@@ -27,6 +27,9 @@ import { addLesson } from '../src/lessons.mjs';
 import { buildTaskPrompt } from '../src/task-builder.mjs';
 import { buildRedactor } from '../src/redact.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
+import { classifyInfraError } from '../src/adapters/base.mjs';
+import { codexAdapter } from '../src/adapters/codex.mjs';
+import { getVerificationCommands } from '../src/verify.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -44,6 +47,24 @@ function runCli(args, cwd) {
     env: { ...process.env, GROW_LOOP_STATE_DIR: '' }
   });
   return JSON.parse(stdout);
+}
+
+function runCliFailure(args, cwd) {
+  try {
+    execFileSync(process.execPath, [CLI_PATH, ...args], {
+      cwd: cwd || PKG_ROOT,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, GROW_LOOP_STATE_DIR: '' }
+    });
+  } catch (err) {
+    return { status: err.status, stderr: String(err.stderr || '') };
+  }
+  throw new Error(`Expected CLI failure for: ${args.join(' ')}`);
+}
+
+function shellQuote(p) {
+  return JSON.stringify(p);
 }
 
 function setupCtx(packs, configOverrides = {}) {
@@ -277,6 +298,92 @@ test('infra failures (429/auth/timeout) NEVER consume repair budget; fallback on
   }
 });
 
+test('infra classifier ignores model/tool text on clean exits and reads only CLI error events on failures', () => {
+  const assistant429 = JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Added retry when amap returns 429 rate limit' } });
+  const tool401 = JSON.stringify({ type: 'item.completed', item: { type: 'command_execution', aggregated_output: 'expect(res.status).toBe(401)', exit_code: 1 } });
+  const serverSource = "if (req.headers.origin !== allowedOrigin) throw new InputError('foreign origin', 403);";
+
+  // Clean exit: whatever the executor read or wrote is not an infra failure
+  assert.equal(classifyInfraError(0, `${assistant429}\n${tool401}`, '', false), null);
+  assert.equal(classifyInfraError(0, serverSource, '', false), null);
+
+  // Failed exit caused by code, while model text mentions 429/401: still a code failure
+  assert.equal(classifyInfraError(1, `${assistant429}\n${tool401}`, '', false), null);
+
+  // Failed exit with real CLI error events / stderr
+  assert.equal(classifyInfraError(1, JSON.stringify({ type: 'turn.failed', error: { message: 'unexpected status 401 Unauthorized' } }), '', false), 'INFRA_AUTH');
+  assert.equal(classifyInfraError(1, JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, result: 'API Error: 429 Too Many Requests' }), '', false), 'INFRA_QUOTA');
+  assert.equal(classifyInfraError(1, '', 'Error: 429 rate_limit_exceeded', false), 'INFRA_QUOTA');
+  assert.equal(classifyInfraError(1, '', "'codex' is not recognized as an internal or external command", false), 'INFRA_CLI_CRASH');
+  assert.equal(classifyInfraError(0, '', '', true), 'INFRA_TIMEOUT');
+
+  // First line of a truncated tail is a JSON fragment and must not be scanned
+  assert.equal(classifyInfraError(1, 'retry on 429 rate limit"}}\n', '', false), null);
+});
+
+test('grow-loop verify runs configured commands itself; self-reported passes need explicit opt-in', () => {
+  const repoDir = makeTempDir('grow-loop-verify-');
+  try {
+    runCli(['init', '--repo', repoDir, '--profile', 'standard-test']);
+    const configPath = path.join(repoDir, '.loop', 'config.json');
+    const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    fs.writeFileSync(path.join(repoDir, 'check.mjs'), "import fs from 'node:fs';\nif (!fs.existsSync('fixed.txt')) { console.error('assertion failed: fixed.txt missing'); process.exit(3); }\n", 'utf8');
+    cfg.verification.commands = [`${shellQuote(process.execPath)} --version`, `${shellQuote(process.execPath)} check.mjs`];
+    writeJsonAtomic(configPath, cfg);
+
+    // Placeholders are not runnable commands
+    assert.deepEqual(getVerificationCommands({ verification: { commands: ['# Replace me', '  '] } }), []);
+
+    runCli(['next', '--repo', repoDir]);
+    // Not in VERIFY yet -> refuse
+    const early = runCliFailure(['verify', '--repo', repoDir]);
+    assert.match(early.stderr, /not waiting for verification/);
+
+    runCli(['record', 'implement', '--repo', repoDir, '--passed', '--summary', 'first try']);
+
+    // A coordinator cannot assert a pass while commands are configured
+    const selfPass = runCliFailure(['record', 'verify', '--repo', repoDir, '--passed', '--summary', 'trust me']);
+    assert.match(selfPass.stderr, /run "grow-loop verify"/);
+
+    // CLI-run verification fails on the real exit code and schedules a repair
+    const v1 = runCli(['verify', '--repo', repoDir]);
+    assert.equal(v1.passed, false);
+    assert.equal(v1.commands.length, 2);
+    assert.equal(v1.commands[1].exit_code, 3);
+    assert.match(v1.summary, /exited 3: assertion failed: fixed\.txt missing/);
+    assert.equal(v1.transition.outcome, 'repair_tier1');
+    let state = JSON.parse(fs.readFileSync(path.join(repoDir, '.loop', 'state.json'), 'utf8'));
+    assert.equal(state.packs.W01.last_verify.source, 'cli');
+    assert.equal(state.packs.W01.last_verify.passed, false);
+    assert.ok(fs.existsSync(path.join(v1.run_dir, 'cmd-2', 'stderr.log')));
+    const lessons = JSON.parse(fs.readFileSync(path.join(repoDir, '.loop', 'lessons.json'), 'utf8'));
+    assert.match(lessons.items[0].root_cause, /fixed\.txt missing/);
+
+    // Repair, then the CLI observes a clean pass
+    fs.writeFileSync(path.join(repoDir, 'fixed.txt'), 'ok\n', 'utf8');
+    runCli(['record', 'implement', '--repo', repoDir, '--passed', '--summary', 'added fixed.txt']);
+    const v2 = runCli(['verify', '--repo', repoDir]);
+    assert.equal(v2.passed, true);
+    assert.match(v2.summary, /^2\/2 commands exited 0/);
+    assert.equal(v2.transition.outcome, 'ready_for_review');
+
+    // Explicit opt-in still allows a manual pass, labelled as self-reported in evidence
+    runCli(['record', 'review', '--repo', repoDir, '--verdict', 'fail', '--findings', JSON.stringify([{ severity: 'HIGH', title: 'Missing edge case' }])]);
+    runCli(['record', 'implement', '--repo', repoDir, '--passed', '--summary', 'edge case']);
+    const manual = runCli(['record', 'verify', '--repo', repoDir, '--passed', '--allow-self-report', '--summary', 'checked by hand']);
+    assert.equal(manual.outcome, 'ready_for_review');
+    state = JSON.parse(fs.readFileSync(path.join(repoDir, '.loop', 'state.json'), 'utf8'));
+    assert.equal(state.packs.W01.last_verify.source, 'self_reported');
+
+    const ev = runCli(['evidence', '--repo', repoDir]);
+    const md = fs.readFileSync(ev.path, 'utf8');
+    assert.match(md, /\| CLI 实跑 \|/);
+    assert.match(md, /\| 自报 \|/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('review severity floor overrides fail on MEDIUM/LOW only, and 2-round review cap stops adversarial loops', () => {
   // Case A: MEDIUM/LOW only -> overrides fail -> PASS + tech-debt.md
   const a = setupCtx([{ id: 'W01', title: 'Severity floor', risk: 'low', estimated_files: 5 }]);
@@ -443,6 +550,7 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
     cfg.routing.tier2 = 'self';
     cfg.routing.reviewer = 'self';
     cfg.code_intel = { tool: 'none' };
+    cfg.verification.commands = [`${shellQuote(process.execPath)} --check hello.js`];
     writeJsonAtomic(configPath, cfg);
 
     writeJsonAtomic(path.join(repoDir, '.loop', 'manifest.json'), {
@@ -488,7 +596,8 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
 
     fs.writeFileSync(path.join(repoDir, 'hello.js'), 'export const hello = (n) => `hi ${n}`;\n', 'utf8');
     runCli(['record', 'implement', '--repo', repoDir, '--passed', '--summary', 'Added hello.js']);
-    runCli(['record', 'verify', '--repo', repoDir, '--passed', '--command', 'node --check hello.js', '--summary', 'syntax ok']);
+    const ver1 = runCli(['verify', '--repo', repoDir]);
+    assert.equal(ver1.passed, true);
 
     const findingsFile = path.join(repoDir, '.loop', 'r1-findings.json');
     writeJsonAtomic(findingsFile, [{ severity: 'LOW', title: 'Could add JSDoc', locator: 'hello.js:hello' }]);
@@ -524,7 +633,8 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
 
     fs.writeFileSync(path.join(repoDir, 'index.js'), 'import { hello } from "./hello.js";\nconsole.log(hello("world"));\n', 'utf8');
     runCli(['record', 'implement', '--repo', repoDir, '--passed', '--summary', 'Added index.js']);
-    runCli(['record', 'verify', '--repo', repoDir, '--passed', '--command', 'node index.js', '--summary', 'printed hi world']);
+    const ver2 = runCli(['verify', '--repo', repoDir]);
+    assert.equal(ver2.passed, true);
     runCli(['record', 'review', '--repo', repoDir, '--verdict', 'pass', '--summary', 'clean']);
 
     execFileSync('git', ['add', 'index.js'], { cwd: repoDir, stdio: 'ignore' });
@@ -546,4 +656,17 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
+});
+
+test('codex resume keeps --cd/--sandbox before the resume subcommand', () => {
+  const cfg = { executable: 'codex', model: 'm', reasoning_effort: 'high' };
+  const { args } = codexAdapter.buildArgs(cfg, { repoDir: '/repo', runDir: '/run', readOnly: false, resumeSessionId: 'abc' });
+  const at = args.indexOf('resume');
+  assert.ok(at > 0);
+  assert.equal(args[at + 1], 'abc');
+  assert.ok(args.indexOf('--cd') < at && args.indexOf('--sandbox') < at);
+  assert.equal(args.at(-1), '-');
+  const fresh = codexAdapter.buildArgs(cfg, { repoDir: '/repo', runDir: '/run', readOnly: true }).args;
+  assert.equal(fresh.includes('resume'), false);
+  assert.equal(fresh[fresh.indexOf('--sandbox') + 1], 'read-only');
 });

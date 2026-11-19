@@ -17,7 +17,10 @@ import { buildRedactor } from '../redact.mjs';
 
 export function classifyInfraError(exitCode, stdoutText, stderrText, timedOut) {
   if (timedOut) return 'INFRA_TIMEOUT';
-  const combined = `${stdoutText || ''}\n${stderrText || ''}`;
+  // A clean exit means the CLI finished its turn. Its stdout then carries model and tool
+  // text (source code, test output, docs) that may legitimately mention 429/401/rate limits.
+  if (exitCode === 0) return null;
+  const combined = `${extractCliErrorText(stdoutText)}\n${stderrText || ''}`;
   if (/\b429\b|rate[_ -]?limit|quota[_ -]?exhausted|free-usage-exhausted|insufficient_quota|too many requests/i.test(combined)) {
     return 'INFRA_QUOTA';
   }
@@ -28,6 +31,35 @@ export function classifyInfraError(exitCode, stdoutText, stderrText, timedOut) {
     return 'INFRA_CLI_CRASH';
   }
   return null;
+}
+
+/**
+ * Keep only the stdout parts a CLI emits about its own failure: plain-text lines and
+ * JSON events typed as errors. Assistant messages and tool results are dropped, so code
+ * the executor read or wrote cannot masquerade as a quota/auth failure.
+ */
+export function extractCliErrorText(stdoutText) {
+  const kept = [];
+  const lines = String(stdoutText || '').split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed) continue;
+    if (!trimmed.startsWith('{')) {
+      // The first line of a truncated tail is usually the end of a JSON event.
+      if (i === 0 && trimmed.endsWith('}')) continue;
+      kept.push(trimmed);
+      continue;
+    }
+    try {
+      const obj = JSON.parse(trimmed);
+      if (/error|fail/i.test(`${obj.type || ''} ${obj.subtype || ''}`) || obj.error || obj.is_error === true) {
+        kept.push(trimmed);
+      }
+    } catch {
+      // ignore partial JSON lines
+    }
+  }
+  return kept.join('\n');
 }
 
 /**

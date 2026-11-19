@@ -39,7 +39,7 @@
 - **爆炸半径预判（Blast-Radius Gate）**：
   - `estimated_files >= 25` 或 `cross_module: true` 或 `risk: "high"` → 自动直接上 `tier2` 起跑，不浪费低阶模型反复返工。
   - `estimated_files >= 50` → 触发 `PAUSED_FOR_HUMAN`（`BLAST_RADIUS_SPLIT`），建议拆包或由人显式批准直接上 `tier2`。
-- **Verify-First**：永远先过机器验证（编译 / 单测 / 隔离实测脚本），再进关包审查。
+- **Verify-First**：永远先过机器验证（编译 / 单测 / 隔离实测脚本），再进关包审查。`grow-loop verify` 由 CLI 亲自执行 `verification.commands` 并按退出码判定；配置了命令时不接受总控 AI 自报「通过」（`--allow-self-report` 显式放行的会在证据包标为「自报」）。
 - **修复与自动升级阶梯（`2 + 2`）**：
   - `tier1` 最多修 **2 轮** → 第 3 次失败自动升级到 `tier2`（`tier2_repairs = 1`）。
   - `tier2` 最多修 **2 轮** → 仍未过硬刹车 `PAUSED_FOR_HUMAN`（`BUDGET_EXCEEDED`），交给人拍板，绝不无限死循环。
@@ -111,7 +111,7 @@ grow-loop dispatch --stage implement --dry-run
 
 # 正式派发执行（外部 CLI 自动记录结果；self 模式由当前宿主执行后 record）
 grow-loop dispatch --stage implement
-grow-loop record verify --passed --command "npm test" --summary "42/42 passed"
+grow-loop verify   # CLI 自己跑 verification.commands，按退出码记结果
 grow-loop record review --verdict pass --findings-file findings.json --summary "0 blocking findings"
 grow-loop record commit --from-git
 
@@ -142,6 +142,7 @@ grow-loop/
 │   ├── lessons.mjs           # 结构化错题本（lessons.json / lessons.md / tech-debt.md）与跨包注入
 │   ├── probe.mjs             # 带超时只读能力探活 + 可选 code_intel 探测
 │   ├── task-builder.mjs      # 生成带错题/阻塞项/单测红线的受控 task.md
+│   ├── verify.mjs            # CLI 亲自执行验证命令、按退出码判定并留存日志
 │   ├── redact.mjs            # 凭据/Token/内网 IP 脱敏与残留扫描引擎
 │   ├── evidence.mjs          # 双层脱敏验收证据包生成器（人读总表 + 6 类证据）
 │   └── adapters/             # 薄驱动层（self / codex / claude / dsh / custom-cmd）

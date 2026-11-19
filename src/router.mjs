@@ -254,7 +254,7 @@ export function buildNextDirective(ctx, pack, packDef) {
       pack_id: pack.id,
       title: pack.title,
       verification: config?.verification || {},
-      next_command: `Run configured verification commands, then call: grow-loop record verify --passed | --failed --summary "..."`
+      next_command: 'grow-loop verify (runs verification.commands and records exit codes); use "grow-loop record verify --failed ..." only for failures found outside those commands'
     };
   }
 
@@ -473,10 +473,16 @@ export function recordVerifyOutcome(ctx, payload) {
   if (!pack) throw new Error('No active pack found');
   const budgets = getBudgets(config);
 
+  // 'cli' = grow-loop ran the configured commands and checked exit codes itself;
+  // 'self_reported' = the coordinator asserted the outcome via `record verify`.
+  const source = payload.source === 'cli' ? 'cli' : 'self_reported';
+
   pack.last_verify = {
     passed: Boolean(payload.passed),
+    source,
     summary: payload.summary || '',
     command: payload.command || null,
+    run_dir: payload.runDir || null,
     at: new Date().toISOString()
   };
 
@@ -484,6 +490,7 @@ export function recordVerifyOutcome(ctx, payload) {
     type: 'verify_recorded',
     pack_id: pack.id,
     passed: Boolean(payload.passed),
+    source,
     summary: payload.summary || '',
     command: payload.command || null
   });

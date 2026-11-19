@@ -91,12 +91,12 @@ export const codexAdapter = {
   buildArgs(cfg, { repoDir, runDir, readOnly, resumeSessionId }) {
     const { cmd, prefix } = resolveCodexCommand(cfg);
     const finalMdPath = path.join(runDir, 'final.md');
-    const args = [...prefix, 'exec'];
+    // `codex exec resume` rejects --cd/--sandbox, so they must precede the subcommand.
+    const args = [...prefix, 'exec', '--cd', repoDir, '--sandbox', readOnly ? 'read-only' : (cfg.sandbox || 'workspace-write')];
     if (resumeSessionId) {
       args.push('resume', resumeSessionId);
     }
-    args.push('--json', '--cd', repoDir, '--output-last-message', finalMdPath);
-    args.push('--sandbox', readOnly ? 'read-only' : (cfg.sandbox || 'workspace-write'));
+    args.push('--json', '--output-last-message', finalMdPath);
     if (cfg.model) args.push('--model', cfg.model);
     if (cfg.reasoning_effort) {
       args.push('-c', `model_reasoning_effort="${cfg.reasoning_effort}"`);

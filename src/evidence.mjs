@@ -152,10 +152,11 @@ export function generateEvidencePack(ctx, outputPath) {
   if (!verifyEvents.length) {
     lines.push('_无机器验证事件记录。_');
   } else {
-    lines.push('| 时间 | 包号 | 结果 | 命令 | 摘要 |');
-    lines.push('|---|---|---|---|---|');
+    lines.push('| 时间 | 包号 | 结果 | 来源 | 命令 | 摘要 |');
+    lines.push('|---|---|---|---|---|---|');
     for (const e of verifyEvents) {
-      lines.push(`| ${esc(e.ts)} | ${esc(e.pack_id)} | ${e.passed ? 'PASS' : 'FAIL'} | \`${esc(e.command || '无记录')}\` | ${esc(e.summary)} |`);
+      const source = e.source === 'cli' ? 'CLI 实跑' : '自报';
+      lines.push(`| ${esc(e.ts)} | ${esc(e.pack_id)} | ${e.passed ? 'PASS' : 'FAIL'} | ${source} | \`${esc(e.command || '无记录')}\` | ${esc(e.summary)} |`);
     }
   }
   lines.push('');

@@ -32,6 +32,7 @@ import { buildTaskPrompt } from '../src/task-builder.mjs';
 import { addLesson } from '../src/lessons.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
 import { buildRedactor } from '../src/redact.mjs';
+import { getVerificationCommands, runVerification } from '../src/verify.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -71,6 +72,7 @@ Usage:
   grow-loop status    [--repo <dir>] [--state-dir <dir>]
   grow-loop next      [--repo <dir>] [--state-dir <dir>]
   grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume] [--task-file <path>]
+  grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--timeout <sec>]
   grow-loop record    <implement|verify|review|commit|lesson> [flags]
   grow-loop resume    --decision "<text>" [--action approve|repair|retry|commit|switch_instance|abort] [--instance <id>]
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
@@ -314,6 +316,10 @@ function cmdRecord(sub, flags) {
   }
 
   if (sub === 'verify') {
+    const claimsPass = Boolean(flags.passed) && !flags.failed;
+    if (claimsPass && getVerificationCommands(ctx.config).length && !flags['allow-self-report']) {
+      throw new Error('verification.commands are configured: run "grow-loop verify" so the CLI checks real exit codes, or pass --allow-self-report to record an unchecked pass.');
+    }
     const res = recordVerifyOutcome(ctx, {
       packId,
       passed: Boolean(flags.passed) && !flags.failed,
@@ -380,6 +386,15 @@ function cmdRecord(sub, flags) {
   throw new Error(`Unknown record subcommand "${sub}". Use: implement | verify | review | commit | lesson`);
 }
 
+async function cmdVerify(flags) {
+  const ctx = loadWorkspace(flags.repo, flags['state-dir']);
+  const res = await runVerification(ctx, {
+    packId: flags.pack || ctx.state.active_pack_id,
+    timeoutSec: flags.timeout ? Number(flags.timeout) : undefined
+  });
+  outJson(res);
+}
+
 function cmdResume(flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir']);
   const res = resumeFromGate(ctx, {
@@ -413,6 +428,7 @@ async function main() {
     else if (cmd === 'status') cmdStatus(flags);
     else if (cmd === 'next') cmdNext(flags);
     else if (cmd === 'dispatch') await cmdDispatch(flags);
+    else if (cmd === 'verify') await cmdVerify(flags);
     else if (cmd === 'record') cmdRecord(positionals[1], flags);
     else if (cmd === 'resume') cmdResume(flags);
     else if (cmd === 'evidence') cmdEvidence(flags);
