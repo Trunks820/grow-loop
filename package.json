@@ -3,7 +3,16 @@
   "version": "0.1.0",
   "description": "Harness-agnostic multi-package delivery loop with tiered routing, 2+2+2 escalation/review budgets, zero-custody CLI adapters, lessons injection, and redacted evidence packs.",
   "type": "module",
+  "author": "Trunks820",
   "license": "MIT",
+  "homepage": "https://github.com/Trunks820/grow-loop#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Trunks820/grow-loop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Trunks820/grow-loop/issues"
+  },
   "engines": {
     "node": ">=18.0.0"
   },

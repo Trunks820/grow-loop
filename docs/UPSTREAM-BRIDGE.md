@@ -1,6 +1,6 @@
 # Upstream Bridge (`manifest.json` Contract)
 
-`grow-loop` is intentionally decoupled from any specific requirements or planning tool. Whether your work packages come from **`grow-me`**, **`ai-dev-workflow`**, a PRD Markdown table, Jira/Linear/GitHub Issues, or hand-written JSON, you only need to populate `.loop/manifest.json`.
+`grow-loop` is intentionally decoupled from any specific requirements or planning tool. Whether your work packages come from **[grow-me](https://github.com/Trunks820/grow-me)** (companion upstream tool, under active polish), **`ai-dev-workflow`**, a PRD Markdown table, Jira/Linear/GitHub Issues, or hand-written JSON, you only need to populate `.loop/manifest.json`.
 
 ---
 

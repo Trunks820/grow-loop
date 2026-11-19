@@ -1,9 +1,15 @@
 # grow-loop
 
+[![Tests](https://github.com/Trunks820/grow-loop/actions/workflows/test.yml/badge.svg)](https://github.com/Trunks820/grow-loop/actions/workflows/test.yml)
+[![Node.js >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **Harness-agnostic, zero-dependency multi-package delivery loop for AI coding agents.**
 
 > `grow-loop` 是面向 AI 编程交付的**确定性治理状态机与跨宿主 Skill**（Node.js >= 18，零外部依赖）。  
 > 无论今天由 **Codex、Antigravity、Claude Code、DeepSeek Harness 还是 Cursor** 担任总控，把「状态流转、修复上限、自动升级、审查封顶、授权刹车、错题注入、脱敏证据包」全部外置到代码里，让 AI 按包稳步交付，而不是陷入无限返工或失控自动放行。
+>
+> 🌱 **Grow 家族**：配套上游工具 [grow-me](https://github.com/Trunks820/grow-me)（持续打磨中）负责**让需求长成方案**，`grow-loop` 负责**让方案长成交付**；同时完全解耦，可直接承接 `ai-dev-workflow` 或任意 Markdown / Issue 任务清单。
 
 ---
 
@@ -67,7 +73,7 @@
 ### 1. 克隆并可选安装为全局 Skill / CLI
 
 ```bash
-git clone <your-repo-url> grow-loop
+git clone https://github.com/Trunks820/grow-loop.git
 cd grow-loop
 npm test   # 运行内置 node:test 测试套件
 ```
@@ -88,7 +94,7 @@ node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --st
 ```
 
 ### 3. 编辑任务清单与执行器映射
-- `.loop/manifest.json`：填入待交付的工作包 `W01..Wn`（可由 `grow-me` / `ai-dev-workflow` 或任意 Markdown 清单转换，详见 [docs/UPSTREAM-BRIDGE.md](docs/UPSTREAM-BRIDGE.md)）。
+- `.loop/manifest.json`：填入待交付的工作包 `W01..Wn`（可由 [grow-me](https://github.com/Trunks820/grow-me) / `ai-dev-workflow` 或任意 Markdown 清单转换，详见 [docs/UPSTREAM-BRIDGE.md](docs/UPSTREAM-BRIDGE.md)）。
 - `.loop/config.json`：配置本机的 `tier1` / `tier2` / `reviewer` 实例与 `verification` 命令。
 
 ### 4. 探活并驱动闭环
