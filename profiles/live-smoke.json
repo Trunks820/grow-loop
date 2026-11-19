@@ -1,0 +1,72 @@
+{
+  "profile": "live-smoke",
+  "description": "Preset for complex/legacy business systems: forbids writing new unit tests and relies on existing regression suite + isolated live/smoke verification scripts.",
+  "executors": {
+    "self": {
+      "kind": "self",
+      "label": "Active Host Harness"
+    },
+    "dsh_default": {
+      "kind": "dsh",
+      "label": "DeepSeek Harness (Tier 1)",
+      "profile": "headless",
+      "timeout_sec": 2400
+    },
+    "codex_strong": {
+      "kind": "codex",
+      "label": "Codex Strong Reasoning (Tier 2 & Reviewer)",
+      "model": "",
+      "sandbox": "workspace-write",
+      "timeout_sec": 3600
+    }
+  },
+  "routing": {
+    "tier1": "dsh_default",
+    "tier2": "codex_strong",
+    "reviewer": "codex_strong",
+    "on_infra_failure": "pause_for_human"
+  },
+  "budgets": {
+    "tier1_max_repairs": 2,
+    "tier2_max_repairs": 2
+  },
+  "blast_radius": {
+    "escalate_tier2_files": 25,
+    "escalate_tier2_cross_module": true,
+    "pause_split_files": 50
+  },
+  "verification": {
+    "new_tests": "forbidden",
+    "commands": [
+      "# Replace with your build + existing regression tests + isolated live smoke script"
+    ]
+  },
+  "review": {
+    "mode": "closing-full",
+    "max_rounds": 2,
+    "blocking_severities": [
+      "BLOCKER",
+      "HIGH"
+    ],
+    "round2_non_divergent": true
+  },
+  "code_intel": {
+    "tool": "codegraph"
+  },
+  "probe": {
+    "timeout_ms": 8000
+  },
+  "approval_envelope": {
+    "require_human_for": [
+      "git_push",
+      "branch_merge",
+      "deploy",
+      "external_message",
+      "production_write",
+      "global_config_edit"
+    ]
+  },
+  "redaction": {
+    "extra_patterns": []
+  }
+}

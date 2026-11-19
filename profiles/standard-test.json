@@ -1,0 +1,80 @@
+{
+  "profile": "standard-test",
+  "description": "Default preset for standard repositories with automated unit/integration test suites.",
+  "executors": {
+    "self": {
+      "kind": "self",
+      "label": "Active Host Harness"
+    },
+    "tier1_cli": {
+      "kind": "codex",
+      "label": "Economy / Fast Executor Instance (customize kind/model)",
+      "model": "",
+      "sandbox": "workspace-write",
+      "timeout_sec": 2400
+    },
+    "tier2_cli": {
+      "kind": "codex",
+      "label": "Strong Reasoning Executor Instance",
+      "model": "",
+      "sandbox": "workspace-write",
+      "timeout_sec": 3600
+    },
+    "reviewer_cli": {
+      "kind": "codex",
+      "label": "Independent Read-Only Reviewer Instance",
+      "model": "",
+      "sandbox": "read-only",
+      "timeout_sec": 1800
+    }
+  },
+  "routing": {
+    "tier1": "self",
+    "tier2": "self",
+    "reviewer": "self",
+    "on_infra_failure": "pause_for_human"
+  },
+  "budgets": {
+    "tier1_max_repairs": 2,
+    "tier2_max_repairs": 2
+  },
+  "blast_radius": {
+    "escalate_tier2_files": 25,
+    "escalate_tier2_cross_module": true,
+    "pause_split_files": 50
+  },
+  "verification": {
+    "new_tests": "optional",
+    "commands": [
+      "npm test"
+    ]
+  },
+  "review": {
+    "mode": "closing-full",
+    "max_rounds": 2,
+    "blocking_severities": [
+      "BLOCKER",
+      "HIGH"
+    ],
+    "round2_non_divergent": true
+  },
+  "code_intel": {
+    "tool": "none"
+  },
+  "probe": {
+    "timeout_ms": 8000
+  },
+  "approval_envelope": {
+    "require_human_for": [
+      "git_push",
+      "branch_merge",
+      "deploy",
+      "external_message",
+      "production_write",
+      "global_config_edit"
+    ]
+  },
+  "redaction": {
+    "extra_patterns": []
+  }
+}

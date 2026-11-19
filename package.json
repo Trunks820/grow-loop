@@ -1,0 +1,34 @@
+{
+  "name": "grow-loop",
+  "version": "0.1.0",
+  "description": "Harness-agnostic multi-package delivery loop with tiered routing, 2+2+2 escalation/review budgets, zero-custody CLI adapters, lessons injection, and redacted evidence packs.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "bin": {
+    "grow-loop": "./bin/grow-loop.mjs"
+  },
+  "files": [
+    "SKILL.md",
+    "README.md",
+    "bin/",
+    "src/",
+    "profiles/",
+    "docs/"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "ai-agent",
+    "agent-skills",
+    "coding-agent",
+    "codex",
+    "claude-code",
+    "deepseek-harness",
+    "delivery-loop",
+    "orchestrator"
+  ]
+}

@@ -1,0 +1,144 @@
+---
+name: grow-loop
+description: Harness-agnostic multi-package delivery loop with deterministic state machine, 2+2+2 repair/escalation/review brakes, live CLI probing, cross-pack lesson injection, and redacted evidence packs. Trigger when executing multi-pack feature delivery, running a controlled implement-verify-review-commit loop, or handing off delivery state across AI coding harnesses (Codex, Antigravity, Claude Code, DeepSeek Harness, Cursor).
+---
+
+# grow-loop — Harness-Agnostic Multi-Package Delivery Loop
+
+**Core principle:** Whichever AI agent harness runs this skill IS the coordinator. All deterministic governance — state transitions, `2 + 2 + 2` repair/escalation/review limits, infra-failure immunity, approval gates, lesson injection, and redacted evidence generation — lives outside the LLM in the zero-dependency Node.js CLI (`bin/grow-loop.mjs`) and `.loop/` state directory.
+
+> **Lossless Cross-Harness Handoff:** Because state defaults to `<repo>/.loop/` (auto-added to `.gitignore`, or overridden via `--state-dir` / `GROW_LOOP_STATE_DIR`), you can run W01–W03 in Codex and seamlessly pick up W04–W06 in Antigravity, Claude Code, or Cursor with zero context loss.
+
+---
+
+## Locate the CLI
+
+Resolve `GROW_LOOP_BIN` relative to this skill directory:
+- `<this-skill-dir>/bin/grow-loop.mjs`
+- Run with: `node "<this-skill-dir>/bin/grow-loop.mjs" <command> [flags]`
+- Or if linked globally (`npm link`): `grow-loop <command> [flags]`
+
+Requires **Node.js >= 18** and **zero** third-party npm packages.
+
+---
+
+## Mandatory Security & Governance Red Lines
+
+### 1. Approval Envelope (Never Cross Without Explicit Human Gate)
+Inside the autonomous loop, you may read code, edit files inside the current repo/worktree, run local builds/tests/verification scripts, dispatch configured CLI executors, and create **local** git commits (`git add <explicit files> && git commit`).
+
+You **MUST STOP** and ask the human before any of these actions:
+- `git push`, PR creation, tag push, or branch merge/rebase into shared branches
+- Deployment, migration against production/shared environments, or external API side effects
+- Editing global/home configs (`~/.codex/`, `~/.claude/`, `~/.dsh/`, shell profiles)
+- Installing unapproved system packages or modifying host security/sandbox settings
+
+### 2. Five Zero-Custody Auth Red Lines
+- **Zero Credential Custody:** Never read, copy, proxy, or cache OAuth tokens, cookies, API keys, or CLI credential stores (`~/.codex/auth.json`, `~/.claude/`, etc.). Every executor CLI must already be authenticated by the user locally (BYO CLI).
+- **No Silent Account Rotation:** Never rotate accounts or proxy subscription pools behind the user's back. Infra failures (`429` / auth / timeout) pause for the human by default.
+- **Read-Only Probing & Zero Secret Echo:** `grow-loop probe` only invokes local read-only CLI checks with bounded timeouts — never paid LLM calls. All logs/events/evidence are passed through `src/redact.mjs`.
+- **No Blind Auto-Approve:** Reviewers ALWAYS run read-only; implementers run with minimum required workspace write scope.
+- **Non-Invasive Runtime:** Never mutate external CLI configs or silently `npm install -g` tools.
+
+---
+
+## Coordinator Execution Protocol (Mode A)
+
+Follow this exact deterministic loop for every work package (`W01`, `W02`, ...):
+
+### Step 0: Initialize (Once per project/worktree)
+1. Check if `<repo>/.loop/state.json` (or custom `--state-dir`) exists.
+2. If not, pick the right profile and initialize:
+   - **`standard-test`** (regular repo with unit/integration tests):
+     ```bash
+     node <GROW_LOOP_BIN> init --repo <repo> --profile standard-test
+     ```
+   - **`live-smoke`** (legacy/DB-heavy repo where new unit tests are forbidden and real-env smoke scripts verify behavior):
+     ```bash
+     node <GROW_LOOP_BIN> init --repo <repo> --profile live-smoke
+     ```
+   - Use `--state-dir <path>` only if the user wants state stored outside the repo (e.g., an Obsidian vault). Default `<repo>/.loop/` is preferred and automatically added to `<repo>/.gitignore`.
+3. Populate `.loop/manifest.json` from upstream specs (`grow-me` / `ai-dev-workflow` task list, PRD, or issue list — see `docs/UPSTREAM-BRIDGE.md`) and adjust `.loop/config.json` (executor instances + verify commands).
+4. Run live capability discovery before dispatching external executors:
+   ```bash
+   node <GROW_LOOP_BIN> probe --repo <repo>
+   ```
+   Remember: `probe` verifies local CLI readiness (`cli_ready`), NOT server-side quota.
+
+### Step 1: Ask the State Machine What to Do Next
+```bash
+node <GROW_LOOP_BIN> next --repo <repo>
+```
+**Obey the returned JSON `action` strictly:**
+
+| Returned `action` | What Coordinator Must Do |
+|---|---|
+| `PAUSE_FOR_HUMAN` | **STOP the loop immediately.** Present `gate.reason`, `gate.summary`, `gate.questions` (if any), and the exact `resume_hint` options to the user. Wait for human input, then call `grow-loop resume --decision "..." --action <...>`. |
+| `IMPLEMENT` | Execute implementation on the assigned `tier` & `instance` (see Step 2). |
+| `VERIFY` | Run the project's machine verification (build + tests OR build + regression + live smoke script), then call `grow-loop record verify --passed\|--failed --summary "..."`. **Verify ALWAYS runs before Review.** |
+| `REVIEW` | Run a **read-only closing full review** (Round 1 or non-divergent Round 2), then call `grow-loop record review --verdict pass\|fail --findings-file <json> --summary "..."`. |
+| `COMMIT` | Stage explicit changed files (`git status`, no untracked junk/secrets), make a **local** commit only (never push!), then call `grow-loop record commit --from-git`. |
+| `COMPLETED` | All packs are committed! Run `grow-loop evidence` to generate the redacted two-layer evidence pack and report to the user. |
+
+### Step 2: Executing `IMPLEMENT` (External Adapter vs `self`)
+- **If `instance` uses an external CLI adapter (`codex`, `claude`, `dsh`, `custom-cmd`):**
+  1. First run dry-run preflight:
+     ```bash
+     node <GROW_LOOP_BIN> dispatch --repo <repo> --stage implement --dry-run
+     ```
+  2. Inspect the generated `task.md` inside `run_dir` (verify scope, injected lessons, and `new_tests_policy`), then dispatch:
+     ```bash
+     node <GROW_LOOP_BIN> dispatch --repo <repo> --stage implement
+     ```
+  3. `dispatch` automatically records the outcome (including infra-failure immunity if `429`/auth/timeout occurs) and returns the next transition.
+- **If `instance` is `self` (the current host harness executes directly):**
+  1. Optionally run `dispatch --dry-run` to materialize `task.md` with auto-injected lessons and pending blocking findings.
+  2. Implement the bounded changes directly in the repo, respecting `new_tests_policy` (`forbidden` means zero new test files!).
+  3. Record completion:
+     ```bash
+     node <GROW_LOOP_BIN> record implement --repo <repo> --passed --summary "<concise summary>"
+     ```
+     (Or `--failed --summary "..."` if implementation hit a code blocker, or `--infra-error INFRA_QUOTA` if hit a rate limit.)
+
+### Step 3: Executing `VERIFY` (Verify-First Rule)
+- Always execute concrete machine verification commands from `config.verification` (compile/typecheck, test suite, or isolated-port live smoke script).
+- Never claim pass without real exit code 0 evidence.
+- Record result:
+  ```bash
+  node <GROW_LOOP_BIN> record verify --repo <repo> --passed --command "<cmd>" --summary "<concrete results>"
+  ```
+  If verification fails, pass `--failed --summary "..." --root-cause "..." --rule "..." --locator "<file:symbol>"` — `grow-loop` will automatically log a structured lesson in `lessons.json` + `lessons.md` and run the `2 + 2` repair/escalation ladder.
+
+### Step 4: Executing `REVIEW` (2-Round Cap + Severity Floor)
+- Perform **closing full review** over the full pack diff (do NOT waste turns on repeated incremental reviews mid-pack unless a huge risk emerges).
+- Reviewer MUST be **read-only** (`--stage review` enforces read-only flags on adapters).
+- Classify every finding strictly into `BLOCKER` | `HIGH` | `MEDIUM` | `LOW`:
+  - **Only `BLOCKER` and `HIGH` block closure.**
+  - **`MEDIUM` and `LOW` are archived into `.loop/tech-debt.md` and NEVER block.**
+- If `review_round === 2` (`non_divergent_closure_only: true`): verify ONLY whether Round-1 blocking findings are fixed and whether the fix introduced any new `BLOCKER`/`HIGH` regression. Do NOT open new style/perf refactors.
+- Record result via JSON findings file:
+  ```bash
+  node <GROW_LOOP_BIN> record review --repo <repo> --verdict pass --findings-file <path-to-findings.json> --summary "..."
+  ```
+
+### Step 5: Built-In `2 + 2 + 2` Brakes (Enforced Automatically by CLI)
+- **Blast-Radius Gate:** `estimated_files >= 25` or `cross_module: true` or `risk: "high"` → auto-starts at `tier2`; `estimated_files >= 50` → pauses with `BLAST_RADIUS_SPLIT`.
+- **Repair Ladder (`2 + 2`):**
+  - `tier1` gets up to `2` repair rounds (`tier1_max_repairs: 2`).
+  - Failing a 3rd time auto-escalates to `tier2` (`tier2_repairs = 1`).
+  - `tier2` gets up to `2` repair rounds (`tier2_max_repairs: 2`).
+  - Failing again triggers `PAUSED_FOR_HUMAN` (`BUDGET_EXCEEDED`).
+- **Closing Review Cap (`2`):** Max `2` closing reviews (`max_review_rounds: 2`). Hitting `2/2` on `tier1` auto-escalates once to `tier2` (after `VERIFY`, pauses for human commit sign-off without opening a 3rd review); hitting `2/2` on `tier2` pauses immediately (`REVIEW_CAP_REACHED`).
+- **Infra Failure Immunity:** `INFRA_QUOTA` (`429`), `INFRA_AUTH`, `INFRA_TIMEOUT`, and `INFRA_CLI_CRASH` **NEVER** consume `tier1` or `tier2` repair budgets.
+
+### Step 6: Commit & Generate Evidence Pack
+1. When `next` returns `COMMIT`, review `git status` and `git diff --stat`, stage explicit files, commit locally (no `git push`), and record:
+   ```bash
+   node <GROW_LOOP_BIN> record commit --repo <repo> --from-git
+   ```
+2. Repeat `grow-loop next` until `action === "COMPLETED"`.
+3. Generate the final redacted two-layer evidence pack:
+   ```bash
+   node <GROW_LOOP_BIN> evidence --repo <repo>
+   ```
+   Verify `scanHits` is empty (`[]`) before sharing `.loop/evidence.md`.
