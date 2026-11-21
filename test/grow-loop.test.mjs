@@ -2356,7 +2356,7 @@ test('self dispatch records implementation and review time and commit checks fla
   try {
     fs.mkdirSync(repoDir);
     fixtureGit(repoDir, 'init');
-    fs.writeFileSync(path.join(repoDir, 'app.js'), 'export const value = 1;\n');
+    fs.writeFileSync(path.join(repoDir, 'app.js'), 'const value = 1;\n');
     fs.writeFileSync(path.join(repoDir, 'fixture-notes.md'), 'fixture baseline');
     fixtureCommit(repoDir, 'fixture baseline', 'app.js', 'fixture-notes.md');
     const manifestPath = path.join(root, 'manifest.json');
@@ -2392,7 +2392,7 @@ test('self dispatch records implementation and review time and commit checks fla
     assert.equal(saved().prepared_run, null);
     assert.equal(saved().inflight_run.run_id, impl.run_id);
     assert.equal(impl.result.elapsed_seconds, null);
-    fs.appendFileSync(path.join(repoDir, 'app.js'), 'export const next = 2;\n');
+    fs.appendFileSync(path.join(repoDir, 'app.js'), 'const next = 2;\n');
     cli('record', 'implement', '--passed', '--executor-tool', 'host-codex', '--executor-model', 'fixture-model',
       '--executor-effort', 'high');
     const implResult = readJsonSafe(path.join(impl.run_dir, 'result.json'));
