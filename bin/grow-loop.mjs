@@ -22,7 +22,9 @@ import {
   writeManifestWithReason
 } from '../src/state.mjs';
 import {
+  getBudgets,
   getPackDef,
+  getRepairRounds,
   recordCommitOutcome,
   recordImplementOutcome,
   recordReviewOutcome,
@@ -34,7 +36,7 @@ import {
 import { getAdapter } from '../src/adapters/index.mjs';
 import { probeAllInstances } from '../src/probe.mjs';
 import { buildTaskPrompt, parseOutOfScopeItems, taskBriefWarnings } from '../src/task-builder.mjs';
-import { addLesson } from '../src/lessons.mjs';
+import { addLesson, loadLessons, updateLesson } from '../src/lessons.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
 import { buildRedactor } from '../src/redact.mjs';
 import { getVerificationCommands, runVerification } from '../src/verify.mjs';
@@ -91,11 +93,15 @@ Usage:
   grow-loop todo add --pack <ID> --text "<text>" --reason "<text>"
   grow-loop todo list
   grow-loop todo dismiss --todo <ID> --reason "<text>"
+  grow-loop lesson confirm --id <ID> --rule "<text>" (--scope global | --scope tags [--tags a,b]) [--root-cause "<text>"]
+  grow-loop lesson disable --id <ID> --reason "<text>"
+  grow-loop lesson list [--status draft|confirmed|disabled]
   grow-loop next      [--repo <dir>] [--state-dir <dir>]
   grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume] [--task-file <path>]
   grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--pack <id>] [--timeout <sec>] [--mark-env "<reason>"]
   grow-loop record    <implement|verify|review|commit|lesson> [flags]
   grow-loop record review --report <report.md> [--reviewer <instance>]
+  grow-loop record lesson --summary "<text>" [--pack <ID>] [--rule "<text>"] [--scope global|tags] [--tags a,b]
   grow-loop resume    --decision "<text>" [--action approve|repair|retry|commit|switch_instance|abort] [--instance <id>]
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
 
@@ -231,6 +237,7 @@ function cmdStatus(flags) {
     active_pack_id: ctx.state.active_pack_id,
     packs: summary,
     open_todos: (ctx.state.todos || []).filter((todo) => todo.status === 'open'),
+    ...lessonDraftNotice(ctx.stateDir),
     ...(ctx.manifestChange ? { manifest_change_pending: ctx.manifestChange } : {})
   });
 }
@@ -439,7 +446,48 @@ function cmdTodo(sub, flags) {
 function cmdNext(flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir']);
   const directive = startOrAdvanceActivePack(ctx);
-  outJson(directive);
+  outJson({ ...directive, ...lessonDraftNotice(ctx.stateDir) });
+}
+
+function lessonDraftNotice(stateDir) {
+  const drafts = loadLessons(stateDir).items
+    .filter(({ status }) => status === 'draft')
+    .map(({ id, summary }) => ({ id, summary }));
+  return drafts.length ? {
+    lesson_draft_notice: `有 ${drafts.length} 条教训草稿待确认`,
+    lesson_drafts: drafts
+  } : {};
+}
+
+function parseLessonTags(value) {
+  return value === undefined ? undefined : requireText(value, 'tags').split(',').map((tag) => tag.trim()).filter(Boolean);
+}
+
+function cmdLesson(sub, flags) {
+  const ctx = loadWorkspace(flags.repo, flags['state-dir'], { allowPendingManifest: sub === 'list' });
+  if (sub === 'list') {
+    const status = flags.status;
+    if (status !== undefined && !['draft', 'confirmed', 'disabled'].includes(status)) {
+      throw new Error('Specify --status draft, confirmed, or disabled.');
+    }
+    const items = loadLessons(ctx.stateDir).items.filter((item) => status === undefined || item.status === status);
+    appendEvent(ctx.stateDir, ctx.config, { type: 'lesson_listed', status: status ?? null, count: items.length });
+    outJson({ items });
+  } else if (sub === 'confirm') {
+    const id = requireText(flags.id, 'id');
+    const rule = requireText(flags.rule, 'rule');
+    const scope = requireText(flags.scope, 'scope');
+    if (scope === 'global' && flags.tags !== undefined) throw new Error('Use --tags with --scope tags.');
+    const tags = parseLessonTags(flags.tags);
+    const rootCause = flags['root-cause'] === undefined ? undefined : requireText(flags['root-cause'], 'root-cause');
+    outJson(updateLesson(ctx.stateDir, ctx.config, id, { status: 'confirmed', rule, scope, tags, rootCause }));
+  } else if (sub === 'disable') {
+    const id = requireText(flags.id, 'id');
+    const reason = requireText(flags.reason, 'reason');
+    outJson(updateLesson(ctx.stateDir, ctx.config, id, { status: 'disabled', reason }));
+  } else {
+    throw new Error('Unknown lesson subcommand. Use: confirm | disable | list.');
+  }
 }
 
 function recordReviewReport(ctx, { packId, reportPath, reviewer, reviewerModel, reviewRound, runId }) {
@@ -450,7 +498,7 @@ function recordReviewReport(ctx, { packId, reportPath, reviewer, reviewerModel, 
   } catch (error) {
     report = { errors: [`Report file: cannot read Markdown${error.code ? ` (${error.code})` : ''}.`] };
   }
-  report ??= parseReviewReport(markdown);
+  report ??= parseReviewReport(markdown, getBudgets(ctx.config).blockingSeverities);
   if (report.errors) {
     const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
     const invalid = {
@@ -686,15 +734,19 @@ function cmdRecord(sub, flags) {
   }
 
   if (sub === 'lesson') {
+    const pack = ctx.state.packs[packId];
     const entry = addLesson(ctx.stateDir, ctx.config, {
       pack_id: packId || 'GLOBAL',
       stage: flags.stage || 'MANUAL',
       severity: flags.severity || 'HIGH',
       summary: flags.summary || '',
       root_cause: flags['root-cause'] || '',
-      rule: flags.rule || '',
+      rule: flags.rule === undefined ? '' : requireText(flags.rule, 'rule'),
       locator: flags.locator || '',
-      tags: flags.tags ? String(flags.tags).split(',').map((s) => s.trim()).filter(Boolean) : []
+      tags: parseLessonTags(flags.tags) ?? getPackDef(ctx.manifest, packId)?.tags,
+      scope: flags.scope,
+      repair_rounds: pack ? getRepairRounds(pack) : 0,
+      discovered_by: 'manual'
     });
     outJson(entry);
     return;
@@ -748,6 +800,7 @@ async function main() {
     else if (cmd === 'pack') cmdPack(positionals[1], flags);
     else if (cmd === 'forward') cmdForward(flags);
     else if (cmd === 'todo') cmdTodo(positionals[1], flags);
+    else if (cmd === 'lesson') cmdLesson(positionals[1], flags);
     else if (cmd === 'next') cmdNext(flags);
     else if (cmd === 'dispatch') await cmdDispatch(flags);
     else if (cmd === 'verify') await cmdVerify(flags);

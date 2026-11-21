@@ -112,7 +112,7 @@ node <GROW_LOOP_BIN> next --repo <repo>
   ```bash
   node <GROW_LOOP_BIN> verify --repo <repo>
   ```
-  On failure the CLI reruns the whole sequence once by default. If the second attempt passes, the CLI records `flaky`, keeps both runs, and advances without using repair budget or recording a lesson. If both attempts fail, the CLI records a lesson and applies the `2 + 2` repair/escalation ladder.
+  On failure the CLI reruns the whole sequence once by default. If the second attempt passes, the CLI records `flaky`, keeps both runs, and advances without using repair budget or recording a lesson. If both attempts fail, the CLI records a lesson draft and applies the `2 + 2` repair/escalation ladder.
 - Read the failure logs before dispatching a repair. If the failure is environmental, run `grow-loop verify --mark-env "<reason>"` before dispatch. The CLI records the reason, undoes the repair charge and lesson, and reruns verification. If the rerun still fails, resolve the environment problem while the pack waits in `VERIFY`.
 - While commands are configured, `record verify --passed` is refused. Use `record verify --failed --summary "..." --root-cause "..." --rule "..." --locator "<file:symbol>"` only for failures found outside those commands. `--allow-self-report` records an unchecked pass and is labelled `自报` in the evidence pack; use it only when the human explicitly accepts a manual check.
 
@@ -120,15 +120,29 @@ node <GROW_LOOP_BIN> next --repo <repo>
 - Perform **closing full review** over the full pack diff (do NOT waste turns on repeated incremental reviews mid-pack unless a huge risk emerges).
 - Reviewer MUST be **read-only** (`--stage review` enforces read-only flags on adapters).
 - Check each existing behavior listed in the task brief and report regressions at the applicable severity. Round 2 applies this checklist within its closure scope. The “已经定了的” section carries the original decisions for both rounds.
-- Classify every finding strictly into `BLOCKER` | `HIGH` | `MEDIUM` | `LOW`:
-  - **Only `BLOCKER` and `HIGH` block closure.**
-  - **`MEDIUM` and `LOW` are recorded in `.loop/tech-debt.md`.** On a failed review they are included in the repair task under `顺手一起修（不阻断）`.
-- For a non-divergent Round 2, check only the listed prior findings and new `BLOCKER`/`HIGH` regressions introduced by the repair. Re-report unresolved `MEDIUM`/`LOW` items from the prior round under their original titles. On passage, those items become pending and the omitted items are marked fixed.
+- Classify each finding as `BLOCKER`, `HIGH`, `MEDIUM`, or `LOW`. The blocking severities are set by `review.blocking_severities` (default `BLOCKER` and `HIGH`) and shown in `next` and the review task. A blocking finding creates a lesson draft, with any supplied `rule` prefilled.
+- Findings outside the blocking severities are recorded in `.loop/tech-debt.md`. After a failed review, the repair task includes them under `顺手一起修（不阻断）`.
+- For a non-divergent Round 2, check the listed prior findings and new regressions introduced by the repair that meet the configured blocking severities. Re-report unresolved non-blocking items under their original titles. On passage, those items become pending and the omitted items are marked fixed. If the package is committed after human approval at the review cap, all remaining in-round items become pending.
 - External dispatch reads the returned Markdown report automatically. For self-review, run `dispatch --stage review --dry-run` to get the task, then save a Markdown report matching its Required Output Format and submit it:
   ```bash
   node <GROW_LOOP_BIN> record review --repo <repo> --report <report.md>
   ```
 - If the CLI reports an invalid report, correct the indicated location and submit the report again. The package stays in `REVIEW` and the round does not advance.
+
+### Confirm and Scope Lessons
+
+Implementation failures, verification failures, and blocking review findings create `draft` lessons. Use the IDs and summaries in `next` and `status` to review them while the loop continues.
+
+```bash
+node <GROW_LOOP_BIN> lesson list --status draft
+node <GROW_LOOP_BIN> lesson confirm --id L001 --rule "Write the next action" --scope global
+node <GROW_LOOP_BIN> lesson confirm --id L002 --rule "Write the next action" --scope tags --tags exam
+node <GROW_LOOP_BIN> lesson disable --id L001 --reason "Explain why the rule is retired"
+```
+
+Use `--root-cause` to add or update the cause on confirmation. For `--scope tags`, omit `--tags` to use the lesson's feature tags. At least one tag is required. A manual `record lesson` with both `--rule` and `--scope` creates a `confirmed` lesson. Otherwise it creates a draft. A disabled lesson remains in the store with `status: disabled` and a reason.
+
+Task briefs include up to eight confirmed rules. The package's own rules come first, followed by rules whose `scope_tags` overlap the package's `tags`, then global rules. Each group is ordered newest first. `lessons.md` shows status, scope, feature tags, and `repair_rounds`. A package commit updates the repair count and records the closure in `fixed_by` and `closed_at`. Old `OPEN` and `CLOSED` entries remain readable. An old entry with a rule is treated as confirmed and scoped to its tags, or globally if it has none. An old entry without a rule is treated as a draft.
 
 ### Step 5: Built-In `2 + 2 + 2` Brakes (Enforced Automatically by CLI)
 - **Blast-Radius Gate:** `estimated_files >= 25` or `cross_module: true` or `risk: "high"` → auto-starts at `tier2`; `estimated_files >= 50` → pauses with `BLAST_RADIUS_SPLIT`.

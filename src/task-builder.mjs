@@ -1,10 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ensureDir, getStatePaths } from './state.mjs';
-import { inRoundTechDebt, selectLessonsForPack } from './lessons.mjs';
+import { formatLessonScope, inRoundTechDebt, selectLessonsForPack } from './lessons.mjs';
 import { buildRedactor } from './redact.mjs';
-import { BLOCKING_REVIEW_SEVERITIES } from './review-report.mjs';
-import { getBudgets } from './router.mjs';
+import { getBudgets, getRepairRounds } from './router.mjs';
 import { getVerificationPlan } from './verify.mjs';
 import { namesCode, scanReferences } from './ref-scan.mjs';
 
@@ -133,20 +132,23 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
   const { stateDir, config, state } = ctx;
   const budgets = getBudgets(config);
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
-  const lessons = selectLessonsForPack(stateDir, packDef, 8);
   const lines = [];
 
   if (stage === 'review') {
     const nextRound = pack.review_rounds + 1;
     const isRound2Closure = nextRound >= 2 && budgets.round2NonDivergent;
+    const blocking = [...budgets.blockingSeverities].map((severity) => `\`${severity}\``).join(' or ');
     lines.push(`# Closing Code Review (Round ${nextRound}/${budgets.maxReviewRounds}) · ${pack.id}: ${pack.title}`);
     lines.push('');
     lines.push('## Hard Constraints');
     lines.push('- **READ-ONLY MODE**: Do NOT edit any source files, do NOT commit/push/deploy, do NOT run destructive commands.');
-    lines.push(`- **Blocking Severities**: Only \`${BLOCKING_REVIEW_SEVERITIES.join('`, `')}\` findings may block package closure.`);
-    lines.push('- `MEDIUM` and `LOW` findings will be archived into `tech-debt.md` and will NOT block this package.');
+    lines.push(blocking
+      ? `- **Blocking Severities**: ${blocking} findings block package closure.`
+      : '- **Blocking Severities**: None configured.');
+    lines.push('- Findings outside the configured blocking severities go into `tech-debt.md`.');
     if (isRound2Closure) {
-      lines.push('- **ROUND 2 NON-DIVERGENT CLOSURE RULE**: Verify ONLY the listed prior findings and any new `BLOCKER` or `HIGH` regressions introduced by the repair.');
+      const regressions = blocking ? ` and any new ${blocking} regressions introduced by the repair` : '';
+      lines.push(`- **ROUND 2 NON-DIVERGENT CLOSURE RULE**: Verify ONLY the listed prior findings${regressions}.`);
     }
     lines.push('');
     lines.push('## Scope & Goal');
@@ -159,7 +161,7 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
     lines.push('');
 
     addBriefField(lines, packDef, 'preserve_behaviors', isRound2Closure
-      ? '在本轮收尾范围内逐条核对下列旧行为，按严重程度报告修复新引入的 `BLOCKER` 或 `HIGH` 回归。'
+      ? '在本轮收尾范围内逐条核对下列旧行为，报告修复新引入且达到本包阻断级别的回归。'
       : '逐条核对下列旧行为，未保住的按严重程度报告。');
     addDecisions(lines, packDef, pack);
     addArtifactDirectory(lines, stateDir, pack.id);
@@ -172,13 +174,18 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
 
     lines.push('## Required Output Format');
     lines.push('Output one standalone `VERDICT: PASS` or `VERDICT: FAIL` line, followed by exactly one fenced `json` block. The JSON `verdict` must agree with the line.');
-    lines.push('Use `FAIL` if any finding is `BLOCKER` or `HIGH`, and `PASS` otherwise. Give every finding a non-empty `title` and a severity of `BLOCKER`, `HIGH`, `MEDIUM`, or `LOW`. Use `findings: []` when there are no findings.');
+    lines.push(blocking ? `Use \`FAIL\` if any finding is ${blocking}, and \`PASS\` otherwise.` : 'Use `PASS` for this configuration.');
+    lines.push('Give every finding a non-empty `title` and a severity of `BLOCKER`, `HIGH`, `MEDIUM`, or `LOW`. Use `findings: []` when there are no findings.');
     lines.push('', 'VERDICT: PASS');
     lines.push('```json');
-    lines.push('{ "verdict": "pass", "summary": "...", "findings": [{ "severity": "LOW", "title": "...", "locator": "File.ext#Class.method", "detail": "...", "rule": "..." }] }');
+    const exampleSeverity = ['LOW', 'MEDIUM', 'HIGH', 'BLOCKER'].find((severity) => !budgets.blockingSeverities.has(severity));
+    const exampleFindings = exampleSeverity
+      ? [{ severity: exampleSeverity, title: '...', locator: 'File.ext#Class.method', detail: '...', rule: '...' }]
+      : [];
+    lines.push(`{ "verdict": "pass", "summary": "...", "findings": ${JSON.stringify(exampleFindings)} }`);
     lines.push('```');
   } else {
-    const isRepair = pack.tier1_repairs > 0 || pack.tier2_repairs > 0;
+    const isRepair = getRepairRounds(pack) > 0;
     const repairs = pack.current_tier === 'tier2' ? pack.tier2_repairs : pack.tier1_repairs;
     const attempt = repairs > 0 ? ` attempt ${repairs}` : '';
     const modeLabel = isRepair ? `REPAIR (${pack.current_tier}${attempt})` : `INITIAL (${pack.current_tier})`;
@@ -267,14 +274,6 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
       lines.push('');
     }
 
-    if (lessons.length > 0) {
-      lines.push('## Injected Lessons from Prior Runs (Do Not Repeat)');
-      for (const l of lessons) {
-        lines.push(`- **${l.id}** (${l.pack_id}/${l.stage}): ${l.summary}${l.rule ? ` → **Rule**: ${l.rule}` : ''}`);
-      }
-      lines.push('');
-    }
-
     const verificationPlan = getVerificationPlan(config, packDef);
     if (verificationPlan.length) {
       lines.push('## Verification Commands');
@@ -286,6 +285,14 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
 
     lines.push('## 超范围发现的报告方式');
     lines.push('发现需要改动但超出授权范围时，不要动这些位置。在最终回复末尾加入标题 `## 超范围没改`，每项单独一行，格式为 `- 位置：说明`。没有这类发现时省略该节。');
+  }
+
+  const lessons = selectLessonsForPack(stateDir, packDef);
+  if (lessons.length) {
+    lines.push('', '## Injected Lessons from Prior Runs (Do Not Repeat)');
+    for (const lesson of lessons) {
+      lines.push(`- **${lesson.id}** (${lesson.pack_id}/${lesson.stage} · ${formatLessonScope(lesson)}): ${lesson.summary} → **Rule**: ${lesson.rule}`);
+    }
   }
 
   ensureDir(runDir);

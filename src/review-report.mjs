@@ -1,5 +1,11 @@
 export const BLOCKING_REVIEW_SEVERITIES = ['BLOCKER', 'HIGH'];
-const REVIEW_SEVERITIES = [...BLOCKING_REVIEW_SEVERITIES, 'MEDIUM', 'LOW'];
+const REVIEW_SEVERITIES = ['BLOCKER', 'HIGH', 'MEDIUM', 'LOW'];
+
+export function getBlockingReviewSeverities(config) {
+  const configured = config?.review?.blocking_severities ?? BLOCKING_REVIEW_SEVERITIES;
+  return new Set(configured.map((severity) => String(severity).toUpperCase())
+    .filter((severity) => REVIEW_SEVERITIES.includes(severity)));
+}
 
 // Some V8 SyntaxErrors omit the offset and include excerpts of the input.
 // Scan the JSON grammar in that case so diagnostics can give a location without echoing the report.
@@ -49,7 +55,7 @@ function locateInvalidJson(json) {
 }
 
 /** Parse the Markdown format emitted by the closing review task. */
-export function parseReviewReport(markdown) {
+export function parseReviewReport(markdown, blockingSeverities = getBlockingReviewSeverities()) {
   const lines = markdown.split(/\r\n|\n|\r/);
   const verdictLines = [];
   const jsonBlocks = [];
@@ -127,8 +133,14 @@ export function parseReviewReport(markdown) {
     return normalized;
   });
 
-  const blockingIndex = findings.findIndex(({ severity }) => BLOCKING_REVIEW_SEVERITIES.includes(severity));
-  if (verdict === 'FAIL' && blockingIndex === -1) errors.push(`${location}, findings: FAIL requires at least one BLOCKER or HIGH finding.`);
-  if (verdict === 'PASS' && blockingIndex !== -1) errors.push(`${location}, finding ${blockingIndex + 1}, severity: PASS cannot include BLOCKER or HIGH findings.`);
+  const blocking = new Set(blockingSeverities);
+  const blockingIndex = findings.findIndex(({ severity }) => blocking.has(severity));
+  if (verdict === 'FAIL' && blockingIndex === -1) {
+    const blockingLabels = [...blocking].join(', ') || 'none';
+    errors.push(`${location}, findings: FAIL requires at least one configured blocking finding (blocking severities: ${blockingLabels}).`);
+  }
+  if (verdict === 'PASS' && blockingIndex !== -1) {
+    errors.push(`${location}, finding ${blockingIndex + 1}, severity: PASS cannot include ${findings[blockingIndex].severity} when it is configured to block.`);
+  }
   return errors.length ? { errors } : { verdict, summary: data.summary ?? '', findings };
 }

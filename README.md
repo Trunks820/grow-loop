@@ -22,7 +22,7 @@
 | 核心对象 | 聊天线程 / 终端窗口 | 工作包（`W01..Wn`）全生命周期状态机 |
 | 返工与升级 | 人肉观察并手动换模型 | 确定性 `2 + 2 + 2` 规则自动升级与硬刹车 |
 | 质量兜底 | 依赖模型自觉 | 强制 **Verify-First**（机器实测先于审查）+ 封顶关包全量审 |
-| 跨包进化 | 每轮重新踩坑 | 错题本（`lessons.json`）按标签自动注入下一包 `task.md` |
+| 跨包进化 | 每轮重新踩坑 | 教训确认后按适用范围写入任务书 |
 | 账号与凭据 | 部分工具接管登录态或换号 | **零托管 5 条红线**（只调本机已登录 CLI，绝不碰凭据） |
 | 换宿主续跑 | 绑死在单一客户端 | 状态默认在 `<repo>/.loop/`，随时换宿主无损接力 |
 
@@ -44,8 +44,8 @@
   - `tier1` 最多修 **2 轮** → 第 3 次失败自动升级到 `tier2`（`tier2_repairs = 1`）。
   - `tier2` 最多修 **2 轮** → 仍未过硬刹车 `PAUSED_FOR_HUMAN`（`BUDGET_EXCEEDED`），交给人拍板，绝不无限死循环。
 - **关包审查封顶 + 严重度底线（`2`）**：
-  - 默认采用**关包全量深审**，最多 **2 轮**（`max_review_rounds: 2`）。第 2 轮只核对上轮阻塞项、“本轮一起修”项和修复新引入的 `BLOCKER` / `HIGH` 回归。
-  - **仅 `BLOCKER` / `HIGH` 阻塞关包**。`MEDIUM` / `LOW` 进入 `.loop/tech-debt.md`。退回轮标“本轮一起修”，通过后按原标题再报的转为待办，其余划掉并标为已修。
+  - 默认采用**关包全量深审**，最多 **2 轮**（`review.max_rounds: 2`）。第 2 轮核对上轮阻塞项、“本轮一起修”项和修复新引入、达到阻断级别的回归。
+  - `review.blocking_severities` 决定哪些级别阻塞关包，默认是 `BLOCKER` 和 `HIGH`。其余发现进入 `.loop/tech-debt.md`。退回轮标“本轮一起修”，审查通过后按原标题再报的转为待办，其余划掉并标为已修。到达审查上限后人工批准提交时，仍标为“本轮一起修”的条目在提交时转为待办。
   - 达到 2 轮上限时：若仍在 `tier1`，自动升级 `tier2` 做一次最终修复（验证通过后暂停请人确认提交，不再开第 3 轮对抗审查）；若已在 `tier2`，立即停机找人（`REVIEW_CAP_REACHED`）。
 - **基础设施故障免疫（Infra Immunity）**：
   - `429` 限流（`INFRA_QUOTA`）、认证失效（`INFRA_AUTH`）、超时（`INFRA_TIMEOUT`）、CLI 崩溃（`INFRA_CLI_CRASH`）**绝不消耗** `tier1`/`tier2` 代码修复额度；默认停机通知人，不悄悄换号。
@@ -143,6 +143,24 @@ grow-loop evidence
 - `verification.retry_once` 默认 `true`。每轮遇到第一条失败就停。第一轮失败后从头重跑整套命令，两轮日志分目录保存。第二轮全过时记为 `flaky`，照常进入审查，不扣修复次数、不记教训。设为 `false` 时只跑一轮。
 
 验证失败后先查看日志。若确认是环境问题，在正式派活前运行 `grow-loop verify --mark-env "本机测试服务未启动"`。CLI 记录原因，撤销该次失败引起的预算、升档、暂停和教训，并立即重跑验证。若重跑仍失败，包留在 `VERIFY`，环境恢复后可再次运行 `grow-loop verify`。
+
+## 教训的确认和挑选
+
+实现失败、验证失败和阻断审查发现自动记为 `draft`（草稿）。审查给出的 `rule` 会预填。`next` 和 `status` 列出待确认的编号和摘要，派活照常。指挥的人补上“下次怎么做”，选定范围后确认。停用时保留教训和原因。
+
+```bash
+grow-loop lesson list --status draft
+grow-loop lesson confirm --id L001 --rule "检查失败后先核对测试数据" --scope global
+grow-loop lesson confirm --id L002 --rule "先初始化考试数据" --scope tags --tags exam
+grow-loop lesson disable --id L001 --reason "检查已由验证脚本覆盖"
+grow-loop record lesson --summary "缺少测试数据" --rule "先初始化考试数据" --scope tags --tags exam
+```
+
+`confirm` 必须提供 `--rule` 和 `--scope`，可选 `--root-cause`。`--scope tags` 省略 `--tags` 时沿用教训自己的功能类别，两处都为空会报错。手动 `record lesson` 同时提供规则和范围时直接记为 `confirmed`（已确认），否则记为草稿。`lesson list` 可查看 `draft`、`confirmed`、`disabled`（已停用）或全部记录。命令操作写入 `events.jsonl`。
+
+每份任务书最多挑 8 条已确认教训，依次优先本包教训、范围与包标签有交集的教训、全局教训。同档按创建时间从新到旧。即使适用标签与来源包的标签不匹配，本包的已确认教训仍优先纳入本包任务书。
+
+`lessons.json` 使用 `status` 保存确认状态，`scope` 保存 `global` 或 `tags`，`scope_tags` 保存适用标签。`tags` 保存所属包的功能类别，`repair_rounds` 保存两档累计修复轮次。提交时更新为最终轮次，并用 `fixed_by` 和 `closed_at` 记录修复包和时间。`lessons.md` 展示状态、范围、功能类别和轮次。旧 `OPEN` / `CLOSED` 记录按规则是否存在读作已确认或草稿，已确认时有标签按标签适用，无标签按全局适用。确认或停用时才将该条旧记录写为新状态。
 
 ## 任务书
 

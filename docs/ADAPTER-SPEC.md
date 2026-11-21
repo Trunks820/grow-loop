@@ -162,7 +162,7 @@ VERDICT: PASS
 ```
 ````
 
-The JSON `verdict` must agree with the standalone line. `findings` must be an array and can be empty. Each finding requires a non-empty `title` and one of `BLOCKER`, `HIGH`, `MEDIUM`, or `LOW`. Severity is case-insensitive. Use `FAIL` when at least one finding is `BLOCKER` or `HIGH`, and `PASS` otherwise. `summary`, `locator`, `detail`, and `rule` are strings when supplied.
+The JSON `verdict` must agree with the standalone line. `findings` must be an array and can be empty. Each finding requires a non-empty `title` and one of `BLOCKER`, `HIGH`, `MEDIUM`, or `LOW`. Severity is case-insensitive. Use `FAIL` when at least one finding matches `review.blocking_severities` in the workspace configuration, and `PASS` otherwise. The default blocking severities are `BLOCKER` and `HIGH`. The CLI uses the same configuration to build the review task, validate the report, and route the findings. `summary`, `locator`, `detail`, and `rule` are strings when supplied. A blocking finding's `rule` prepopulates a lesson draft for the coordinator to confirm.
 
 If the file is unreadable or the report is invalid, dispatch prints the report path and errors with the applicable line, column, finding number, or field. It logs `review_report_invalid`, exits nonzero, and leaves the package in `REVIEW` without consuming a review round. Submit a corrected report or rerun the review. Adapter execution failures and infrastructure errors follow their existing handling.
 

@@ -990,9 +990,11 @@ if (!fs.existsSync('service-ready')) {
       assert.equal(pack.escalation_reason, null);
       assert.equal(pack.gate, null);
       assert.deepEqual([pack.tier1_repairs, pack.tier2_repairs], [0, 0]);
+      assert.equal(pack.repair_rounds, 0);
       assert.equal(pack.last_verify.environment_reason, reason);
       assert.equal(pack.last_verify.repair_undo, undefined);
       assert.deepEqual(readJsonSafe(ctx.paths.lessonsJsonPath).items, [earlier]);
+      assert.deepEqual(runCli(['lesson', 'list', '--status', 'draft'], repoDir).items.map(({ id }) => id), [earlier.id]);
       assert.doesNotMatch(fs.readFileSync(ctx.paths.lessonsMdPath, 'utf8'), /local service unavailable/);
       const marked = readEvents(ctx.paths.eventsPath).find((event) => event.type === 'verify_marked_environment');
       assert.equal(marked.reason, reason);
@@ -1207,7 +1209,7 @@ test('dispatch records valid reviews, rejects invalid reports, and settles in-ro
   const report = path.join(repoDir, 'review.md');
   const legacy = '# Prior tech debt\r\n\r\n- Preserve this entry exactly.\r\n';
   const findings = [
-    { severity: 'HIGH', title: 'Retry skips verification', locator: 'src/retry.mjs#verify' },
+    { severity: 'HIGH', title: 'Retry skips verification', locator: 'src/retry.mjs#verify', rule: 'Verify after each retry' },
     { severity: 'low', title: 'Clarify retry log', detail: 'Include the attempt number' },
     { severity: 'MEDIUM', title: 'Forward elapsed time' }
   ];
@@ -1276,6 +1278,10 @@ test('dispatch records valid reviews, rejects invalid reports, and settles in-ro
     const repairTask = fs.readFileSync(path.join(repair.run_dir, 'task.md'), 'utf8');
     assert.match(repairTask, /## Blocking Findings to Fix\r?\n- .*Retry skips verification/);
     assert.match(repairTask, /## 顺手一起修（不阻断）\r?\n- .*Clarify retry log/);
+    const [draft] = readJsonSafe(ctx.paths.lessonsJsonPath).items;
+    assert.equal(draft.status, 'draft');
+    assert.equal(draft.rule, findings[0].rule);
+    assert.doesNotMatch(repairTask, /## Injected Lessons/);
 
     cli('record', 'implement', '--passed');
     cli('record', 'verify', '--passed', '--allow-self-report');
@@ -1352,7 +1358,10 @@ test('review severity floor overrides fail on MEDIUM/LOW only, and 2-round revie
     recordVerifyOutcome(b.ctx, { passed: true, summary: 'build ok' });
     const r2 = recordReviewOutcome(b.ctx, {
       verdict: 'fail',
-      findings: [{ severity: 'HIGH', title: 'Missing transaction boundary', locator: 'Service.save' }]
+      findings: [
+        { severity: 'HIGH', title: 'Missing transaction boundary', locator: 'Service.save' },
+        { severity: 'LOW', title: 'Add transaction metrics' }
+      ]
     });
     assert.equal(r2.outcome, 'escalated_tier2_on_review_cap');
     assert.equal(b.ctx.state.packs.W01.current_tier, 'tier2');
@@ -1362,6 +1371,11 @@ test('review severity floor overrides fail on MEDIUM/LOW only, and 2-round revie
     const vFinal = recordVerifyOutcome(b.ctx, { passed: true, summary: 'all checks green' });
     assert.equal(vFinal.outcome, 'paused_review_cap_verified');
     assert.equal(b.ctx.state.packs.W01.gate.reason, ALLOWED_GATE_REASONS.REVIEW_CAP_REACHED);
+    assert.equal(readJsonSafe(b.ctx.paths.techDebtJsonPath).items[0].status, 'IN_ROUND');
+    runCli(['resume', '--action', 'commit', '--decision', 'Verification passed after the review cap'], b.repoDir);
+    runCli(['record', 'commit', '--sha', '111111111111'], b.repoDir);
+    assert.equal(readJsonSafe(b.ctx.paths.techDebtJsonPath).items[0].status, 'PENDING');
+    assert.match(fs.readFileSync(b.ctx.paths.techDebtMdPath, 'utf8'), /Add transaction metrics — 待办/);
   } finally {
     fs.rmSync(b.repoDir, { recursive: true, force: true });
   }
@@ -1385,8 +1399,53 @@ test('review severity floor overrides fail on MEDIUM/LOW only, and 2-round revie
     });
     assert.equal(r2.outcome, 'paused_review_cap_reached');
     assert.equal(c.ctx.state.packs.W01.gate.reason, ALLOWED_GATE_REASONS.REVIEW_CAP_REACHED);
+    resumeFromGate(c.ctx, { action: 'repair', decision: 'Allow a final repair' });
+    recordImplementOutcome(c.ctx, { passed: true });
+    recordVerifyOutcome(c.ctx, { passed: true });
+    resumeFromGate(c.ctx, { action: 'commit', decision: 'Final repair verified' });
+    recordCommitOutcome(c.ctx, { sha: '222222222222' });
+    assert.equal(c.ctx.state.packs.W01.tier2_repairs, 1);
+    assert.deepEqual(readJsonSafe(c.ctx.paths.lessonsJsonPath).items.map(({ repair_rounds }) => repair_rounds), [2, 2]);
   } finally {
     fs.rmSync(c.repoDir, { recursive: true, force: true });
+  }
+});
+
+test('review report validation, routing and task briefs share configured blocking severities', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'W', tags: ['retry'] }], {
+    review: { blocking_severities: ['medium'] },
+    verification: { commands: [] }
+  });
+  const cli = (...args) => runCli(args, repoDir);
+  const report = path.join(repoDir, 'review.md');
+  const medium = { severity: 'MEDIUM', title: 'Retry loses result' };
+  const high = { severity: 'HIGH', title: 'Log evidence gap' };
+  try {
+    cli('next');
+    cli('record', 'implement', '--passed');
+    cli('record', 'verify', '--passed');
+    assert.deepEqual(cli('next').blocking_severities, ['MEDIUM']);
+    const preview = cli('dispatch', '--dry-run');
+    const task = fs.readFileSync(path.join(preview.run_dir, 'task.md'), 'utf8');
+    assert.match(task, /Use `FAIL` if any finding is `MEDIUM`/);
+    fs.writeFileSync(report, reviewMarkdown('pass', [medium]));
+    const invalid = runCliFailure(['record', 'review', '--report', report], repoDir);
+    assert.match(JSON.parse(invalid.stdout).errors.join('\n'), /PASS cannot include/);
+    assert.equal(readJsonSafe(ctx.paths.statePath).packs.W.review_rounds, 0);
+
+    fs.writeFileSync(report, reviewMarkdown('fail', [medium, high]));
+    assert.equal(cli('record', 'review', '--report', report).outcome, 'repair_tier1');
+    const pack = readJsonSafe(ctx.paths.statePath).packs.W;
+    assert.deepEqual(pack.pending_blocking_findings, [medium]);
+    const [draft] = readJsonSafe(ctx.paths.lessonsJsonPath).items;
+    assert.deepEqual([draft.status, draft.severity, draft.tags, draft.repair_rounds], ['draft', 'MEDIUM', ['retry'], 0]);
+    cli('record', 'implement', '--passed');
+    cli('record', 'verify', '--passed');
+    fs.writeFileSync(report, reviewMarkdown('pass', [high]));
+    assert.equal(cli('record', 'review', '--report', report).outcome, 'review_passed');
+    assert.equal(readJsonSafe(ctx.paths.techDebtJsonPath).items[0].status, 'PENDING');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
 
@@ -1576,7 +1635,8 @@ test('cross-pack lesson injection and live-smoke test policy banner in generated
       severity: 'HIGH',
       summary: 'Always use explicit column aliases in legacy joins',
       rule: 'Explicitly alias duplicate columns in SQL queries',
-      tags: ['db']
+      tags: ['db'],
+      scope: 'tags'
     });
 
     const runDir = path.join(ctx.paths.runsDir, 'W02', 'test-run');
@@ -1590,6 +1650,125 @@ test('cross-pack lesson injection and live-smoke test policy banner in generated
     assert.match(content, /TEST POLICY \(`forbidden`\)/);
     assert.match(content, /L001/);
     assert.match(content, /Always use explicit column aliases/);
+    assert.match(content, /tags \(db\)/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('verification drafts require confirmation and get the final package repair count on commit', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'W1', tags: ['exam'] }, { id: 'W2', tags: ['exam'] }], {
+    budgets: { tier1_max_repairs: 1 },
+    review: { mode: 'none' },
+    verification: { commands: [`${shellQuote(process.execPath)} check.mjs`], retry_once: false },
+    redaction: { extra_patterns: ['private-marker'] }
+  });
+  const cli = (...args) => runCli(args, repoDir);
+  const preview = (id) => fs.readFileSync(path.join(cli('dispatch', '--dry-run', '--pack', id).run_dir, 'task.md'), 'utf8');
+  const check = path.join(repoDir, 'check.mjs');
+  try {
+    fs.writeFileSync(check, "console.error('Missing exam fixture'); process.exitCode = 1;\n");
+    cli('next');
+    cli('record', 'implement', '--passed');
+    assert.equal(cli('verify').transition.outcome, 'repair_tier1');
+    const [draft] = cli('lesson', 'list', '--status', 'draft').items;
+    assert.deepEqual([draft.stage, draft.tags, draft.repair_rounds], ['VERIFY', ['exam'], 0]);
+    const next = cli('next');
+    assert.deepEqual(next.injected_lessons, []);
+    for (const output of [next, cli('status')]) {
+      assert.equal(output.lesson_draft_notice, '有 1 条教训草稿待确认');
+      assert.deepEqual(output.lesson_drafts, [{ id: draft.id, summary: draft.summary }]);
+    }
+    assert.doesNotMatch(preview('W2'), /L001|Injected Lessons/);
+
+    assert.equal(cli('record', 'implement', '--failed', '--rule', 'Inspect the fixture').outcome, 'escalated_tier2');
+    const implementation = cli('lesson', 'list', '--status', 'draft').items[1];
+    assert.deepEqual([implementation.stage, implementation.tags, implementation.repair_rounds, implementation.rule],
+      ['IMPLEMENT', ['exam'], 1, 'Inspect the fixture']);
+    assert.match(runCliFailure(['lesson', 'confirm', '--id', draft.id, '--scope', 'tags'], repoDir).stderr, /--rule/);
+    const confirmed = cli('lesson', 'confirm', '--id', draft.id, '--rule', 'Seed the exam fixture', '--scope', 'tags',
+      '--root-cause', 'Missing fixture in private-marker');
+    assert.deepEqual([confirmed.status, confirmed.scope_tags], ['confirmed', ['exam']]);
+    assert.equal(confirmed.root_cause, 'Missing fixture in [REDACTED:INTERNAL]');
+    assert.match(preview('W2'), /L001.*tags \(exam\).*Seed the exam fixture/);
+    assert.equal(cli('next').lesson_draft_notice, '有 1 条教训草稿待确认');
+
+    fs.writeFileSync(check, 'process.exitCode = 0;\n');
+    cli('record', 'implement', '--passed');
+    assert.equal(cli('verify').transition.outcome, 'ready_to_commit');
+    cli('record', 'commit', '--sha', '333333333333');
+    const items = readJsonSafe(ctx.paths.lessonsJsonPath).items;
+    assert.deepEqual(items.map(({ status, repair_rounds, fixed_by }) => [status, repair_rounds, fixed_by]),
+      [['confirmed', 2, 'W1'], ['draft', 2, 'W1']]);
+    assert.ok(items.every(({ closed_at }) => Number.isFinite(Date.parse(closed_at))));
+    assert.deepEqual(cli('next').injected_lessons.map(({ id }) => id), [draft.id]);
+    const table = fs.readFileSync(ctx.paths.lessonsMdPath, 'utf8');
+    assert.match(table, /Status \| Scope \| Feature Tags \| Repair Rounds/);
+    assert.match(table, /confirmed \| tags \(exam\) \| exam \| 2/);
+    const event = readEvents(ctx.paths.eventsPath).find(({ type }) => type === 'lesson_confirmed');
+    assert.deepEqual([event.lesson_id, event.previous_status, event.rule, event.root_cause],
+      [draft.id, 'draft', confirmed.rule, confirmed.root_cause]);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('lesson scopes match feature tags, preserve origin package priority and stop injecting disabled rules', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'W1', tags: ['notification'] }, { id: 'W2', tags: ['EXAM'] }]);
+  const cli = (...args) => runCli(args, repoDir);
+  const preview = (id) => fs.readFileSync(path.join(cli('dispatch', '--dry-run', '--pack', id).run_dir, 'task.md'), 'utf8');
+  try {
+    const global = cli('record', 'lesson', '--pack', 'GLOBAL', '--summary', 'Use stable test inputs', '--rule', 'Seed the generator', '--scope', 'global');
+    const draft = cli('record', 'lesson', '--pack', 'GLOBAL', '--summary', 'Use a fixed test date', '--rule', 'Pin the clock');
+    assert.equal(draft.status, 'draft');
+    assert.match(runCliFailure(['lesson', 'confirm', '--id', draft.id, '--rule', 'Freeze time', '--scope', 'tags'], repoDir).stderr, /requires --tags/);
+    const exam = cli('lesson', 'confirm', '--id', draft.id, '--scope', 'tags', '--tags', 'exam, quiz', '--rule', 'Freeze time');
+    assert.deepEqual(exam.scope_tags, ['exam', 'quiz']);
+    assert.match(preview('W2'), /L002.*tags \(exam, quiz\).*Freeze time[\s\S]*L001.*global.*Seed the generator/);
+    assert.match(preview('W1'), /L001.*Seed the generator/);
+    assert.doesNotMatch(preview('W1'), /L002|Freeze time/);
+
+    const own = cli('record', 'lesson', '--pack', 'W1', '--tags', 'exam', '--summary', 'Check the delivery time', '--rule', 'Use UTC', '--scope', 'tags');
+    assert.equal(own.status, 'confirmed');
+    assert.deepEqual(cli('next').injected_lessons.map(({ id }) => id), [own.id, global.id]);
+    const disabled = cli('lesson', 'disable', '--id', global.id, '--reason', 'The generator always uses a fixed seed');
+    assert.equal(disabled.disabled_reason, 'The generator always uses a fixed seed');
+    assert.deepEqual(cli('lesson', 'list', '--status', 'disabled').items, [disabled]);
+    const notification = preview('W1');
+    assert.match(notification, /L003.*Use UTC/);
+    for (const task of [preview('W2'), notification]) assert.doesNotMatch(task, /L001|Seed the generator/);
+    assert.match(preview('W2'), /L002.*Freeze time/);
+    const events = readEvents(ctx.paths.eventsPath);
+    assert.ok(events.some(({ type, lesson_id, reason }) => type === 'lesson_disabled' && lesson_id === global.id && reason === disabled.disabled_reason));
+    assert.ok(events.some(({ type, status, count }) => type === 'lesson_listed' && status === 'disabled' && count === 1));
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('legacy lessons are read in place and injection is capped in priority and recency order', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'W', tags: ['exam'] }]);
+  const cli = (...args) => runCli(args, repoDir);
+  const legacy = (number, fields = {}) => ({
+    id: `L${String(number).padStart(3, '0')}`, status: 'OPEN', pack_id: 'OLD', tags: [],
+    summary: `Legacy lesson ${number}`, rule: 'Repeat this check', created_at: new Date(number * 1000).toISOString(), ...fields
+  });
+  try {
+    const items = [legacy(1, { pack_id: 'W', tags: ['notification'] }), legacy(2, { tags: ['exam'], status: 'CLOSED' }),
+      legacy(3, { rule: '' }), ...Array.from({ length: 8 }, (_, index) => legacy(index + 4))];
+    writeJsonAtomic(ctx.paths.lessonsJsonPath, { next_id: 12, items });
+    const original = fs.readFileSync(ctx.paths.lessonsJsonPath, 'utf8');
+    const next = cli('next');
+    assert.deepEqual(next.lesson_drafts, [{ id: 'L003', summary: 'Legacy lesson 3' }]);
+    assert.deepEqual(next.injected_lessons.map(({ id }) => id), ['L001', 'L002', 'L011', 'L010', 'L009', 'L008', 'L007', 'L006']);
+    assert.equal(fs.readFileSync(ctx.paths.lessonsJsonPath, 'utf8'), original);
+
+    cli('lesson', 'confirm', '--id', 'L003', '--scope', 'global', '--rule', 'Recheck separately');
+    cli('lesson', 'disable', '--id', 'L002', '--reason', 'Rule retired');
+    const updated = readJsonSafe(ctx.paths.lessonsJsonPath).items;
+    assert.deepEqual([updated[0], ...updated.slice(3)], [items[0], ...items.slice(3)]);
+    assert.deepEqual([updated[2].status, updated[2].scope], ['confirmed', 'global']);
+    assert.deepEqual([updated[1].status, updated[1].scope, updated[1].scope_tags], ['disabled', 'tags', ['exam']]);
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
@@ -1628,6 +1807,7 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
     execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir, stdio: 'ignore' });
     execFileSync('git', ['config', 'user.name', 'Test User'], { cwd: repoDir, stdio: 'ignore' });
     fs.writeFileSync(path.join(repoDir, 'README.md'), '# Demo\n', 'utf8');
+    writeJsonAtomic(path.join(repoDir, 'package.json'), { type: 'module' });
     execFileSync('git', ['add', 'README.md'], { cwd: repoDir, stdio: 'ignore' });
     execFileSync('git', ['commit', '-m', 'chore: initial commit'], { cwd: repoDir, stdio: 'ignore' });
 
@@ -1717,7 +1897,7 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
       'record', 'lesson', '--repo', repoDir,
       '--pack', 'W01', '--severity', 'HIGH',
       '--summary', 'Avoid leaking sk-secretkey123456789012345 in logs',
-      '--rule', 'Always redact tokens', '--tags', 'core'
+      '--rule', 'Always redact tokens', '--scope', 'tags', '--tags', 'core'
     ]);
 
     const n2 = runCli(['next', '--repo', repoDir]);

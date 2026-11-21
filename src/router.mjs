@@ -1,10 +1,10 @@
-import { appendEvent, readJsonSafe, saveState, writeJsonAtomic } from './state.mjs';
+import { appendEvent, readJsonSafe, saveState } from './state.mjs';
 import { buildRedactor } from './redact.mjs';
 import { taskBriefWarnings } from './task-builder.mjs';
 import { getVerificationCommands } from './verify.mjs';
 import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
-import { addLesson, closeLessonsForPack, loadLessons, recordReviewTechDebt, renderLessonsMarkdown, selectLessonsForPack } from './lessons.mjs';
-import { BLOCKING_REVIEW_SEVERITIES } from './review-report.mjs';
+import { addLesson, closeLessonsForPack, deferInRoundTechDebt, recordReviewTechDebt, removeLesson, selectLessonsForPack } from './lessons.mjs';
+import { getBlockingReviewSeverities } from './review-report.mjs';
 
 export function getBudgets(config) {
   return {
@@ -12,9 +12,7 @@ export function getBudgets(config) {
     tier2MaxRepairs: config?.budgets?.tier2_max_repairs ?? 2,
     maxReviewRounds: config?.review?.max_rounds ?? 2,
     reviewMode: config?.review?.mode ?? 'closing-full',
-    blockingSeverities: new Set(
-      (config?.review?.blocking_severities || ['BLOCKER', 'HIGH']).map((s) => String(s).toUpperCase())
-    ),
+    blockingSeverities: getBlockingReviewSeverities(config),
     round2NonDivergent: config?.review?.round2_non_divergent ?? true,
     blastRadius: {
       escalateTier2Files: config?.blast_radius?.escalate_tier2_files ?? 25,
@@ -221,12 +219,13 @@ export function startOrAdvanceActivePack(ctx) {
 export function buildNextDirective(ctx, pack, packDef) {
   const { stateDir, config } = ctx;
   const budgets = getBudgets(config);
-  const lessons = selectLessonsForPack(stateDir, packDef, 8);
   const packInfo = {
     pack_id: pack.id,
     title: pack.title,
     warnings: taskBriefWarnings(packDef, config)
   };
+  const injectedLessons = () => selectLessonsForPack(stateDir, packDef)
+    .map(({ id, summary, rule, scope, scope_tags }) => ({ id, summary, rule, scope, scope_tags }));
 
   if (pack.status === 'PAUSED_FOR_HUMAN') {
     return {
@@ -238,7 +237,7 @@ export function buildNextDirective(ctx, pack, packDef) {
   }
 
   if (pack.status === 'IMPLEMENT') {
-    const isRepair = pack.tier1_repairs > 0 || pack.tier2_repairs > 0;
+    const isRepair = getRepairRounds(pack) > 0;
     return {
       action: 'IMPLEMENT',
       mode: isRepair ? 'REPAIR' : 'INITIAL',
@@ -252,7 +251,7 @@ export function buildNextDirective(ctx, pack, packDef) {
         tier2_max: budgets.tier2MaxRepairs
       },
       new_tests_policy: config?.verification?.new_tests || 'optional',
-      injected_lessons: lessons.map((l) => ({ id: l.id, summary: l.summary, rule: l.rule })),
+      injected_lessons: injectedLessons(),
       pending_blocking_findings: pack.pending_blocking_findings || [],
       next_command: `grow-loop dispatch --dry-run (then grow-loop dispatch)`
     };
@@ -281,7 +280,8 @@ export function buildNextDirective(ctx, pack, packDef) {
       review_round: nextRound,
       max_review_rounds: budgets.maxReviewRounds,
       non_divergent_closure_only: nextRound >= 2 && budgets.round2NonDivergent,
-      blocking_severities: BLOCKING_REVIEW_SEVERITIES,
+      blocking_severities: [...budgets.blockingSeverities],
+      injected_lessons: injectedLessons(),
       reviewer_instance: reviewerInstance,
       read_only: true,
       previous_blocking_findings: pack.pending_blocking_findings || [],
@@ -304,6 +304,24 @@ export function buildNextDirective(ctx, pack, packDef) {
   };
 }
 
+export function getRepairRounds(pack) {
+  return pack.repair_rounds ?? ((pack.tier1_repairs ?? 0) + (pack.tier2_repairs ?? 0));
+}
+
+function countRepairRound(pack) {
+  // An approved extra repair can reset the tier budget without resetting the cumulative count.
+  pack.repair_rounds = getRepairRounds(pack) + 1;
+}
+
+function recordFailureLesson(ctx, pack, input) {
+  return addLesson(ctx.stateDir, ctx.config, {
+    ...input,
+    pack_id: pack.id,
+    tags: getPackDef(ctx.manifest, pack.id)?.tags,
+    repair_rounds: getRepairRounds(pack)
+  });
+}
+
 /**
  * Core 2+2 Repair & Auto-Escalation Ladder:
  * - Tier 1 up to tier1_max_repairs (default 2)
@@ -316,6 +334,7 @@ export function applyRepairLadder(ctx, pack, source, reasonSummary) {
   const budgets = getBudgets(config);
 
   if (pack.current_tier === 'tier1' && pack.tier1_repairs < budgets.tier1MaxRepairs) {
+    countRepairRound(pack);
     pack.tier1_repairs += 1;
     pack.status = 'IMPLEMENT';
     appendEvent(stateDir, config, {
@@ -339,6 +358,7 @@ export function applyRepairLadder(ctx, pack, source, reasonSummary) {
     pack.active_instance = nextInstance;
     pack.escalated = true;
     pack.escalation_reason = `Tier 1 (${prevInstance}) failed after ${pack.tier1_repairs}/${budgets.tier1MaxRepairs} repairs (${source}): ${reasonSummary}`;
+    countRepairRound(pack);
     pack.tier2_repairs += 1;
     pack.status = 'IMPLEMENT';
     // Reset native session ID when switching executor instance
@@ -360,6 +380,7 @@ export function applyRepairLadder(ctx, pack, source, reasonSummary) {
 
   // Currently on Tier 2
   if (pack.current_tier !== 'tier1' && pack.tier2_repairs < budgets.tier2MaxRepairs) {
+    countRepairRound(pack);
     pack.tier2_repairs += 1;
     pack.status = 'IMPLEMENT';
     appendEvent(stateDir, config, {
@@ -476,8 +497,7 @@ export function recordImplementOutcome(ctx, payload) {
     return { outcome: 'ready_for_verify', status: pack.status };
   }
 
-  addLesson(stateDir, config, {
-    pack_id: pack.id,
+  recordFailureLesson(ctx, pack, {
     stage: 'IMPLEMENT',
     severity: 'HIGH',
     summary: payload.summary || 'Implementation execution error',
@@ -504,10 +524,7 @@ export function markVerificationEnvironment(ctx, packId, reason) {
     throw new Error(`Pack ${pack.id} has no verification failure eligible for --mark-env. Use it before dispatching the repair.`);
   }
 
-  const store = loadLessons(stateDir);
-  store.items = store.items.filter((item) => item.id !== undo.lesson_id);
-  writeJsonAtomic(paths.lessonsJsonPath, store);
-  renderLessonsMarkdown(paths.lessonsMdPath, store);
+  removeLesson(stateDir, undo.lesson_id);
 
   Object.assign(pack, undo.fields, { status: 'VERIFY' });
   delete lastVerify.repair_undo;
@@ -578,8 +595,8 @@ export function recordVerifyOutcome(ctx, payload) {
       return { outcome: 'verify_environment_failed', status: pack.status };
     }
     const fields = Object.fromEntries(verifyRepairFields.map((field) => [field, pack[field]]));
-    const lesson = addLesson(stateDir, config, {
-      pack_id: pack.id,
+    fields.repair_rounds = getRepairRounds(pack);
+    const lesson = recordFailureLesson(ctx, pack, {
       stage: 'VERIFY',
       severity: 'HIGH',
       summary: payload.summary || 'Machine verification failed',
@@ -635,7 +652,7 @@ export function recordReviewOutcome(ctx, payload) {
     throw new Error(`Pack ${pack.id} is no longer awaiting this review. Check "grow-loop next" before recording a report.`);
   }
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
-  const blockingSeverities = payload.reportPath ? new Set(BLOCKING_REVIEW_SEVERITIES) : budgets.blockingSeverities;
+  const { blockingSeverities } = budgets;
   const reviewer = payload.reviewer || resolveTierInstance(config, 'reviewer');
   const reviewerModel = payload.reviewerModel === undefined ? config?.executors?.[reviewer]?.model : payload.reviewerModel;
   const summary = redactor.redactString(payload.summary || '');
@@ -654,18 +671,16 @@ export function recordReviewOutcome(ctx, payload) {
     }
   }
 
-  // If reviewer passed --verdict fail with zero structured findings, synthesize a single HIGH finding
-  // so repair prompts and lessons never drop the failure reason.
+  // A legacy --verdict fail without findings still needs a configured blocking severity.
   const rawVerdictLower = String(payload.verdict || '').toLowerCase();
-  if (rawVerdictLower === 'fail' && findings.length === 0) {
+  if (rawVerdictLower === 'fail' && findings.length === 0 && blockingSeverities.size) {
     blocking.push({
-      severity: 'HIGH',
+      severity: blockingSeverities.has('HIGH') ? 'HIGH' : blockingSeverities.values().next().value,
       title: summary || `Review round ${pack.review_rounds} failed without structured findings`,
       detail: summary
     });
   }
 
-  // Enforce Severity Floor: only BLOCKER / HIGH may fail a closing review
   const effectivePass = blocking.length === 0;
   const verdictNormalized = effectivePass ? 'PASS' : 'FAIL';
   const debtCount = recordReviewTechDebt(stateDir, config, pack.id, pack.review_rounds, nonBlocking, effectivePass);
@@ -703,15 +718,13 @@ export function recordReviewOutcome(ctx, payload) {
     return {
       outcome: 'review_passed',
       tech_debt_recorded: debtCount,
-      severity_floor_overridden: String(payload.verdict || '').toLowerCase() === 'fail' && blocking.length === 0
+      severity_floor_overridden: rawVerdictLower === 'fail'
     };
   }
 
-  // Blocking findings exist (BLOCKER / HIGH)
   pack.pending_blocking_findings = blocking;
   for (const bf of blocking) {
-    addLesson(stateDir, config, {
-      pack_id: pack.id,
+    recordFailureLesson(ctx, pack, {
       stage: `REVIEW_R${pack.review_rounds}`,
       severity: bf.severity,
       summary: bf.title || bf.summary || 'Blocking review finding',
@@ -732,6 +745,7 @@ export function recordReviewOutcome(ctx, payload) {
       pack.active_instance = next;
       pack.escalated = true;
       pack.escalation_reason = `Review cap (${pack.review_rounds}/${budgets.maxReviewRounds}) hit on tier1 with ${blocking.length} blocking findings`;
+      countRepairRound(pack);
       pack.tier2_repairs += 1;
       pack.last_session_id = null;
       pack.status = 'IMPLEMENT';
@@ -798,9 +812,10 @@ export function recordCommitOutcome(ctx, payload) {
     stateDir,
     config,
     pack.id,
-    pack.active_instance,
+    getRepairRounds(pack),
     pack.last_verify?.summary || `commit:${payload.sha?.slice(0, 9)}`
   );
+  deferInRoundTechDebt(stateDir, pack.id);
 
   appendEvent(stateDir, config, {
     type: 'pack_committed',
@@ -889,6 +904,7 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
     pack.gate = null;
     if (act === 'repair') {
       // Explicit human authorization grants one extra repair round on current tier
+      countRepairRound(pack);
       if (pack.current_tier === 'tier2') {
         pack.tier2_repairs = Math.max(0, getBudgets(config).tier2MaxRepairs - 1);
       } else {
