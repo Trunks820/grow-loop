@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { buildRedactor } from './redact.mjs';
 
 export const DEFAULT_STATE_DIR_NAME = '.loop';
@@ -24,13 +25,16 @@ export function getStatePaths(stateDir) {
     stateDir,
     configPath: path.join(stateDir, 'config.json'),
     manifestPath: path.join(stateDir, 'manifest.json'),
+    manifestSnapshotPath: path.join(stateDir, 'manifest.snapshot.json'),
     statePath: path.join(stateDir, 'state.json'),
     eventsPath: path.join(stateDir, 'events.jsonl'),
     lessonsJsonPath: path.join(stateDir, 'lessons.json'),
     lessonsMdPath: path.join(stateDir, 'lessons.md'),
+    techDebtJsonPath: path.join(stateDir, 'tech-debt.json'),
     techDebtMdPath: path.join(stateDir, 'tech-debt.md'),
     probeCachePath: path.join(stateDir, 'probe-cache.json'),
     runsDir: path.join(stateDir, 'runs'),
+    artifactsDir: path.join(stateDir, 'artifacts'),
     evidenceMdPath: path.join(stateDir, 'evidence.md')
   };
 }
@@ -53,6 +57,32 @@ export function writeJsonAtomic(filePath, data) {
 export function readJsonSafe(filePath, fallback = null) {
   if (!fs.existsSync(filePath)) return fallback;
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+export function validateManifest(manifest) {
+  if (!Array.isArray(manifest?.packs)) {
+    throw new Error('Manifest must be a JSON object with a packs array.');
+  }
+  const ids = new Set();
+  for (const pack of manifest.packs) {
+    if (typeof pack?.id !== 'string' || !pack.id.trim() || ids.has(pack.id)) {
+      throw new Error('Each manifest pack must have a unique non-empty string id.');
+    }
+    ids.add(pack.id);
+  }
+}
+
+export function readManifest(filePath) {
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    if (error instanceof SyntaxError) throw new Error('Manifest must contain valid JSON.');
+    throw error;
+  }
+  validateManifest(manifest);
+  return manifest;
 }
 
 export function readEvents(eventsPath) {
@@ -120,7 +150,10 @@ export function createInitialPackState(packDef) {
     review_rounds: 0,
     infra_failures: 0,
     last_session_id: null,
+    last_session_route: null,
     last_run_id: null,
+    inflight_run: null,
+    prepared_run: null,
     last_verify: null,
     last_review: null,
     pending_blocking_findings: [],
@@ -128,18 +161,27 @@ export function createInitialPackState(packDef) {
     gate: null,
     blast_radius: null,
     commit: null,
+    base_commit: null,
+    base_branch: null,
     started_at: null,
     completed_at: null
   };
 }
 
+export function invalidateSession(pack) {
+  pack.last_session_id = null;
+  if (pack.inflight_run) pack.inflight_run.route_changed = true;
+}
+
+export function rememberSession(pack, sessionId, stage, instance) {
+  pack.last_session_id = sessionId;
+  pack.last_session_route = { id: sessionId, stage, instance };
+}
+
 export function createInitialState(repoDir, stateDir, profileName, manifest) {
-  const packs = {};
-  const packOrder = [];
-  for (const p of manifest.packs || []) {
-    packOrder.push(p.id);
-    packs[p.id] = createInitialPackState(p);
-  }
+  const packDefs = manifest.packs || [];
+  const packs = Object.fromEntries(packDefs.map((pack) => [pack.id, createInitialPackState(pack)]));
+  const packOrder = packDefs.map((pack) => pack.id);
   return {
     schema_version: '0.1',
     repo_dir: path.resolve(repoDir),
@@ -149,29 +191,35 @@ export function createInitialState(repoDir, stateDir, profileName, manifest) {
     active_pack_id: packOrder[0] || null,
     pack_order: packOrder,
     packs,
+    todos: [],
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString()
   };
 }
 
 /**
- * Sync manifest additions into existing state without clobbering finished packs.
+ * Sync the confirmed manifest while retaining historical pack records.
  */
 export function syncManifestIntoState(state, manifest) {
   const order = [];
   for (const p of manifest.packs || []) {
     order.push(p.id);
-    if (!state.packs[p.id]) {
-      state.packs[p.id] = createInitialPackState(p);
-    } else {
+    if (!Object.hasOwn(state.packs, p.id)) {
+      Object.defineProperty(state.packs, p.id, {
+        value: createInitialPackState(p), enumerable: true, writable: true, configurable: true
+      });
+    } else if (state.packs[p.id].status !== 'COMMITTED') {
       state.packs[p.id].title = p.title || state.packs[p.id].title;
       state.packs[p.id].risk = p.risk || state.packs[p.id].risk;
     }
   }
   state.pack_order = order;
-  if (!state.active_pack_id) {
-    state.active_pack_id = order.find((id) => state.packs[id]?.status !== 'COMMITTED') || null;
+  const firstUnfinished = order.find((id) => state.packs[id].status !== 'COMMITTED') || null;
+  const restart = firstUnfinished && ['COMPLETED', 'IDLE'].includes(state.loop_status);
+  if (restart || !order.includes(state.active_pack_id) || state.packs[state.active_pack_id].status === 'COMMITTED') {
+    state.active_pack_id = firstUnfinished;
   }
+  if (restart) state.loop_status = 'RUNNING';
   return state;
 }
 
@@ -181,17 +229,140 @@ export function saveState(stateDir, state) {
   writeJsonAtomic(statePath, state);
 }
 
-export function loadWorkspace(repoDir, explicitStateDir) {
+export function addScopeTodos(ctx, { packId, runId = null, texts, reason }) {
+  if (!texts.length) return [];
+  const { stateDir, config, state } = ctx;
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  const todos = state.todos ??= [];
+  const added = [];
+  for (const text of texts) {
+    const todo = {
+      id: `T${String(todos.length + 1).padStart(3, '0')}`,
+      pack_id: packId,
+      run_id: runId,
+      content: redactor.redactString(text),
+      status: 'open',
+      created_at: new Date().toISOString()
+    };
+    todos.push(todo);
+    added.push(todo);
+  }
+  saveState(stateDir, state);
+  for (const todo of added) appendEvent(stateDir, config, { type: 'todo_added', ...todo, reason });
+  return added;
+}
+
+function describeManifestChanges(previous, manifest, config) {
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  const secretField = /^(?:api[_-]?key|app[_-]?secret|(?:(?:access|refresh|auth)[_-]?)?token|password|passwd|cookie|authorization|secret(?:[_-]?key)?)$/i;
+
+  function redactField(field, value) {
+    if (secretField.test(field)) return '[REDACTED:SECRET]';
+    if (Array.isArray(value)) return value.map((item) => redactField('', item));
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+        redactor.redactString(key), redactField(key, item)
+      ]));
+    }
+    return redactor.redactValue(value);
+  }
+
+  function fieldChanges(before, after, excluded) {
+    const fields = new Set([...Object.keys(before), ...Object.keys(after)]);
+    fields.delete(excluded);
+    return [...fields].filter((field) => !isDeepStrictEqual(before[field], after[field])).map((field) => ({
+      field: redactor.redactString(field),
+      old_value: Object.hasOwn(before, field) ? redactField(field, before[field]) : null,
+      new_value: Object.hasOwn(after, field) ? redactField(field, after[field]) : null,
+      ...(Object.hasOwn(before, field) ? {} : { old_missing: true }),
+      ...(Object.hasOwn(after, field) ? {} : { new_missing: true })
+    }));
+  }
+
+  const before = new Map(previous.packs.map((pack) => [pack.id, pack]));
+  const after = new Map(manifest.packs.map((pack) => [pack.id, pack]));
+  const oldOrder = [...before.keys()];
+  const newOrder = [...after.keys()];
+  const orderChanged = !isDeepStrictEqual(oldOrder.filter((id) => after.has(id)), newOrder.filter((id) => before.has(id)));
+  const changedPacks = [];
+  for (const [id, pack] of after) {
+    if (!before.has(id)) continue;
+    const fields = fieldChanges(before.get(id), pack, 'id');
+    if (fields.length) changedPacks.push({ id: redactor.redactString(id), fields });
+  }
+  return {
+    added_packs: newOrder.filter((id) => !before.has(id)).map(redactor.redactString),
+    removed_packs: oldOrder.filter((id) => !after.has(id)).map(redactor.redactString),
+    order_changed: orderChanged,
+    ...(orderChanged ? {
+      old_order: oldOrder.map(redactor.redactString),
+      new_order: newOrder.map(redactor.redactString)
+    } : {}),
+    changed_packs: changedPacks,
+    manifest_fields: fieldChanges(previous, manifest, 'packs')
+  };
+}
+
+export class ManifestChangedError extends Error {
+  constructor(pending) {
+    super('Manifest changes are pending acknowledgment.');
+    this.pending = pending;
+  }
+}
+
+export function checkManifest(paths, manifest, config, { allowPendingManifest = false } = {}) {
+  const snapshot = readManifest(paths.manifestSnapshotPath);
+  const pending = snapshot && !isDeepStrictEqual(snapshot, manifest) ? {
+    changes: describeManifestChanges(snapshot, manifest, config),
+    ack_command: 'grow-loop manifest-ack --reason "<reason>"'
+  } : null;
+  if (pending && !allowPendingManifest) throw new ManifestChangedError(pending);
+  return { snapshot, pending };
+}
+
+export function writeManifestWithReason(ctx, manifest, reason, source, details) {
+  if (typeof reason !== 'string' || !reason.trim()) {
+    throw new Error('Specify a non-empty --reason.');
+  }
+  validateManifest(manifest);
+
+  const { paths, config, stateDir, state } = ctx;
+  const current = readManifest(paths.manifestPath);
+  if (!current) throw new Error('Workspace manifest is missing.');
+  const alreadyWritten = isDeepStrictEqual(current, manifest);
+  // A manual edit made after loading the workspace must stay pending.
+  const { snapshot, pending } = checkManifest(paths, current, config, {
+    allowPendingManifest: source === 'manifest_ack' && alreadyWritten
+  });
+  const previous = snapshot || current;
+  const changed = !isDeepStrictEqual(previous, manifest);
+  if (!changed && !details) return null;
+
+  const changes = pending?.changes || describeManifestChanges(previous, manifest, config);
+  if (!alreadyWritten) writeJsonAtomic(paths.manifestPath, manifest);
+  appendEvent(stateDir, config, { type: 'manifest_changed', source, reason: reason.trim(), changes, ...(details && { details }) });
+  syncManifestIntoState(state, manifest);
+  saveState(stateDir, state);
+  // A new snapshot marks the audited change as fully applied.
+  if (changed) writeJsonAtomic(paths.manifestSnapshotPath, manifest);
+  ctx.manifest = manifest;
+  ctx.manifestChange = null;
+  return changes;
+}
+
+export function loadWorkspace(repoDir, explicitStateDir, options) {
   const stateDir = resolveStateDir(repoDir, explicitStateDir);
   const paths = getStatePaths(stateDir);
   const config = readJsonSafe(paths.configPath);
-  const manifest = readJsonSafe(paths.manifestPath);
+  const manifest = readManifest(paths.manifestPath);
   const state = readJsonSafe(paths.statePath);
   if (!config || !manifest || !state) {
     throw new Error(
       `grow-loop state not initialized in "${stateDir}". Run "grow-loop init --profile <standard-test|live-smoke>" first.`
     );
   }
-  syncManifestIntoState(state, manifest);
-  return { stateDir, paths, config, manifest, state };
+  const { snapshot, pending } = checkManifest(paths, manifest, config, options);
+  if (!snapshot) writeJsonAtomic(paths.manifestSnapshotPath, manifest);
+  syncManifestIntoState(state, snapshot || manifest);
+  return { stateDir, paths, config, manifest, state, manifestChange: pending };
 }

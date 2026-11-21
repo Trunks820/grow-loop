@@ -1,9 +1,124 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureDir } from './state.mjs';
-import { selectLessonsForPack } from './lessons.mjs';
+import { ensureDir, getStatePaths } from './state.mjs';
+import { formatLessonScope, inRoundTechDebt, selectLessonsForPack } from './lessons.mjs';
 import { buildRedactor } from './redact.mjs';
-import { getBudgets } from './router.mjs';
+import { getBudgets, getRepairRounds } from './router.mjs';
+import { getVerificationPlan } from './verify.mjs';
+import { namesCode, scanReferences } from './ref-scan.mjs';
+
+const briefFields = {
+  pitfalls: '避坑提示',
+  co_change_files: '要一起改的文件',
+  preserve_behaviors: '要保住的旧行为'
+};
+
+function textItems(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item.trim()) : [];
+}
+
+export function taskBriefWarnings(packDef, config) {
+  const warnings = [];
+  for (const [field, heading] of Object.entries(briefFields)) {
+    if (!textItems(packDef[field]).length) warnings.push(`「${heading}」未填写。`);
+  }
+  for (const [index, hint] of (Array.isArray(packDef.pitfalls) ? packDef.pitfalls : []).entries()) {
+    if (typeof hint === 'string' && hint.trim() && !namesCode(hint)) {
+      warnings.push(`第 ${index + 1} 条避坑提示未点名代码：${hint}`);
+    }
+  }
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  return warnings.map(redactor.redactString);
+}
+
+export function parseOutOfScopeItems(markdown, { includeSection = false } = {}) {
+  const items = [];
+  let fence = null;
+  let inSection = false;
+  let hasSection = false;
+  const lines = markdown.replace(/^\uFEFF/, '').split(/\r?\n/);
+  const listItem = /^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]+(.+)$/;
+  for (const [index, line] of lines.entries()) {
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (marker?.[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = null;
+      continue;
+    }
+    if (marker) {
+      fence = marker[1];
+      continue;
+    }
+    const item = line.match(listItem)?.[1].trim();
+    const atxHeading = /^ {0,3}#{1,6}(?:[ \t]|$)/.test(line);
+    const setextHeading = !item && /^ {0,3}\S/.test(line) && /^ {0,3}(?:=+|-+)[ \t]*$/.test(lines[index + 1] || '');
+    if (atxHeading || setextHeading) {
+      inSection = line.includes('超范围没改');
+      hasSection ||= inSection;
+      continue;
+    }
+    if (inSection) {
+      const text = item?.replace(/^\[[ xX]\]\s*/, '').trim().replace(/^(\*{1,2}|_{1,2})(.+)\1$/, '$2').trim();
+      if (text && !/^(?:无|没有|暂无)[。.!！]?$/.test(text)) items.push(item);
+    }
+  }
+  return includeSection ? { items, hasSection } : items;
+}
+
+function addBriefField(lines, packDef, field, guidance) {
+  lines.push(`## ${briefFields[field]}`);
+  if (guidance) lines.push(guidance, '');
+  const items = textItems(packDef[field]);
+  lines.push(...(items.length ? items.map((item) => `- ${item}`) : ['未填写。']), '');
+}
+
+function addVerbatim(lines, decision) {
+  if (typeof decision !== 'string' || !decision.trim()) {
+    lines.push('未记录原话。', '');
+    return;
+  }
+  const longest = (decision.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 2);
+  const fence = '`'.repeat(longest + 1);
+  lines.push(`${fence}text`, decision, fence, '');
+}
+
+function addDecisions(lines, packDef, pack) {
+  lines.push('## 已经定了的', '与本任务书其他描述冲突时，以这里的原话为准。', '');
+  const approvals = Object.entries(pack.resolved_gates || {}).map(([gate_reason, approval]) => ({
+    ...approval, gate_reason, action: 'approve', at: approval.approved_at
+  }));
+  const gateDecisions = [...approvals, ...(pack.decisions || [])];
+  const questions = new Set([...textItems(packDef.open_questions), ...gateDecisions.flatMap((entry) => textItems(entry.questions))]);
+  if (questions.size) {
+    lines.push('本包提出的问题', ...[...questions].map((question) => `- ${question}`), '');
+  }
+
+  const decisions = Array.isArray(packDef.decisions) ? packDef.decisions.filter(Boolean) : [];
+  for (const { question, decision, at } of decisions) {
+    lines.push(`- 方案问题：${question || '未记录'}（时间：${at || '未记录'}）`, '');
+    addVerbatim(lines, decision);
+  }
+  for (const { gate_reason, action, decision, at } of gateDecisions) {
+    lines.push(`- 门禁 \`${gate_reason}\`（${action}，时间：${at || '未记录'}）`, '');
+    addVerbatim(lines, decision);
+  }
+  if (!decisions.length && !gateDecisions.length) lines.push('暂无决定记录。', '');
+}
+
+function addArtifactDirectory(lines, stateDir, packId) {
+  const artifactsDir = path.join(getStatePaths(stateDir).artifactsDir, packId);
+  lines.push('## 产物放哪');
+  lines.push(`报告、截图和草稿一律放到 \`${artifactsDir.replace(/\\/g, '/')}/\`。请勿把这些产物写到仓库的其他位置或加入 Git。`, '');
+}
+
+function addReviewFindings(lines, heading, findings, instruction) {
+  if (!findings?.length) return;
+  lines.push(`## ${heading}`);
+  if (instruction) lines.push(instruction, '');
+  for (const { severity, title, summary, locator, detail } of findings) {
+    lines.push(`- **[${severity}]** ${title || summary}${locator ? ` (\`${locator}\`)` : ''}${detail ? `: ${detail}` : ''}`);
+  }
+  lines.push('');
+}
 
 /**
  * Build a bounded, self-contained UTF-8 task prompt for an executor or reviewer run.
@@ -14,23 +129,26 @@ import { getBudgets } from './router.mjs';
  * - Blocking findings to fix (in REPAIR mode) or Round-2 non-divergent closure scope (in REVIEW R2)
  */
 export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
-  const { stateDir, config } = ctx;
+  const { stateDir, config, state } = ctx;
   const budgets = getBudgets(config);
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
-  const lessons = selectLessonsForPack(stateDir, packDef, 8);
   const lines = [];
 
   if (stage === 'review') {
     const nextRound = pack.review_rounds + 1;
     const isRound2Closure = nextRound >= 2 && budgets.round2NonDivergent;
+    const blocking = [...budgets.blockingSeverities].map((severity) => `\`${severity}\``).join(' or ');
     lines.push(`# Closing Code Review (Round ${nextRound}/${budgets.maxReviewRounds}) · ${pack.id}: ${pack.title}`);
     lines.push('');
     lines.push('## Hard Constraints');
     lines.push('- **READ-ONLY MODE**: Do NOT edit any source files, do NOT commit/push/deploy, do NOT run destructive commands.');
-    lines.push(`- **Blocking Severities**: Only \`${[...budgets.blockingSeverities].join('`, `')}\` findings may block package closure.`);
-    lines.push('- `MEDIUM` and `LOW` findings will be archived into `tech-debt.md` and will NOT block this package.');
+    lines.push(blocking
+      ? `- **Blocking Severities**: ${blocking} findings block package closure.`
+      : '- **Blocking Severities**: None configured.');
+    lines.push('- Findings outside the configured blocking severities go into `tech-debt.md`.');
     if (isRound2Closure) {
-      lines.push('- **ROUND 2 NON-DIVERGENT CLOSURE RULE**: Verify ONLY whether Round 1 blocking findings are cleanly closed AND whether the repair introduced any NEW `BLOCKER` or `HIGH` regressions. Do NOT expand scope into unrelated legacy nitpicks.');
+      const regressions = blocking ? ` and any new ${blocking} regressions introduced by the repair` : '';
+      lines.push(`- **ROUND 2 NON-DIVERGENT CLOSURE RULE**: Verify ONLY the listed prior findings${regressions}.`);
     }
     lines.push('');
     lines.push('## Scope & Goal');
@@ -42,22 +160,35 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
     }
     lines.push('');
 
-    if (pack.pending_blocking_findings?.length) {
-      lines.push('## Prior Round Blocking Findings to Verify Closed');
-      for (const bf of pack.pending_blocking_findings) {
-        lines.push(`- **[${bf.severity}]** ${bf.title || bf.summary}${bf.locator ? ` (\`${bf.locator}\`)` : ''}${bf.detail ? `: ${bf.detail}` : ''}`);
-      }
-      lines.push('');
+    addBriefField(lines, packDef, 'preserve_behaviors', isRound2Closure
+      ? '在本轮收尾范围内逐条核对下列旧行为，报告修复新引入且达到本包阻断级别的回归。'
+      : '逐条核对下列旧行为，未保住的按严重程度报告。');
+    addDecisions(lines, packDef, pack);
+    addArtifactDirectory(lines, stateDir, pack.id);
+
+    addReviewFindings(lines, 'Prior Round Blocking Findings to Verify Closed', pack.pending_blocking_findings);
+    if (nextRound >= 2) {
+      addReviewFindings(lines, '顺手一起修（不阻断）', inRoundTechDebt(stateDir, pack.id),
+        '只核对下列条目。仍未修好的按原 `title` 再报一次，已修好的省略。');
     }
 
     lines.push('## Required Output Format');
-    lines.push('Output a clear `VERDICT: PASS` or `VERDICT: FAIL`, followed by a JSON block matching:');
+    lines.push('Output one standalone `VERDICT: PASS` or `VERDICT: FAIL` line, followed by exactly one fenced `json` block. The JSON `verdict` must agree with the line.');
+    lines.push(blocking ? `Use \`FAIL\` if any finding is ${blocking}, and \`PASS\` otherwise.` : 'Use `PASS` for this configuration.');
+    lines.push('Give every finding a non-empty `title` and a severity of `BLOCKER`, `HIGH`, `MEDIUM`, or `LOW`. Use `findings: []` when there are no findings.');
+    lines.push('', 'VERDICT: PASS');
     lines.push('```json');
-    lines.push('{ "verdict": "pass|fail", "summary": "...", "findings": [{ "severity": "BLOCKER|HIGH|MEDIUM|LOW", "title": "...", "locator": "File.ext#Class.method", "detail": "...", "rule": "..." }] }');
+    const exampleSeverity = ['LOW', 'MEDIUM', 'HIGH', 'BLOCKER'].find((severity) => !budgets.blockingSeverities.has(severity));
+    const exampleFindings = exampleSeverity
+      ? [{ severity: exampleSeverity, title: '...', locator: 'File.ext#Class.method', detail: '...', rule: '...' }]
+      : [];
+    lines.push(`{ "verdict": "pass", "summary": "...", "findings": ${JSON.stringify(exampleFindings)} }`);
     lines.push('```');
   } else {
-    const isRepair = pack.tier1_repairs > 0 || pack.tier2_repairs > 0;
-    const modeLabel = isRepair ? `REPAIR (${pack.current_tier} attempt ${pack.current_tier === 'tier2' ? pack.tier2_repairs : pack.tier1_repairs})` : `INITIAL (${pack.current_tier})`;
+    const isRepair = getRepairRounds(pack) > 0;
+    const repairs = pack.current_tier === 'tier2' ? pack.tier2_repairs : pack.tier1_repairs;
+    const attempt = repairs > 0 ? ` attempt ${repairs}` : '';
+    const modeLabel = isRepair ? `REPAIR (${pack.current_tier}${attempt})` : `INITIAL (${pack.current_tier})`;
     lines.push(`# Work Package ${pack.id} · ${modeLabel} — ${pack.title}`);
     lines.push('');
     lines.push('## Hard Constraints');
@@ -89,35 +220,78 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
     }
     lines.push('');
 
-    if (isRepair && pack.pending_blocking_findings?.length) {
-      lines.push('## Blocking Findings to Fix');
-      for (const bf of pack.pending_blocking_findings) {
-        lines.push(`- **[${bf.severity}]** ${bf.title || bf.summary}${bf.locator ? ` (\`${bf.locator}\`)` : ''}${bf.detail ? `: ${bf.detail}` : ''}`);
+    for (const field of Object.keys(briefFields)) addBriefField(lines, packDef, field);
+    addDecisions(lines, packDef, pack);
+
+    lines.push('## 可能要一起改的文件', '', '### 可能要一起改，请确认', '授权范围以本包清单为准。');
+    const references = scanReferences(state?.repo_dir || process.cwd(), stateDir, packDef);
+    if (references.skipped) {
+      lines.push(`没扫（${references.skipped}）。`);
+    } else if (references.matches.size) {
+      for (const [file, term] of references.matches) lines.push(`- \`${file}\`（命中 \`${term}\`）`);
+    } else {
+      lines.push('未找到范围外的引用文件。');
+    }
+    lines.push('');
+
+    lines.push('## 转来的发现');
+    if (packDef.forwarded_findings?.length) {
+      for (const finding of packDef.forwarded_findings) {
+        lines.push(`- 来源包 ${finding.from_pack_id}。原因：${finding.reason}`);
+        lines.push(`  ${finding.content}`);
       }
-      lines.push('');
+    } else {
+      lines.push('暂无。');
+    }
+    lines.push('');
+    addArtifactDirectory(lines, stateDir, pack.id);
+
+    if (isRepair) {
+      addReviewFindings(lines, 'Blocking Findings to Fix', pack.pending_blocking_findings);
+      addReviewFindings(lines, '顺手一起修（不阻断）', inRoundTechDebt(stateDir, pack.id));
     }
 
     if (isRepair && pack.last_verify && !pack.last_verify.passed) {
       lines.push('## Last Machine Verification Failure');
-      lines.push(`- Command: \`${pack.last_verify.command || 'configured verify'}\``);
+      const failure = pack.last_verify.failure;
+      lines.push(`- Command: \`${failure?.command || pack.last_verify.command || 'configured verify'}\``);
       lines.push(`- Summary: ${pack.last_verify.summary}`);
-      lines.push('');
-    }
-
-    if (lessons.length > 0) {
-      lines.push('## Injected Lessons from Prior Runs (Do Not Repeat)');
-      for (const l of lessons) {
-        lines.push(`- **${l.id}** (${l.pack_id}/${l.stage}): ${l.summary}${l.rule ? ` → **Rule**: ${l.rule}` : ''}`);
+      if (failure) {
+        lines.push(`- Exit code: ${failure.exit_code}`);
+        lines.push(`- Timed out: ${failure.timed_out ? 'yes' : 'no'}`);
+        lines.push(`- stdout log: \`${failure.stdout_log}\``);
+        lines.push(`- stderr log: \`${failure.stderr_log}\``);
+        if (failure.test_names.length) {
+          lines.push('', '### Failed Tests', ...failure.test_names.map((name) => `- ${name}`));
+        }
+        if (failure.assertion_lines.length) {
+          lines.push('', '### Assertion Lines', ...failure.assertion_lines.map((line) => `    ${line}`));
+        }
+        if (failure.excerpt) {
+          lines.push('', '### Output Excerpt', ...failure.excerpt.split('\n').map((line) => `    ${line}`));
+        }
       }
       lines.push('');
     }
 
-    if (Array.isArray(config?.verification?.commands) && config.verification.commands.length) {
+    const verificationPlan = getVerificationPlan(config, packDef);
+    if (verificationPlan.length) {
       lines.push('## Verification Commands');
-      for (const cmd of config.verification.commands) {
-        lines.push(`- \`${cmd}\``);
+      for (const { command, source } of verificationPlan) {
+        lines.push(`- \`${command}\` (${source})`);
       }
       lines.push('');
+    }
+
+    lines.push('## 超范围发现的报告方式');
+    lines.push('发现需要改动但超出授权范围时，不要动这些位置。在最终回复末尾加入标题 `## 超范围没改`，每项单独一行，格式为 `- 位置：说明`。没有这类发现时省略该节。');
+  }
+
+  const lessons = selectLessonsForPack(stateDir, packDef);
+  if (lessons.length) {
+    lines.push('', '## Injected Lessons from Prior Runs (Do Not Repeat)');
+    for (const lesson of lessons) {
+      lines.push(`- **${lesson.id}** (${lesson.pack_id}/${lesson.stage} · ${formatLessonScope(lesson)}): ${lesson.summary} → **Rule**: ${lesson.rule}`);
     }
   }
 

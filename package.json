@@ -1,6 +1,6 @@
 {
   "name": "grow-loop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Harness-agnostic multi-package delivery loop with tiered routing, 2+2+2 escalation/review budgets, zero-custody CLI adapters, lessons injection, and redacted evidence packs.",
   "type": "module",
   "author": "Trunks820",
@@ -22,6 +22,7 @@
   "files": [
     "SKILL.md",
     "README.md",
+    "CHANGELOG.md",
     "bin/",
     "src/",
     "profiles/",

@@ -36,6 +36,8 @@ export function generateEvidencePack(ctx, outputPath) {
   const { stateDir, config, manifest, state } = ctx;
   const paths = getStatePaths(stateDir);
   const events = readEvents(paths.eventsPath);
+  const finalImplementations = new Map(events.filter(({ type }) => type === 'implement_completed')
+    .map((event) => [event.pack_id, event]));
   const lessonsStore = loadLessons(stateDir);
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
 
@@ -55,11 +57,15 @@ export function generateEvidencePack(ctx, outputPath) {
 
   for (const id of state.pack_order) {
     const p = state.packs[id];
+    const implementation = finalImplementations.get(id);
+    const instance = implementation?.instance || p.active_instance || '未派发';
+    const tool = implementation?.executor_tool || '无记录';
+    const model = implementation?.executor_model || '无记录';
     const sha = p.commit?.sha ? `\`${p.commit.sha.slice(0, 9)}\`` : '未提交';
     const diffStat = p.commit ? `${p.commit.files} files (\`+${p.commit.insertions}/-${p.commit.deletions}\`)` : '无记录';
     const repairs = `${p.tier1_repairs} / ${p.tier2_repairs}${p.escalated ? ' (已升级T2)' : ''}`;
     lines.push(
-      `| **${esc(p.id)}** | ${esc(p.title)} | \`${esc(p.active_instance || '未派发')}\` | ${sha} | ${diffStat} | ${repairs} | ${p.review_rounds} | **${esc(p.status)}** |`
+      `| **${esc(p.id)}** | ${esc(p.title)} | ${esc(instance)} · ${esc(tool)} / ${esc(model)} | ${sha} | ${diffStat} | ${repairs} | ${p.review_rounds} | **${esc(p.status)}** |`
     );
   }
   lines.push('');

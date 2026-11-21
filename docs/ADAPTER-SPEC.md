@@ -1,10 +1,10 @@
-# Executor Adapter Specification (`grow-loop` v0.1)
+# Executor Adapter Specification
 
-`grow-loop` separates **delivery governance** (state machine, budgets, gates, lessons, evidence) from **model execution**. Any local AI coding CLI can participate as a `tier1`, `tier2`, or `reviewer` instance by implementing a thin driver under `src/adapters/`.
+`grow-loop` separates **delivery governance** (state machine, budgets, gates, lessons, evidence) from **model execution**. Any local AI coding CLI can participate as a `tier1`, `tier2`, or `reviewer` instance by implementing a thin driver under `src/adapters/`. For the operator workflow, see the [coordinator protocol](../SKILL.md#coordinator-execution-protocol-mode-a).
 
 ---
 
-## 1. Instance-Level Registry (Not Vendor-Level)
+## 1. Executor Instances
 
 In `.loop/config.json`, `executors` maps **instance IDs** rather than vendor names. The same CLI binary can appear multiple times with different models, reasoning effort, sandboxes, or accounts:
 
@@ -47,7 +47,7 @@ In `.loop/config.json`, `executors` maps **instance IDs** rather than vendor nam
 
 ## 2. Five Zero-Custody Auth Red Lines
 
-Every built-in and community adapter **MUST** comply with these 5 red lines:
+Every built-in and community adapter must implement the [Approval Envelope and Zero-Custody red lines](../SKILL.md#mandatory-security--governance-red-lines). Apply them in the driver as follows.
 
 1. **Zero Credential Custody (BYO Local CLI Only)**
    - Never read, copy, import, proxy, or cache OAuth tokens, browser cookies, API keys, or CLI credential stores (`~/.codex/auth.json`, `~/.claude/`, `~/.dsh/`, keychains).
@@ -118,22 +118,65 @@ export const myAdapter = {
    * Execute the CLI with stdout/stderr streamed to runDir/stdout.log & stderr.log.
    * Writes redacted runDir/result.json and returns normalized result.
    */
-  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor }) {
+  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor, startedAt, onSessionStarted }) {
     return writeRunResult(runDir, {
       instance_id: instanceId,
       kind: 'my-cli',
       stage,
       read_only: Boolean(readOnly),
-      status: 'completed', // 'completed' | 'failed' | 'infra_error' | 'host_action_required'
+      status: 'completed', // 'completed' | 'failed' | 'infra_error' | 'host_action_required' | 'interrupted'
       exit_code: 0,
       elapsed_seconds: 12.3,
       session_id: 'optional-native-session-id',
       usage: { input_tokens: 0, output_tokens: 0 },
+      final_md: null,      // path to the final Markdown message, when available
       infra_error: null   // null | 'INFRA_QUOTA' | 'INFRA_AUTH' | 'INFRA_TIMEOUT' | 'INFRA_CLI_CRASH'
     }, redactor);
   }
 };
 ```
+
+### Dispatch state and resume
+
+Dry-run dispatch persists `prepared_run` with `run_id`, `run_dir`, `task_file`, `stage`, `instance` and a `fingerprint` of the package and task inputs. Live dispatch for the same stage and instance reuses the directory. A changed fingerprint regenerates the generated task in place. Each invocation honors its explicit `--task-file`.
+
+Before calling `run()`, the CLI consumes `prepared_run` and atomically saves `inflight_run` with the run identifiers, stage, executor instance and start time. `grow-loop status` shows the record. Codex uses `runAdapterProcess({ onStdoutLine })` to read complete stdout lines as they arrive, calls the synchronous `onSessionStarted(threadId)` on `thread.started`, and still parses the full JSONL log for the final result. The CLI immediately persists the ID to `inflight_run` and updates `last_session_id` when the executor still matches the pack's active instance and the route has not changed. `grow-loop dispatch --resume` uses a compatible saved session for the same stage and instance. An explicit `--resume <session-id>` supplies the native ID directly. External runs clear `inflight_run` on exit. An interrupted Codex process leaves the pack available to resume. This includes a nonzero exit after `thread.started` without a signal, terminal event or final message, which can occur when the process is terminated on Windows.
+
+The `self` adapter receives the same start time and returns `host_action_required`. Its `inflight_run` stays open until `grow-loop record implement` or a valid `grow-loop record review --report <report.md>`. Both commands accept optional `--executor-tool`, `--executor-model` and `--executor-effort`. Recording completion updates `result.json` and the event log with the executor details and `elapsed_seconds`. Evidence includes that time and the final implementer's tool and model per pack.
+
+### Git checkpoints
+
+See the coordinator protocol for the [external commit gate](../SKILL.md#step-7--check-external-commits-before-local-closure) and [local commit registration](../SKILL.md#step-8--commit-locally-and-generate-evidence).
+
+### Closing review reports
+
+A completed review adapter can return the path to its final message as `final_md`. `grow-loop dispatch --stage review` reads that file, records the verdict and findings, and uses the dispatched instance and its configured `model` as the reviewer identity. For a self-review or an adapter without `final_md`, save the same report and run `grow-loop record review --report <report.md>`. Self-review uses the dispatched instance, or `self` for reviews submitted without dispatch. Use `--reviewer <instance>` to supply the reviewer identity.
+
+Write one standalone `VERDICT: PASS` or `VERDICT: FAIL` line. Surrounding whitespace and whole-line Markdown bold are allowed. Follow it with exactly one fenced `json` block.
+
+````markdown
+VERDICT: PASS
+
+```json
+{
+  "verdict": "pass",
+  "summary": "The package meets its acceptance criteria.",
+  "findings": [
+    {
+      "severity": "LOW",
+      "title": "Clarify the retry log",
+      "locator": "src/retry.mjs#scheduleRetry",
+      "detail": "Include the attempt number in the log.",
+      "rule": "Include the attempt number when logging retries."
+    }
+  ]
+}
+```
+````
+
+The JSON `verdict` must agree with the standalone line. `findings` must be an array and can be empty. Each finding requires a non-empty `title` and one of `BLOCKER`, `HIGH`, `MEDIUM`, or `LOW`. Severity is case-insensitive. Use `FAIL` when at least one finding matches `review.blocking_severities` in the workspace configuration, and `PASS` otherwise. The default blocking severities are `BLOCKER` and `HIGH`. The CLI uses the same configuration to build the review task, validate the report, and route the findings. `summary`, `locator`, `detail`, and `rule` are strings when supplied. A blocking finding's `rule` prepopulates a lesson draft for the coordinator to confirm.
+
+If the file is unreadable or the report is invalid, dispatch prints the report path and errors with the applicable line, column, finding number, or field. It logs `review_report_invalid`, exits nonzero, and leaves the package in `REVIEW` without consuming a review round. Submit a corrected report or rerun the review. Adapter execution failures and infrastructure errors follow their existing handling.
 
 ---
 

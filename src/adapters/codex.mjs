@@ -14,21 +14,22 @@ function resolveCodexCommand(cfg) {
 }
 
 function parseCodexJsonl(stdoutPath) {
-  if (!fs.existsSync(stdoutPath)) return { threadId: null, usage: null };
-  let threadId = null;
-  let usage = null;
+  const result = { threadId: null, usage: null, threadStarted: false, turnEnded: false };
+  if (!fs.existsSync(stdoutPath)) return result;
   const lines = fs.readFileSync(stdoutPath, 'utf8').split(/\r?\n/);
   for (const line of lines) {
     if (!line.trim().startsWith('{')) continue;
     try {
       const obj = JSON.parse(line);
-      if (obj.thread_id && !threadId) threadId = obj.thread_id;
-      if (obj.usage && typeof obj.usage === 'object') usage = obj.usage;
+      if (obj.thread_id && !result.threadId) result.threadId = obj.thread_id;
+      if (obj.usage && typeof obj.usage === 'object') result.usage = obj.usage;
+      if (obj.type === 'thread.started' && obj.thread_id) result.threadStarted = true;
+      if (['turn.completed', 'turn.failed', 'error'].includes(obj.type)) result.turnEnded = true;
     } catch {
       // ignore non-JSON lines
     }
   }
-  return { threadId, usage };
+  return result;
 }
 
 /**
@@ -125,9 +126,10 @@ export const codexAdapter = {
     );
   },
 
-  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor }) {
+  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor, onSessionStarted }) {
     const { cmd, args, finalMdPath } = this.buildArgs(cfg || {}, { repoDir, runDir, readOnly, resumeSessionId });
     const stdinText = fs.readFileSync(taskFilePath, 'utf8');
+    let startedThreadId = null;
     const proc = await runAdapterProcess({
       command: cmd,
       args,
@@ -135,11 +137,28 @@ export const codexAdapter = {
       stdinText,
       runDir,
       timeoutSec: timeoutSec || cfg?.timeout_sec || 3600,
-      redactor
+      redactor,
+      onStdoutLine: onSessionStarted && ((line) => {
+        if (startedThreadId) return;
+        let event;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          return;
+        }
+        if (event?.type === 'thread.started' && typeof event.thread_id === 'string' && event.thread_id) {
+          startedThreadId = event.thread_id;
+          onSessionStarted(startedThreadId);
+        }
+      })
     });
 
     const parsed = parseCodexJsonl(proc.stdoutPath);
     const infraError = classifyInfraError(proc.exitCode, proc.stdoutTail, proc.stderrTail, proc.timedOut);
+    const finalMd = fs.existsSync(finalMdPath) ? finalMdPath : null;
+    // A Codex process terminated on Windows may return an exit code without a signal.
+    const interrupted = proc.signal || (proc.exitCode !== 0 && parsed.threadStarted && !parsed.turnEnded && !finalMd);
+    const status = infraError ? 'infra_error' : interrupted ? 'interrupted' : proc.exitCode === 0 ? 'completed' : 'failed';
 
     return writeRunResult(
       runDir,
@@ -148,12 +167,13 @@ export const codexAdapter = {
         kind: 'codex',
         stage,
         read_only: Boolean(readOnly),
-        status: infraError ? 'infra_error' : (proc.exitCode === 0 ? 'completed' : 'failed'),
+        status,
         exit_code: proc.exitCode,
+        ...(proc.signal && { exit_signal: proc.signal }),
         elapsed_seconds: proc.elapsedSeconds,
-        session_id: parsed.threadId,
+        session_id: startedThreadId || parsed.threadId,
         usage: parsed.usage,
-        final_md: fs.existsSync(finalMdPath) ? finalMdPath : null,
+        final_md: finalMd,
         infra_error: infraError
       },
       redactor

@@ -8,6 +8,7 @@
 export const ALLOWED_GATE_REASONS = Object.freeze({
   AMBIGUITY: 'AMBIGUITY',               // Unresolved requirement or contract ambiguity
   EXTERNAL_EFFECT: 'EXTERNAL_EFFECT',   // Real external message, production write, billing side-effect
+  EXTERNAL_COMMIT: 'EXTERNAL_COMMIT',   // External commit touched current or completed pack files
   BLAST_RADIUS_SPLIT: 'BLAST_RADIUS_SPLIT', // Pack exceeds safe size threshold; human decides split vs approve
   BUDGET_EXCEEDED: 'BUDGET_EXCEEDED',   // Tier 1 (2) + Tier 2 (2) repairs exhausted
   REVIEW_CAP_REACHED: 'REVIEW_CAP_REACHED', // 2 closing review rounds failed with BLOCKER/HIGH

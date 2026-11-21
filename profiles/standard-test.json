@@ -45,6 +45,10 @@
   },
   "verification": {
     "new_tests": "optional",
+    "retry_once": true,
+    "env": {},
+    "path_prepend": [],
+    "output_encoding": "utf-8",
     "commands": [
       "npm test"
     ]

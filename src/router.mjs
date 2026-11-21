@@ -1,6 +1,21 @@
-import { appendEvent, saveState } from './state.mjs';
+import path from 'node:path';
+import { appendEvent, invalidateSession, readJsonSafe, rememberSession, saveState, writeManifestWithReason } from './state.mjs';
+import { buildRedactor } from './redact.mjs';
+import { handoffFillSteps, handoffNeeds } from './handoff.mjs';
+import { taskBriefWarnings } from './task-builder.mjs';
+import { getVerificationCommands } from './verify.mjs';
 import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
-import { addLesson, appendTechDebt, closeLessonsForPack, selectLessonsForPack } from './lessons.mjs';
+import { addLesson, closeLessonsForPack, deferInRoundTechDebt, recordReviewTechDebt, removeLesson, selectLessonsForPack } from './lessons.mjs';
+import { getBlockingReviewSeverities } from './review-report.mjs';
+import { checkExternalCommits, readCommitFiles, readGitPosition, scanStrayFiles } from './git-watch.mjs';
+import { writeRunResult } from './adapters/base.mjs';
+import { buildQuestion, NEXT_COMMANDS } from './shell-api.mjs';
+
+const PREFLIGHT_GATE_REASONS = new Set([
+  ALLOWED_GATE_REASONS.BLAST_RADIUS_SPLIT,
+  ALLOWED_GATE_REASONS.AMBIGUITY,
+  ALLOWED_GATE_REASONS.EXTERNAL_EFFECT
+]);
 
 export function getBudgets(config) {
   return {
@@ -8,9 +23,7 @@ export function getBudgets(config) {
     tier2MaxRepairs: config?.budgets?.tier2_max_repairs ?? 2,
     maxReviewRounds: config?.review?.max_rounds ?? 2,
     reviewMode: config?.review?.mode ?? 'closing-full',
-    blockingSeverities: new Set(
-      (config?.review?.blocking_severities || ['BLOCKER', 'HIGH']).map((s) => String(s).toUpperCase())
-    ),
+    blockingSeverities: getBlockingReviewSeverities(config),
     round2NonDivergent: config?.review?.round2_non_divergent ?? true,
     blastRadius: {
       escalateTier2Files: config?.blast_radius?.escalate_tier2_files ?? 25,
@@ -35,6 +48,14 @@ export function getPackDef(manifest, packId) {
   return (manifest.packs || []).find((p) => p.id === packId) || null;
 }
 
+export function requireHandoffPreflight(pack, packDef, ctx) {
+  if (packDef?.handoff && (pack.status === 'PENDING' || PREFLIGHT_GATE_REASONS.has(pack.gate?.reason))) {
+    const error = new Error('Run "grow-loop next" and follow its directive to finish handoff preflight.');
+    if (ctx) error.question = buildQuestion(ctx, pack);
+    throw error;
+  }
+}
+
 export function evaluateBlastRadius(config, packDef, packState = null) {
   const { blastRadius } = getBudgets(config);
   const estimatedFiles = Math.max(
@@ -55,6 +76,8 @@ export function evaluateBlastRadius(config, packDef, packState = null) {
     (blastRadius.escalateTier2CrossModule && crossModule);
 
   const reasons = [];
+  const manualTier = ['tier1', 'tier2'].includes(packDef.tier) ? packDef.tier : null;
+  if (manualTier) reasons.push(`manual tier=${manualTier}`);
   if (risk === 'high') reasons.push('risk=high');
   if (estimatedFiles >= blastRadius.escalateTier2Files) {
     reasons.push(`estimated_files=${estimatedFiles} >= ${blastRadius.escalateTier2Files}`);
@@ -68,7 +91,7 @@ export function evaluateBlastRadius(config, packDef, packState = null) {
     cross_module: crossModule,
     risk,
     should_pause_split: shouldPauseSplit,
-    initial_tier: shouldStartTier2 ? 'tier2' : 'tier1',
+    initial_tier: manualTier || (shouldStartTier2 ? 'tier2' : 'tier1'),
     reasons
   };
 }
@@ -89,6 +112,7 @@ export function checkDependencies(state, packDef) {
  */
 export function startOrAdvanceActivePack(ctx) {
   const { stateDir, config, manifest, state } = ctx;
+  if (state.loop_status === 'ABORTED') return { action: 'ABORTED' };
   const activeId = state.active_pack_id || state.pack_order.find((id) => state.packs[id]?.status !== 'COMMITTED');
   if (!activeId) {
     state.loop_status = 'COMPLETED';
@@ -99,23 +123,47 @@ export function startOrAdvanceActivePack(ctx) {
 
   state.active_pack_id = activeId;
   const pack = state.packs[activeId];
-  const packDef = getPackDef(manifest, activeId);
+  let packDef = getPackDef(manifest, activeId);
   if (!packDef) {
     throw new Error(`Active pack "${activeId}" missing from manifest.json`);
   }
 
   if (pack.status === 'PENDING') {
+    const needs = handoffNeeds(packDef);
+    if (needs.length) {
+      return {
+        action: 'NEEDS_FILL',
+        pack_id: activeId,
+        needs,
+        next_steps: [...handoffFillSteps(needs), `Run: ${NEXT_COMMANDS.next}`],
+        question: buildQuestion(ctx, pack),
+        warnings: taskBriefWarnings(packDef, config)
+      };
+    }
+    if (packDef.handoff?.needs?.length) {
+      packDef = { ...packDef, handoff: { ...packDef.handoff, needs: [] } };
+      const packs = manifest.packs.map((entry) => entry.id === activeId ? packDef : entry);
+      writeManifestWithReason(ctx, { ...manifest, packs }, 'Required handoff fields are complete.', 'handoff_filled');
+    }
+
     const deps = checkDependencies(state, packDef);
     if (!deps.satisfied) {
       return {
         action: 'BLOCKED_DEPENDENCY',
         pack_id: activeId,
         missing_dependencies: deps.missing,
+        question: buildQuestion(ctx, pack),
+        warnings: taskBriefWarnings(packDef, config),
         message: `Pack ${activeId} waiting on uncommitted dependencies: ${deps.missing.join(', ')}`
       };
     }
 
-    pack.started_at = pack.started_at || new Date().toISOString();
+    if (!pack.started_at) {
+      pack.started_at = new Date().toISOString();
+      const position = readGitPosition(state.repo_dir);
+      pack.base_commit = position?.head ?? null;
+      pack.base_branch = position?.branch ?? null;
+    }
     pack.resolved_gates = pack.resolved_gates || {};
     const br = evaluateBlastRadius(config, packDef, pack);
     pack.blast_radius = br;
@@ -214,25 +262,30 @@ export function startOrAdvanceActivePack(ctx) {
 export function buildNextDirective(ctx, pack, packDef) {
   const { stateDir, config } = ctx;
   const budgets = getBudgets(config);
-  const lessons = selectLessonsForPack(stateDir, packDef, 8);
+  const packInfo = {
+    pack_id: pack.id,
+    title: pack.title,
+    warnings: taskBriefWarnings(packDef, config)
+  };
+  const injectedLessons = () => selectLessonsForPack(stateDir, packDef)
+    .map(({ id, summary, rule, scope, scope_tags }) => ({ id, summary, rule, scope, scope_tags }));
 
   if (pack.status === 'PAUSED_FOR_HUMAN') {
     return {
       action: 'PAUSE_FOR_HUMAN',
-      pack_id: pack.id,
-      title: pack.title,
+      ...packInfo,
       gate: pack.gate,
-      resume_hint: `grow-loop resume --decision "<your decision>" --action <${(pack.gate?.allowed_resume_actions || ['approve']).join('|')}>`
+      resume_hint: `grow-loop resume --decision "<your decision>" --action <${(pack.gate?.allowed_resume_actions || ['approve']).join('|')}>`,
+      question: buildQuestion(ctx, pack)
     };
   }
 
   if (pack.status === 'IMPLEMENT') {
-    const isRepair = pack.tier1_repairs > 0 || pack.tier2_repairs > 0;
+    const isRepair = getRepairRounds(pack) > 0;
     return {
       action: 'IMPLEMENT',
       mode: isRepair ? 'REPAIR' : 'INITIAL',
-      pack_id: pack.id,
-      title: pack.title,
+      ...packInfo,
       tier: pack.current_tier,
       instance: pack.active_instance,
       repair_budget: {
@@ -242,19 +295,23 @@ export function buildNextDirective(ctx, pack, packDef) {
         tier2_max: budgets.tier2MaxRepairs
       },
       new_tests_policy: config?.verification?.new_tests || 'optional',
-      injected_lessons: lessons.map((l) => ({ id: l.id, summary: l.summary, rule: l.rule })),
+      injected_lessons: injectedLessons(),
       pending_blocking_findings: pack.pending_blocking_findings || [],
-      next_command: `grow-loop dispatch --dry-run (then grow-loop dispatch)`
+      next_command: `${NEXT_COMMANDS.dryRun} (then ${NEXT_COMMANDS.dispatch})`
     };
   }
 
   if (pack.status === 'VERIFY') {
+    const { new_tests, timeout_sec, output_encoding, retry_once } = config?.verification ?? {};
+    const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
     return {
       action: 'VERIFY',
-      pack_id: pack.id,
-      title: pack.title,
-      verification: config?.verification || {},
-      next_command: 'grow-loop verify (runs verification.commands and records exit codes); use "grow-loop record verify --failed ..." only for failures found outside those commands'
+      ...packInfo,
+      verification: redactor.redactValue({
+        commands: getVerificationCommands(config, packDef),
+        new_tests, timeout_sec, output_encoding, retry_once
+      }),
+      next_command: `${NEXT_COMMANDS.verify} (runs global and pack commands and records exit codes); use "grow-loop record verify --failed ..." only for failures found outside those commands`
     };
   }
 
@@ -263,40 +320,60 @@ export function buildNextDirective(ctx, pack, packDef) {
     const reviewerInstance = resolveTierInstance(config, 'reviewer');
     return {
       action: 'REVIEW',
-      pack_id: pack.id,
-      title: pack.title,
+      ...packInfo,
       review_round: nextRound,
       max_review_rounds: budgets.maxReviewRounds,
       non_divergent_closure_only: nextRound >= 2 && budgets.round2NonDivergent,
       blocking_severities: [...budgets.blockingSeverities],
+      injected_lessons: injectedLessons(),
       reviewer_instance: reviewerInstance,
       read_only: true,
       previous_blocking_findings: pack.pending_blocking_findings || [],
-      next_command: `grow-loop dispatch --stage review --dry-run (then grow-loop record review ...)`
+      next_command: `${NEXT_COMMANDS.review} (self: ${NEXT_COMMANDS.report})`
     };
   }
 
   if (pack.status === 'READY_TO_COMMIT') {
+    const gitWatch = checkExternalCommits(ctx, pack, packDef);
+    if (gitWatch?.status === 'blocked') return buildNextDirective(ctx, pack, packDef);
     return {
       action: 'COMMIT',
-      pack_id: pack.id,
-      title: pack.title,
+      ...packInfo,
+      ...scanStrayFiles(ctx, pack, packDef),
+      ...(gitWatch && { git_watch: gitWatch }),
       approval_note: 'Local commit ONLY (git add explicit files + git commit). NEVER git push / merge / deploy without RELEASE gate.',
-      next_command: `Commit locally, then call: grow-loop record commit --from-git`
+      next_command: `Commit locally, then call: ${NEXT_COMMANDS.commit}`
     };
   }
 
   return {
     action: pack.status,
-    pack_id: pack.id,
-    title: pack.title
+    ...packInfo
   };
+}
+
+export function getRepairRounds(pack) {
+  return pack.repair_rounds ?? ((pack.tier1_repairs ?? 0) + (pack.tier2_repairs ?? 0));
+}
+
+function countRepairRound(pack) {
+  // An approved extra repair can reset the tier budget without resetting the cumulative count.
+  pack.repair_rounds = getRepairRounds(pack) + 1;
+}
+
+function recordFailureLesson(ctx, pack, input) {
+  return addLesson(ctx.stateDir, ctx.config, {
+    ...input,
+    pack_id: pack.id,
+    tags: getPackDef(ctx.manifest, pack.id)?.tags,
+    repair_rounds: getRepairRounds(pack)
+  });
 }
 
 /**
  * Core 2+2 Repair & Auto-Escalation Ladder:
  * - Tier 1 up to tier1_max_repairs (default 2)
- * - Tier 1 exhausted -> auto-escalate to Tier 2 (tier2_repairs = 1)
+ * - Tier 1 exhausted -> auto-escalate if a Tier 2 repair remains
  * - Tier 2 up to tier2_max_repairs (default 2)
  * - Tier 2 exhausted -> PAUSED_FOR_HUMAN (BUDGET_EXCEEDED)
  */
@@ -304,35 +381,36 @@ export function applyRepairLadder(ctx, pack, source, reasonSummary) {
   const { stateDir, config } = ctx;
   const budgets = getBudgets(config);
 
-  if (pack.current_tier === 'tier1') {
-    if (pack.tier1_repairs < budgets.tier1MaxRepairs) {
-      pack.tier1_repairs += 1;
-      pack.status = 'IMPLEMENT';
-      appendEvent(stateDir, config, {
-        type: 'repair_scheduled',
-        pack_id: pack.id,
-        source,
-        tier: 'tier1',
-        instance: pack.active_instance,
-        attempt: pack.tier1_repairs,
-        max_attempts: budgets.tier1MaxRepairs,
-        summary: reasonSummary
-      });
-      saveState(stateDir, stateFor(ctx));
-      return { outcome: 'repair_tier1', tier: 'tier1', attempt: pack.tier1_repairs };
-    }
+  if (pack.current_tier === 'tier1' && pack.tier1_repairs < budgets.tier1MaxRepairs) {
+    countRepairRound(pack);
+    pack.tier1_repairs += 1;
+    pack.status = 'IMPLEMENT';
+    appendEvent(stateDir, config, {
+      type: 'repair_scheduled',
+      pack_id: pack.id,
+      source,
+      tier: 'tier1',
+      instance: pack.active_instance,
+      attempt: pack.tier1_repairs,
+      max_attempts: budgets.tier1MaxRepairs,
+      summary: reasonSummary
+    });
+    saveState(stateDir, stateFor(ctx));
+    return { outcome: 'repair_tier1', tier: 'tier1', attempt: pack.tier1_repairs };
+  }
 
-    // Tier 1 exhausted -> auto-escalate to Tier 2
+  if (pack.current_tier === 'tier1' && pack.tier2_repairs < budgets.tier2MaxRepairs) {
     const prevInstance = pack.active_instance;
     const nextInstance = resolveTierInstance(config, 'tier2');
     pack.current_tier = 'tier2';
     pack.active_instance = nextInstance;
     pack.escalated = true;
     pack.escalation_reason = `Tier 1 (${prevInstance}) failed after ${pack.tier1_repairs}/${budgets.tier1MaxRepairs} repairs (${source}): ${reasonSummary}`;
-    pack.tier2_repairs = 1;
+    countRepairRound(pack);
+    pack.tier2_repairs += 1;
     pack.status = 'IMPLEMENT';
     // Reset native session ID when switching executor instance
-    pack.last_session_id = null;
+    invalidateSession(pack);
 
     appendEvent(stateDir, config, {
       type: 'escalated_to_tier2',
@@ -349,7 +427,8 @@ export function applyRepairLadder(ctx, pack, source, reasonSummary) {
   }
 
   // Currently on Tier 2
-  if (pack.tier2_repairs < budgets.tier2MaxRepairs) {
+  if (pack.current_tier !== 'tier1' && pack.tier2_repairs < budgets.tier2MaxRepairs) {
+    countRepairRound(pack);
     pack.tier2_repairs += 1;
     pack.status = 'IMPLEMENT';
     appendEvent(stateDir, config, {
@@ -383,20 +462,72 @@ export function applyRepairLadder(ctx, pack, source, reasonSummary) {
     summary: pack.gate.summary
   });
   saveState(stateDir, stateFor(ctx));
-  return { outcome: 'paused_budget_exceeded', gate: pack.gate };
+  return { outcome: 'paused_budget_exceeded', gate: pack.gate, question: buildQuestion(ctx, pack) };
 }
 
 function stateFor(ctx) {
   return ctx.state;
 }
 
+function getWritablePack(ctx, packId) {
+  const { state, manifest } = ctx;
+  const pack = state.packs[packId || state.active_pack_id];
+  if (!pack) throw new Error('No active pack found');
+  if (pack.status === 'COMMITTED') throw new Error(`Pack ${pack.id} is already committed.`);
+  if (state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
+  requireHandoffPreflight(pack, getPackDef(manifest, pack.id), ctx);
+  return pack;
+}
+
+function completeSelfRun(ctx, pack, stage, payload, status, instance) {
+  const run = pack.inflight_run;
+  const cfg = ctx.config?.executors?.[instance];
+  const executor = {
+    executor_tool: payload.executor?.executor_tool ?? cfg?.kind ?? null,
+    executor_model: payload.executor?.executor_model ?? cfg?.model ?? null,
+    executor_effort: payload.executor?.executor_effort ?? cfg?.reasoning_effort ?? null
+  };
+  if (payload.dispatch || !run || run.kind !== 'self' || run.stage !== stage) return { executor };
+
+  if (payload.runId && payload.runId !== run.run_id) {
+    throw new Error('Pass --run-id ' + run.run_id + ' to record the dispatched self run, or omit --run-id.');
+  }
+  const result = readJsonSafe(path.join(run.run_dir, 'result.json'), {});
+  const elapsedSeconds = result.elapsed_seconds ?? Math.max(0, (Date.now() - Date.parse(run.started_at)) / 1000);
+  const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
+  for (const field of Object.keys(executor)) {
+    executor[field] = payload.executor?.[field] ?? result[field] ?? executor[field];
+  }
+  const { note, recorded_at, ...receipt } = result;
+  writeRunResult(run.run_dir, {
+    ...receipt, ...executor, instance_id: run.instance, stage, kind: 'self', status,
+    started_at: run.started_at, elapsed_seconds: elapsedSeconds, infra_error: payload.infraError || null
+  }, redactor);
+  pack.inflight_run = null;
+  appendEvent(ctx.stateDir, ctx.config, {
+    type: 'self_run_recorded', pack_id: pack.id, run_id: run.run_id, stage,
+    instance: run.instance, status, elapsed_seconds: elapsedSeconds, ...executor
+  });
+  return { executor, selfRunId: run.run_id };
+}
+
 export function recordImplementOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
-  const pack = state.packs[payload.packId || state.active_pack_id];
-  if (!pack) throw new Error('No active pack found');
+  const pack = getWritablePack(ctx, payload.packId);
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
+    return buildNextDirective(ctx, pack, getPackDef(ctx.manifest, pack.id));
+  }
+  const runTier = payload.dispatch?.tier ?? pack.current_tier;
+  const selfRun = !payload.dispatch && pack.inflight_run?.kind === 'self' && pack.inflight_run.stage === 'implement'
+    ? pack.inflight_run : null;
+  const runInstance = payload.dispatch?.instance ?? selfRun?.instance ?? pack.active_instance;
+  const canResume = runInstance === pack.active_instance && !payload.dispatch?.routeChanged && !selfRun?.route_changed;
+  const { executor, selfRunId } = completeSelfRun(ctx, pack, 'implement', payload,
+    payload.infraError ? 'infra_error' : (payload.passed ? 'completed' : 'failed'), runInstance);
+  if (pack.last_verify) delete pack.last_verify.repair_undo;
 
-  if (payload.sessionId) pack.last_session_id = payload.sessionId;
-  if (payload.runId) pack.last_run_id = payload.runId;
+  if (payload.sessionId && canResume) rememberSession(pack, payload.sessionId, 'implement', runInstance);
+  if (payload.runId || selfRunId) pack.last_run_id = payload.runId || selfRunId;
 
   // Infrastructure failure immunity: NEVER consumes tier1/tier2 repair budgets
   if (payload.infraError) {
@@ -404,18 +535,18 @@ export function recordImplementOutcome(ctx, payload) {
     appendEvent(stateDir, config, {
       type: 'infra_failure',
       pack_id: pack.id,
-      instance: pack.active_instance,
+      instance: runInstance,
       error_class: payload.infraError,
       summary: payload.summary || payload.infraError,
       repair_budget_consumed: false
     });
 
-    const instanceCfg = config?.executors?.[pack.active_instance] || {};
+    const instanceCfg = config?.executors?.[runInstance] || {};
     const onInfra = config?.routing?.on_infra_failure || 'pause_for_human';
-    if (onInfra === 'fallback' && instanceCfg.fallback_instance && config?.executors?.[instanceCfg.fallback_instance]) {
+    if (canResume && onInfra === 'fallback' && instanceCfg.fallback_instance && config?.executors?.[instanceCfg.fallback_instance]) {
       const prev = pack.active_instance;
       pack.active_instance = instanceCfg.fallback_instance;
-      pack.last_session_id = null;
+      invalidateSession(pack);
       pack.status = 'IMPLEMENT';
       appendEvent(stateDir, config, {
         type: 'infra_fallback',
@@ -431,14 +562,14 @@ export function recordImplementOutcome(ctx, payload) {
     pack.status = 'PAUSED_FOR_HUMAN';
     pack.gate = createGate(
       ALLOWED_GATE_REASONS.INFRA_BLOCKED,
-      `Executor "${pack.active_instance}" hit infrastructure failure (${payload.infraError}): ${payload.summary || ''}. Repair budget was NOT consumed.`,
+      `Executor "${runInstance}" hit infrastructure failure (${payload.infraError}): ${payload.summary || ''}. Repair budget was NOT consumed.`,
       {
         recommended_action: 'fix_cli_or_switch_instance',
         allowed_resume_actions: ['retry', 'switch_instance', 'abort']
       }
     );
     saveState(stateDir, state);
-    return { outcome: 'paused_infra_blocked', gate: pack.gate };
+    return { outcome: 'paused_infra_blocked', gate: pack.gate, question: buildQuestion(ctx, pack) };
   }
 
   if (payload.passed) {
@@ -446,18 +577,18 @@ export function recordImplementOutcome(ctx, payload) {
     appendEvent(stateDir, config, {
       type: 'implement_completed',
       pack_id: pack.id,
-      tier: pack.current_tier,
-      instance: pack.active_instance,
-      session_id: pack.last_session_id,
+      tier: runTier,
+      instance: runInstance,
+      session_id: payload.sessionId || (canResume ? pack.last_session_id : null),
       run_id: pack.last_run_id,
+      ...executor,
       summary: payload.summary || 'Implementation completed'
     });
     saveState(stateDir, state);
     return { outcome: 'ready_for_verify', status: pack.status };
   }
 
-  addLesson(stateDir, config, {
-    pack_id: pack.id,
+  recordFailureLesson(ctx, pack, {
     stage: 'IMPLEMENT',
     severity: 'HIGH',
     summary: payload.summary || 'Implementation execution error',
@@ -467,11 +598,55 @@ export function recordImplementOutcome(ctx, payload) {
   return applyRepairLadder(ctx, pack, 'IMPLEMENT', payload.summary || 'Implementation failed');
 }
 
+const verifyRepairFields = [
+  'tier1_repairs', 'tier2_repairs', 'current_tier', 'active_instance',
+  'last_session_id', 'last_session_route', 'escalated', 'escalation_reason', 'gate'
+];
+
+export function markVerificationEnvironment(ctx, packId, reason) {
+  const { stateDir, config, paths } = ctx;
+  const state = ctx.state = readJsonSafe(paths.statePath);
+  const pack = getWritablePack(ctx, packId);
+  const lastVerify = pack.last_verify;
+  const undo = lastVerify?.repair_undo;
+  const repairPending = pack.status === 'IMPLEMENT'
+    || (pack.status === 'PAUSED_FOR_HUMAN' && pack.gate?.reason === ALLOWED_GATE_REASONS.BUDGET_EXCEEDED);
+  if (!repairPending || !undo || lastVerify.passed || state.loop_status === 'ABORTED') {
+    throw new Error(`Pack ${pack.id} has no verification failure eligible for --mark-env. Use it before dispatching the repair.`);
+  }
+
+  removeLesson(stateDir, undo.lesson_id);
+
+  Object.assign(pack, undo.fields, { status: 'VERIFY' });
+  delete lastVerify.repair_undo;
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  lastVerify.environment_reason = redactor.redactString(reason.trim());
+  lastVerify.environment_retry_pending = true;
+  appendEvent(stateDir, config, {
+    type: 'verify_marked_environment',
+    pack_id: pack.id,
+    reason: lastVerify.environment_reason,
+    run_dirs: lastVerify.run_dirs ?? [],
+    removed_lesson_id: undo.lesson_id
+  });
+  saveState(stateDir, state);
+  return lastVerify;
+}
+
 export function recordVerifyOutcome(ctx, payload) {
+  // CLI verification runs commands asynchronously and reports into the latest state.
+  if (payload.source === 'cli') ctx.state = readJsonSafe(ctx.paths.statePath);
   const { stateDir, config, state } = ctx;
-  const pack = state.packs[payload.packId || state.active_pack_id];
-  if (!pack) throw new Error('No active pack found');
+  const pack = getWritablePack(ctx, payload.packId);
   const budgets = getBudgets(config);
+  if (payload.source === 'cli' && 'previousVerifyAt' in payload
+      && (pack.status !== 'VERIFY' || state.loop_status === 'ABORTED'
+        || (pack.last_verify?.at ?? null) !== payload.previousVerifyAt)) {
+    throw new Error(`Pack ${pack.id} changed during verification. The logs were saved, but the result was not recorded.`);
+  }
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
+    return buildNextDirective(ctx, pack, getPackDef(ctx.manifest, pack.id));
+  }
 
   // 'cli' = grow-loop ran the configured commands and checked exit codes itself;
   // 'self_reported' = the coordinator asserted the outcome via `record verify`.
@@ -485,6 +660,14 @@ export function recordVerifyOutcome(ctx, payload) {
     run_dir: payload.runDir || null,
     at: new Date().toISOString()
   };
+  if (source === 'cli') {
+    Object.assign(pack.last_verify, {
+      run_dirs: payload.runDirs ?? [],
+      flaky: Boolean(payload.flaky),
+      failure: payload.failure ?? null,
+      environment_reason: payload.environmentReason ?? null
+    });
+  }
 
   appendEvent(stateDir, config, {
     type: 'verify_recorded',
@@ -492,12 +675,22 @@ export function recordVerifyOutcome(ctx, payload) {
     passed: Boolean(payload.passed),
     source,
     summary: payload.summary || '',
-    command: payload.command || null
+    command: payload.command || null,
+    ...(source === 'cli' && {
+      flaky: pack.last_verify.flaky,
+      run_dirs: pack.last_verify.run_dirs,
+      environment_reason: pack.last_verify.environment_reason
+    })
   });
 
   if (!payload.passed) {
-    addLesson(stateDir, config, {
-      pack_id: pack.id,
+    if (payload.environmentReason) {
+      saveState(stateDir, state);
+      return { outcome: 'verify_environment_failed', status: pack.status };
+    }
+    const fields = Object.fromEntries(verifyRepairFields.map((field) => [field, pack[field]]));
+    fields.repair_rounds = getRepairRounds(pack);
+    const lesson = recordFailureLesson(ctx, pack, {
       stage: 'VERIFY',
       severity: 'HIGH',
       summary: payload.summary || 'Machine verification failed',
@@ -506,6 +699,7 @@ export function recordVerifyOutcome(ctx, payload) {
       locator: payload.locator || '',
       discovered_by: 'machine_verify'
     });
+    pack.last_verify.repair_undo = { fields, lesson_id: lesson.id };
     return applyRepairLadder(ctx, pack, 'VERIFY', payload.summary || 'Verification failed');
   }
 
@@ -535,7 +729,7 @@ export function recordVerifyOutcome(ctx, payload) {
       summary: pack.gate.summary
     });
     saveState(stateDir, state);
-    return { outcome: 'paused_review_cap_verified', gate: pack.gate };
+    return { outcome: 'paused_review_cap_verified', gate: pack.gate, question: buildQuestion(ctx, pack) };
   }
 
   pack.status = 'REVIEW';
@@ -545,9 +739,23 @@ export function recordVerifyOutcome(ctx, payload) {
 
 export function recordReviewOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
-  const pack = state.packs[payload.packId || state.active_pack_id];
-  if (!pack) throw new Error('No active pack found');
+  const pack = getWritablePack(ctx, payload.packId);
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
+    return buildNextDirective(ctx, pack, getPackDef(ctx.manifest, pack.id));
+  }
   const budgets = getBudgets(config);
+  if (payload.reportPath && (pack.status !== 'REVIEW' ||
+    (payload.reviewRound !== undefined && payload.reviewRound !== pack.review_rounds + 1))) {
+    throw new Error(`Pack ${pack.id} is no longer awaiting this review. Check "grow-loop next" before recording a report.`);
+  }
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  const { blockingSeverities } = budgets;
+  const selfReviewer = pack.inflight_run?.kind === 'self' && pack.inflight_run.stage === 'review'
+    ? pack.inflight_run.instance : null;
+  const reviewer = payload.reviewer || selfReviewer || resolveTierInstance(config, 'reviewer');
+  const { executor, selfRunId } = completeSelfRun(ctx, pack, 'review', payload, 'completed', selfReviewer || reviewer);
+  const reviewerModel = payload.reviewerModel === undefined ? executor.executor_model : payload.reviewerModel;
+  const summary = redactor.redactString(payload.summary || '');
 
   pack.review_rounds += 1;
   const findings = Array.isArray(payload.findings) ? payload.findings : [];
@@ -556,39 +764,36 @@ export function recordReviewOutcome(ctx, payload) {
 
   for (const f of findings) {
     const sev = String(f.severity || 'LOW').toUpperCase();
-    if (budgets.blockingSeverities.has(sev)) {
-      blocking.push({ ...f, severity: sev });
+    if (blockingSeverities.has(sev)) {
+      blocking.push({ ...redactor.redactValue(f), severity: sev });
     } else {
       nonBlocking.push({ ...f, severity: sev });
     }
   }
 
-  // Record MEDIUM / LOW findings as tech debt without blocking closure
-  const debtCount = appendTechDebt(stateDir, config, pack.id, pack.review_rounds, nonBlocking);
-
-  // If reviewer passed --verdict fail with zero structured findings, synthesize a single HIGH finding
-  // so repair prompts and lessons never drop the failure reason.
+  // A legacy --verdict fail without findings still needs a configured blocking severity.
   const rawVerdictLower = String(payload.verdict || '').toLowerCase();
-  if (rawVerdictLower === 'fail' && findings.length === 0) {
+  if (rawVerdictLower === 'fail' && findings.length === 0 && blockingSeverities.size) {
     blocking.push({
-      severity: 'HIGH',
-      title: payload.summary || `Review round ${pack.review_rounds} failed without structured findings`,
-      detail: payload.summary || ''
+      severity: blockingSeverities.has('HIGH') ? 'HIGH' : blockingSeverities.values().next().value,
+      title: summary || `Review round ${pack.review_rounds} failed without structured findings`,
+      detail: summary
     });
   }
 
-  // Enforce Severity Floor: only BLOCKER / HIGH may fail a closing review
   const effectivePass = blocking.length === 0;
   const verdictNormalized = effectivePass ? 'PASS' : 'FAIL';
+  const debtCount = recordReviewTechDebt(stateDir, config, pack.id, pack.review_rounds, nonBlocking, effectivePass);
 
   pack.last_review = {
     round: pack.review_rounds,
-    reviewer: payload.reviewer || resolveTierInstance(config, 'reviewer'),
+    reviewer: redactor.redactString(reviewer),
+    reviewer_model: redactor.redactString(reviewerModel || null),
     verdict: verdictNormalized,
     raw_verdict: String(payload.verdict || '').toUpperCase(),
     blocking_count: blocking.length,
     non_blocking_count: nonBlocking.length,
-    summary: payload.summary || '',
+    summary,
     at: new Date().toISOString()
   };
 
@@ -598,11 +803,14 @@ export function recordReviewOutcome(ctx, payload) {
     round: pack.review_rounds,
     max_rounds: budgets.maxReviewRounds,
     reviewer: pack.last_review.reviewer,
+    reviewer_model: pack.last_review.reviewer_model,
+    run_id: payload.runId || selfRunId || null,
+    ...executor,
     verdict: verdictNormalized,
     blocking_count: blocking.length,
     non_blocking_count: nonBlocking.length,
     tech_debt_recorded: debtCount,
-    summary: payload.summary || ''
+    summary
   });
 
   if (effectivePass) {
@@ -612,15 +820,13 @@ export function recordReviewOutcome(ctx, payload) {
     return {
       outcome: 'review_passed',
       tech_debt_recorded: debtCount,
-      severity_floor_overridden: String(payload.verdict || '').toLowerCase() === 'fail' && blocking.length === 0
+      severity_floor_overridden: rawVerdictLower === 'fail'
     };
   }
 
-  // Blocking findings exist (BLOCKER / HIGH)
   pack.pending_blocking_findings = blocking;
   for (const bf of blocking) {
-    addLesson(stateDir, config, {
-      pack_id: pack.id,
+    recordFailureLesson(ctx, pack, {
       stage: `REVIEW_R${pack.review_rounds}`,
       severity: bf.severity,
       summary: bf.title || bf.summary || 'Blocking review finding',
@@ -633,16 +839,17 @@ export function recordReviewOutcome(ctx, payload) {
 
   // Review round cap reached (2/2)!
   if (pack.review_rounds >= budgets.maxReviewRounds) {
-    // If still on tier1 and never escalated, give Tier 2 one escalation repair pass (without a 3rd review)
-    if (pack.current_tier === 'tier1') {
+    // Allow a remaining tier2 repair after tier1 without scheduling a third review.
+    if (pack.current_tier === 'tier1' && pack.tier2_repairs < budgets.tier2MaxRepairs) {
       const prev = pack.active_instance;
       const next = resolveTierInstance(config, 'tier2');
       pack.current_tier = 'tier2';
       pack.active_instance = next;
       pack.escalated = true;
       pack.escalation_reason = `Review cap (${pack.review_rounds}/${budgets.maxReviewRounds}) hit on tier1 with ${blocking.length} blocking findings`;
-      pack.tier2_repairs = 1;
-      pack.last_session_id = null;
+      countRepairRound(pack);
+      pack.tier2_repairs += 1;
+      invalidateSession(pack);
       pack.status = 'IMPLEMENT';
       appendEvent(stateDir, config, {
         type: 'escalated_to_tier2',
@@ -657,11 +864,10 @@ export function recordReviewOutcome(ctx, payload) {
       return { outcome: 'escalated_tier2_on_review_cap', blocking_count: blocking.length };
     }
 
-    // Already on tier2 and hit 2/2 review cap -> hard brake to human!
     pack.status = 'PAUSED_FOR_HUMAN';
     pack.gate = createGate(
       ALLOWED_GATE_REASONS.REVIEW_CAP_REACHED,
-      `Pack ${pack.id} hit closing review cap (${pack.review_rounds}/${budgets.maxReviewRounds}) on tier2 with ${blocking.length} blocking finding(s).`,
+      `Pack ${pack.id} hit closing review cap (${pack.review_rounds}/${budgets.maxReviewRounds}) on ${pack.current_tier} with ${blocking.length} blocking finding(s).`,
       {
         recommended_action: 'inspect_blocking_findings',
         allowed_resume_actions: ['repair', 'commit', 'abort']
@@ -675,7 +881,7 @@ export function recordReviewOutcome(ctx, payload) {
       summary: pack.gate.summary
     });
     saveState(stateDir, state);
-    return { outcome: 'paused_review_cap_reached', blocking_count: blocking.length, gate: pack.gate };
+    return { outcome: 'paused_review_cap_reached', blocking_count: blocking.length, gate: pack.gate, question: buildQuestion(ctx, pack) };
   }
 
   // Review round 1 failed -> enter standard 2+2 repair ladder
@@ -683,14 +889,17 @@ export function recordReviewOutcome(ctx, payload) {
     ctx,
     pack,
     `REVIEW_R${pack.review_rounds}`,
-    payload.summary || `${blocking.length} blocking finding(s) in review round ${pack.review_rounds}`
+    summary || `${blocking.length} blocking finding(s) in review round ${pack.review_rounds}`
   );
 }
 
 export function recordCommitOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
-  const pack = state.packs[payload.packId || state.active_pack_id];
-  if (!pack) throw new Error('No active pack found');
+  const pack = getWritablePack(ctx, payload.packId);
+  const packDef = getPackDef(ctx.manifest, pack.id);
+  const gitWatch = checkExternalCommits(ctx, pack, packDef, payload.sha);
+  if (gitWatch?.status === 'blocked') return buildNextDirective(ctx, pack, packDef);
+  const changedFiles = readCommitFiles(state.repo_dir, payload.sha);
 
   pack.commit = {
     sha: payload.sha,
@@ -698,6 +907,7 @@ export function recordCommitOutcome(ctx, payload) {
     files: Number(payload.files || 0),
     insertions: Number(payload.insertions || 0),
     deletions: Number(payload.deletions || 0),
+    ...(changedFiles && { changed_files: changedFiles }),
     pushed: false,
     committed_at: new Date().toISOString()
   };
@@ -709,9 +919,10 @@ export function recordCommitOutcome(ctx, payload) {
     stateDir,
     config,
     pack.id,
-    pack.active_instance,
+    getRepairRounds(pack),
     pack.last_verify?.summary || `commit:${payload.sha?.slice(0, 9)}`
   );
+  deferInRoundTechDebt(stateDir, pack.id);
 
   appendEvent(stateDir, config, {
     type: 'pack_committed',
@@ -731,7 +942,9 @@ export function recordCommitOutcome(ctx, payload) {
     outcome: 'committed',
     committed_pack: pack.id,
     next_pack_id: nextId,
-    loop_status: state.loop_status
+    loop_status: state.loop_status,
+    ...(gitWatch && { git_watch: gitWatch }),
+    ...(payload.fromGit && scanStrayFiles(ctx, pack, packDef, changedFiles))
   };
 }
 
@@ -746,15 +959,45 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   const prevGate = pack.gate;
   const packDef = getPackDef(manifest, pack.id);
   const act = String(action || 'approve').toLowerCase();
+  const gateReason = prevGate?.reason || 'UNKNOWN';
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  const at = new Date().toISOString();
+  const questions = prevGate?.questions?.length ? { questions: redactor.redactValue(prevGate.questions) } : {};
+  let approvedPosition = null;
+  if (gateReason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
+    if (!prevGate.allowed_resume_actions.includes(act)) {
+      throw new Error('Use --action approve or abort for an EXTERNAL_COMMIT gate.');
+    }
+    if (act === 'approve') {
+      if (typeof decision !== 'string' || !decision.trim()) {
+        throw new Error('Specify a non-empty --decision to approve the external commits.');
+      }
+      approvedPosition = readGitPosition(state.repo_dir);
+      if (!approvedPosition) throw new Error('Git HEAD is unavailable. Restore access to Git before approving the external commits.');
+    }
+  }
 
   appendEvent(stateDir, config, {
     type: 'gate_resumed',
     pack_id: pack.id,
-    gate_reason: prevGate?.reason || 'UNKNOWN',
+    gate_reason: gateReason,
     action: act,
     decision: decision || '',
     switch_instance: instance || null
   });
+
+  if (act === 'switch_instance' && (!instance || !config?.executors?.[instance])) {
+    throw new Error(`Unknown executor instance "${instance}" in config.executors`);
+  }
+  if (['repair', 'retry', 'commit', 'switch_instance'].includes(act) && typeof decision === 'string' && decision.trim()) {
+    (pack.decisions ??= []).push({
+      gate_reason: gateReason,
+      action: act,
+      decision: redactor.redactString(decision),
+      at,
+      ...questions
+    });
+  }
 
   if (act === 'abort') {
     state.loop_status = 'ABORTED';
@@ -771,11 +1014,8 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   }
 
   if (act === 'switch_instance') {
-    if (!instance || !config?.executors?.[instance]) {
-      throw new Error(`Unknown executor instance "${instance}" in config.executors`);
-    }
     pack.active_instance = instance;
-    pack.last_session_id = null;
+    invalidateSession(pack);
     pack.gate = null;
     pack.status = 'IMPLEMENT';
     saveState(stateDir, state);
@@ -786,6 +1026,7 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
     pack.gate = null;
     if (act === 'repair') {
       // Explicit human authorization grants one extra repair round on current tier
+      countRepairRound(pack);
       if (pack.current_tier === 'tier2') {
         pack.tier2_repairs = Math.max(0, getBudgets(config).tier2MaxRepairs - 1);
       } else {
@@ -801,8 +1042,10 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   pack.resolved_gates = pack.resolved_gates || {};
   if (prevGate?.reason) {
     pack.resolved_gates[prevGate.reason] = {
-      approved_at: new Date().toISOString(),
-      decision: decision || ''
+      approved_at: at,
+      decision: redactor.redactString(decision || ''),
+      ...(approvedPosition && { base_commit: approvedPosition.head, base_branch: approvedPosition.branch }),
+      ...questions
     };
   }
   if (prevGate?.reason === ALLOWED_GATE_REASONS.BLAST_RADIUS_SPLIT) {
@@ -811,13 +1054,20 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   }
   pack.gate = null;
 
+  if (approvedPosition) {
+    pack.base_commit = approvedPosition.head;
+    pack.base_branch = approvedPosition.branch;
+    pack.status = prevGate.resume_status;
+    pack.gate = prevGate.prior_gate ?? null;
+    saveState(stateDir, state);
+    return {
+      outcome: 'approved', pack_id: pack.id, status: pack.status, base_commit: pack.base_commit,
+      ...(pack.status === 'PAUSED_FOR_HUMAN' && { question: buildQuestion(ctx, pack) })
+    };
+  }
+
   // If resuming a preflight gate, re-check any remaining preflight gates (AMBIGUITY / EXTERNAL_EFFECT)
-  const preflightGateReasons = new Set([
-    ALLOWED_GATE_REASONS.BLAST_RADIUS_SPLIT,
-    ALLOWED_GATE_REASONS.AMBIGUITY,
-    ALLOWED_GATE_REASONS.EXTERNAL_EFFECT
-  ]);
-  if (prevGate?.reason && preflightGateReasons.has(prevGate.reason) && packDef) {
+  if (PREFLIGHT_GATE_REASONS.has(prevGate?.reason) && packDef) {
     pack.status = 'PENDING';
     saveState(stateDir, state);
     const nextDirective = startOrAdvanceActivePack(ctx);
@@ -826,7 +1076,8 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
       pack_id: pack.id,
       tier: pack.current_tier,
       active_instance: pack.active_instance,
-      next: nextDirective
+      next: nextDirective,
+      ...(nextDirective.question && { question: nextDirective.question })
     };
   }
 

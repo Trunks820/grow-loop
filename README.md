@@ -4,162 +4,102 @@
 [![Node.js >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Harness-agnostic, zero-dependency multi-package delivery loop for AI coding agents.**
-
-> `grow-loop` 是面向 AI 编程交付的**确定性治理状态机与跨宿主 Skill**（Node.js >= 18，零外部依赖）。  
-> 无论今天由 **Codex、Antigravity、Claude Code、DeepSeek Harness 还是 Cursor** 担任总控，把「状态流转、修复上限、自动升级、审查封顶、授权刹车、错题注入、脱敏证据包」全部外置到代码里，让 AI 按包稳步交付，而不是陷入无限返工或失控自动放行。
->
-> 🌱 **Grow 家族**：配套上游工具 [grow-me](https://github.com/Trunks820/grow-me)（持续打磨中）负责**让需求长成方案**，`grow-loop` 负责**让方案长成交付**；同时完全解耦，可直接承接 `ai-dev-workflow` 或任意 Markdown / Issue 任务清单。
-
----
-
-## 为什么做 `grow-loop`？（而不是又一个多 Agent 控制台）
-
-市面上已有 T3 Code、Antumi 等优秀的多 Agent **控制台（遥控屏）**，适合人盯多个 CLI 线程、切模型、收审批。但真实多包研发交付还缺一层**协议与治理内核**：
-
-| 维度 | 多 Agent 控制台 | `grow-loop`（交付治理协议层） |
-|---|---|---|
-| 核心对象 | 聊天线程 / 终端窗口 | 工作包（`W01..Wn`）全生命周期状态机 |
-| 返工与升级 | 人肉观察并手动换模型 | 确定性 `2 + 2 + 2` 规则自动升级与硬刹车 |
-| 质量兜底 | 依赖模型自觉 | 强制 **Verify-First**（机器实测先于审查）+ 封顶关包全量审 |
-| 跨包进化 | 每轮重新踩坑 | 错题本（`lessons.json`）按标签自动注入下一包 `task.md` |
-| 账号与凭据 | 部分工具接管登录态或换号 | **零托管 5 条红线**（只调本机已登录 CLI，绝不碰凭据） |
-| 换宿主续跑 | 绑死在单一客户端 | 状态默认在 `<repo>/.loop/`，随时换宿主无损接力 |
-
----
-
-## 核心特性
-
-### 1. 默认状态落在 `<repo>/.loop/`，支持跨宿主无损接力
-- `grow-loop init` 默认在目标项目/worktree 根目录创建 `.loop/`，并自动写入 `<repo>/.gitignore`（可加 `--no-gitignore` 跳过）。
-- 项目改名、多开 Git worktree 不会错乱；上半程用 Codex 跑完 W01–W03，下半程切到 Antigravity / Claude Code / Cursor 直接 `grow-loop status` / `grow-loop next` 无损接手。
-- 如需把状态集中存到外部目录（如 Obsidian 知识库），通过 `--state-dir <path>` 或环境变量 `GROW_LOOP_STATE_DIR` 覆盖即可（外部目录不会改动项目 `.gitignore`）。
-
-### 2. 确定性 `2 + 2 + 2` 修复、升级与审查治理
-- **爆炸半径预判（Blast-Radius Gate）**：
-  - `estimated_files >= 25` 或 `cross_module: true` 或 `risk: "high"` → 自动直接上 `tier2` 起跑，不浪费低阶模型反复返工。
-  - `estimated_files >= 50` → 触发 `PAUSED_FOR_HUMAN`（`BLAST_RADIUS_SPLIT`），建议拆包或由人显式批准直接上 `tier2`。
-- **Verify-First**：永远先过机器验证（编译 / 单测 / 隔离实测脚本），再进关包审查。`grow-loop verify` 由 CLI 亲自执行 `verification.commands` 并按退出码判定；配置了命令时不接受总控 AI 自报「通过」（`--allow-self-report` 显式放行的会在证据包标为「自报」）。
-- **修复与自动升级阶梯（`2 + 2`）**：
-  - `tier1` 最多修 **2 轮** → 第 3 次失败自动升级到 `tier2`（`tier2_repairs = 1`）。
-  - `tier2` 最多修 **2 轮** → 仍未过硬刹车 `PAUSED_FOR_HUMAN`（`BUDGET_EXCEEDED`），交给人拍板，绝不无限死循环。
-- **关包审查封顶 + 严重度底线（`2`）**：
-  - 默认采用**关包全量深审**，最多 **2 轮**（`max_review_rounds: 2`）；第 2 轮为严格收敛审（只核对上轮阻塞项是否修干净、有无新 `BLOCKER/HIGH` 回归）。
-  - **仅 `BLOCKER` / `HIGH` 阻塞关包**；`MEDIUM` / `LOW` 自动记入 `.loop/tech-debt.md`，即使审查员口头判 `fail` 也会被状态机强制放行（Severity Floor）。
-  - 达到 2 轮上限时：若仍在 `tier1`，自动升级 `tier2` 做一次最终修复（验证通过后暂停请人确认提交，不再开第 3 轮对抗审查）；若已在 `tier2`，立即停机找人（`REVIEW_CAP_REACHED`）。
-- **基础设施故障免疫（Infra Immunity）**：
-  - `429` 限流（`INFRA_QUOTA`）、认证失效（`INFRA_AUTH`）、超时（`INFRA_TIMEOUT`）、CLI 崩溃（`INFRA_CLI_CRASH`）**绝不消耗** `tier1`/`tier2` 代码修复额度；默认停机通知人，不悄悄换号。
-
-### 3. 两个开箱即用 Profile（配置模板）
-不用自己从零写几十行配置，`init` 时二选一即可：
-- **`standard-test`（常规项目模板）**：适合有完整单测/集成测试环境的项目，`new_tests: "optional"`，跑 `npm test` / `pytest` / `mvn test` 等测试命令验证。
-- **`live-smoke`（老项目 / 重库 / 实测模板）**：适合不方便写 mock 单测、强依赖真实数据库或外部服务的老项目，`new_tests: "forbidden"`（把「禁止新增单测文件」写进给 AI 的 `task.md` 顶部红线），靠编译 + 回归检查 + 隔离端口真库实测脚本兜底验证。
-
-### 4. 五条零托管鉴权红线（Zero-Custody Auth Red Lines）
-1. **零凭据托管**：不读、不拷贝、不代理任何 OAuth token、Cookie、API Key 或 CLI 登录目录（BYO 本机已登录 CLI）。
-2. **禁止静默换号**：不搞自动换号池或代理订阅账号；遇到限流默认停机由人决策。
-3. **只读探活 + 零密钥回显**：`grow-loop probe` 只做带超时的本地只读探测（不花一分钱调大模型），并明确区分「CLI 就绪」与「服务端额度」；全部日志/事件/证据经 `src/redact.mjs` 脱敏。
-4. **禁止无条件全放行**：审查阶段强制只读沙箱；`git push` / 合分支 / 发布 / 改生产 / 改全局配置均被 Approval Envelope 拦在人工闸门外。
-5. **非侵入运行**：不修改 `~/.codex/`、`~/.claude/`、`~/.dsh/`，不静默安装全局依赖。
-
----
+`grow-loop` 帮助 Codex、Claude Code、DeepSeek Harness 等宿主按工作包完成代码交付。总控按 CLI 返回的动作派活，由 CLI 运行本机验证，再由审查者关包，总控登记本地提交。CLI 管理修复预算、人工门禁、教训和证据，其他宿主可以接着同一状态目录继续执行。[0.2.0 变更记录](CHANGELOG.md)
 
 ## 快速开始
 
-### 环境要求
-- Node.js `>= 18`（**零第三方依赖**，无需 `npm install`）
-- Git（用于 `--from-git` 自动采集 commit 与 diff 统计）
+需要 Node.js 18 或以上版本和 Git，无需安装第三方依赖。克隆项目后可在仓库里运行 `npm test`。Node.js 18.0.0 可用 `node test/grow-loop.test.mjs` 直接运行测试文件。
 
-### 1. 克隆并可选安装为全局 Skill / CLI
+把本项目目录链接到宿主的 Skill 目录即可让宿主读取 `SKILL.md`。直接运行下面的 Node 命令，或者在已经链接 CLI 的环境中用 `grow-loop` 代替 `node /path/to/grow-loop/bin/grow-loop.mjs`。
 
-```bash
-git clone https://github.com/Trunks820/grow-loop.git
-cd grow-loop
-npm test   # 运行内置 node:test 测试套件
+在目标仓库执行以下两种初始化命令中的一种。已有工作区时，可按桥接指南追加交接包。[清单格式、交接导入与替换](docs/UPSTREAM-BRIDGE.md)
+
+```sh
+node /path/to/grow-loop/bin/grow-loop.mjs init --manifest delivery.json --profile standard-test
+node "/path/to/grow-loop/bin/grow-loop.mjs" init --handoff task.manifest.json --profile standard-test
 ```
 
-作为跨宿主 Agent Skill 使用时，将本仓库软链（或 Windows Junction）到 `~/.agents/skills/grow-loop`（以及你的宿主 Skill 目录），任何支持 `SKILL.md` 的 Agent 即可自动识别。
+- `standard-test` 允许按需补测试，初始验证命令是 `npm test`。
+- `live-smoke` 禁止新增单测，初始化后配置项目的构建、已有回归检查和隔离环境实测脚本。
+- 不在目标仓库时，通过 `--repo <dir>` 指定仓库。状态默认在 `<repo>/.loop/`，初始化将它加入 `.gitignore`，可用 `--no-gitignore` 跳过。使用 `--state-dir <dir>` 或 `GROW_LOOP_STATE_DIR` 指定外置状态目录时，CLI 不改仓库的 `.gitignore`。后续命令沿用同一工作区。
 
-### 2. 在目标项目中初始化
+按总控协议配置执行器和验证命令，补齐包范围及任务书所需的内容，再探活和读取下一步。[总控执行协议](SKILL.md#coordinator-execution-protocol-mode-a)
 
-```bash
-# 常规项目（可跑单测）
-node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --profile standard-test
-
-# 或老项目 / 重库实测模式（禁新增单测 + 实测脚本）
-node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --profile live-smoke
-
-# 可选：把状态存到外部目录（如 Obsidian），不修改项目 .gitignore
-node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --state-dir /path/to/vault/loop-state
+```sh
+node /path/to/grow-loop/bin/grow-loop.mjs probe
+node /path/to/grow-loop/bin/grow-loop.mjs next
 ```
 
-### 3. 编辑任务清单与执行器映射
-- `.loop/manifest.json`：填入待交付的工作包 `W01..Wn`（可由 [grow-me](https://github.com/Trunks820/grow-me) / `ai-dev-workflow` 或任意 Markdown 清单转换，详见 [docs/UPSTREAM-BRIDGE.md](docs/UPSTREAM-BRIDGE.md)）。
-- `.loop/config.json`：配置本机的 `tier1` / `tier2` / `reviewer` 实例与 `verification` 命令。
+`next` 返回本包当前动作。按总控协议依次派发实现、运行验证、完成审查、登记本地提交，再读下一步。全部包完成后生成脱敏证据。外部操作遵守 [Approval Envelope 和 Zero-Custody 红线](SKILL.md#mandatory-security--governance-red-lines)。
 
-### 4. 探活并驱动闭环
+## 命令清单
+
+运行 `grow-loop --help` 查看命令用法。
+
+| 用途 | 命令 | 说明 |
+| --- | --- | --- |
+| 准备工作区 | `grow-loop init`、`grow-loop import`、`grow-loop manifest-ack` | [清单与交接](docs/UPSTREAM-BRIDGE.md) |
+| 查看和推进 | `grow-loop probe`、`grow-loop status`、`grow-loop next`、`grow-loop dispatch`、`grow-loop verify` | [运行工作包](SKILL.md#coordinator-execution-protocol-mode-a) |
+| 登记结果 | `grow-loop record implement`、`grow-loop record verify`、`grow-loop record review`、`grow-loop record commit` | [总控执行协议](SKILL.md#coordinator-execution-protocol-mode-a) |
+| 中途改动 | `grow-loop pack insert`、`grow-loop pack tier`、`grow-loop pack scope`、`grow-loop forward`、`grow-loop todo add`、`grow-loop todo list`、`grow-loop todo dismiss` | [中途改动示例](#中途改动) |
+| 沉淀教训 | `grow-loop lesson list`、`grow-loop lesson confirm`、`grow-loop lesson disable`、`grow-loop record lesson` | [确认草稿与选择适用范围](SKILL.md#step-5--confirm-and-scope-lesson-drafts) |
+| 回填决定 | `grow-loop status --format shell`、`grow-loop answer`、`grow-loop resume` | [壳接口](docs/SHELL-API.md) |
+| 导出证据 | `grow-loop evidence` | [本地提交与证据](SKILL.md#step-8--commit-locally-and-generate-evidence) |
+
+## 中途改动
 
 ```bash
-# 只读探活本机已配置的 CLI 实例（不耗模型额度）
-grow-loop probe
-
-# 查看当前状态与下一步确定性指令
-grow-loop next
-
-# 预检干跑（生成带错题注入的 task.md，不改代码、不调 API）
-grow-loop dispatch --stage implement --dry-run
-
-# 正式派发执行（外部 CLI 自动记录结果；self 模式由当前宿主执行后 record）
-grow-loop dispatch --stage implement
-grow-loop verify   # CLI 自己跑 verification.commands，按退出码记结果
-grow-loop record review --verdict pass --findings-file findings.json --summary "0 blocking findings"
-grow-loop record commit --from-git
-
-# 当触发人工刹车门时恢复
-grow-loop resume --decision "已确认走单选，批准继续" --action approve
-
-# 全部包完成后一键产出脱敏双层证据包（.loop/evidence.md）
-grow-loop evidence
+grow-loop pack insert --file followup.json --after W01 --reason "先补迁移检查"
+grow-loop pack insert --file prerequisite.json --before W02 --reason "先补测试数据"
+grow-loop pack tier --id W02 --tier tier2 --reason "需要跨模块修改"
+grow-loop pack scope --id W02 --add src/a.mjs,src/b.mjs --reason "本包处理权限边界" --todo T001
+grow-loop forward --from W01 --to W03 --text "补查旧客户端兼容性" --reason "W03 负责客户端"
+grow-loop forward --to W03 --todo T002 --reason "在兼容性包处理"
+grow-loop todo add --pack W02 --text "src/c.mjs：缺少超时处理" --reason "实现时发现超范围问题"
+grow-loop todo list
+grow-loop todo dismiss --todo T003 --reason "已确认现有重试覆盖该场景"
 ```
 
----
+- `pack insert` 从 UTF-8 JSON 文件读取单个包对象。`--after` 在新包未写 `depends_on` 时让它依赖锚点，并让原来依赖锚点的待开工包也依赖新包。`--before` 让锚点包依赖新包，只能用于 `PENDING` 包。遇到已开工或已完成的锚点请用 `--after`。输出和流水账会列出插入位置与依赖有变化的包。
+- `pack tier` 为待开工包指定开工时采用的档位，拆包等门禁照常生效。已开工包的改档从下次派活起生效。更换执行实例时会清除旧会话，已用的修复次数照计。
+- `pack scope` 去重后扩充 `scope_files`，并把 `estimated_files` 至少提高到范围文件数。可以用逗号分隔文件，也可以重复传 `--add`。修改后的范围会出现在下次生成的实现任务书里。附带 `--todo` 会把该待办标为 `expanded`。
+- `forward` 接受一段文字或一条 open 待办。文字默认来自当前包，可用 `--from` 指定来源包。转待办时沿用它的来源并标为 `forwarded`。目标包的初次实现和修复任务书会列出转来的发现、来源与原因。
+- Codex 实现派活结束后，标题含「超范围没改」的节中，具体列表项会转成 open 待办。有这一节却未解析出待办时，派活结果会提醒。自己执行时用 `todo add` 记录。`todo list` 显示全部待办，`status` 的 `open_todos` 显示待处理项。
+
+写入类命令都需要非空 `--reason`。改清单的命令更新快照，并在 `events.jsonl` 写入 `manifest_changed`，其 `source` 分别为 `pack_insert`、`pack_tier`、`pack_scope`、`forward`。自动及手动新增待办写入 `todo_added`，关闭写入 `todo_dismissed`。修改包目标或验收时，走[清单确认流程](docs/UPSTREAM-BRIDGE.md#fill-the-required-fields)。各命令可沿用工作区的 `--repo` 和 `--state-dir`。
 
 ## 目录结构
 
 ```text
 grow-loop/
-├── SKILL.md                  # 跨宿主 Agent Skill 协议（Codex / Antigravity / Claude / Cursor 通用）
+├── SKILL.md                  # 总控执行协议和授权红线
+├── CHANGELOG.md              # 版本变更记录
 ├── package.json              # 零依赖 ESM 包定义
-├── bin/
-│   └── grow-loop.mjs         # CLI 入口（init/probe/status/next/dispatch/record/resume/evidence）
-├── profiles/
-│   ├── standard-test.json    # 开箱模板 1：常规单测项目
-│   └── live-smoke.json       # 开箱模板 2：禁新单测 + 实测脚本项目
+├── bin/grow-loop.mjs         # CLI 入口
+├── profiles/                 # standard-test 与 live-smoke
 ├── src/
-│   ├── state.mjs             # .loop/ 原子持久化、自动 .gitignore、events.jsonl
-│   ├── router.mjs            # 确定性状态机（Blast-Radius + 2+2+2 + 审查底线 + 故障免疫）
-│   ├── gate.mjs              # 人工刹车门与 Approval Envelope
-│   ├── lessons.mjs           # 结构化错题本（lessons.json / lessons.md / tech-debt.md）与跨包注入
-│   ├── probe.mjs             # 带超时只读能力探活 + 可选 code_intel 探测
-│   ├── task-builder.mjs      # 生成带错题/阻塞项/单测红线的受控 task.md
-│   ├── verify.mjs            # CLI 亲自执行验证命令、按退出码判定并留存日志
-│   ├── redact.mjs            # 凭据/Token/内网 IP 脱敏与残留扫描引擎
-│   ├── evidence.mjs          # 双层脱敏验收证据包生成器（人读总表 + 6 类证据）
-│   └── adapters/             # 薄驱动层（self / codex / claude / dsh / custom-cmd）
+│   ├── adapters/             # self / codex / claude / dsh / custom-cmd
+│   ├── state.mjs             # 原子持久化与事件流水账
+│   ├── router.mjs            # 状态流转、修复预算和审查路由
+│   ├── gate.mjs              # 人工门禁
+│   ├── handoff.mjs           # 交接清单导入
+│   ├── task-builder.mjs      # 任务书生成
+│   ├── ref-scan.mjs          # 联改引用搜索
+│   ├── probe.mjs             # 本机执行器探活
+│   ├── verify.mjs            # 本机验证与日志
+│   ├── review-report.mjs     # Markdown 审查报告解析
+│   ├── git-watch.mjs         # 外部提交与文件范围检查
+│   ├── lessons.mjs           # 教训与技术债
+│   ├── shell-api.mjs         # 壳状态和人工回填
+│   ├── evidence.mjs          # 交付证据包
+│   └── redact.mjs            # 脱敏和残留扫描
 ├── docs/
-│   ├── ADAPTER-SPEC.md       # Executor 适配器规范与 5 条零托管红线
-│   └── UPSTREAM-BRIDGE.md    # manifest.json 协议与 grow-me / ai-dev-workflow 桥接指南
-└── test/
-    └── grow-loop.test.mjs    # Node 原生 node:test 完整单元与端到端测试
+│   ├── UPSTREAM-BRIDGE.md    # 清单、上游转换与验证配置
+│   ├── ADAPTER-SPEC.md       # 执行器、派发记录与审查格式
+│   └── SHELL-API.md          # 壳状态与回填契约
+└── test/grow-loop.test.mjs   # Node 原生单元与端到端测试
 ```
-
----
-
-## 演进路线（Mode A → Mode C）
-
-- **v0.1（当前，Mode A）**：由任意宿主 Agent（Codex / Antigravity / Claude Code / Cursor）驱动外置 CLI 状态机与薄适配器，先把内核底座与协议打牢。
-- **v0.2（Mode C 底座升级）**：在复用同一份 `.loop/` 状态与适配器规范的前提下，增加无头驱动模式（Mode B：`grow-loop run` 后台无人值守推进，遇门停机），并在其上可选叠加只读观测面板。
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
