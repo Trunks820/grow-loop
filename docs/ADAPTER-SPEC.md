@@ -1,10 +1,10 @@
-# Executor Adapter Specification (`grow-loop` v0.1)
+# Executor Adapter Specification
 
-`grow-loop` separates **delivery governance** (state machine, budgets, gates, lessons, evidence) from **model execution**. Any local AI coding CLI can participate as a `tier1`, `tier2`, or `reviewer` instance by implementing a thin driver under `src/adapters/`.
+`grow-loop` separates **delivery governance** (state machine, budgets, gates, lessons, evidence) from **model execution**. Any local AI coding CLI can participate as a `tier1`, `tier2`, or `reviewer` instance by implementing a thin driver under `src/adapters/`. For the operator workflow, see the [coordinator protocol](../SKILL.md#coordinator-execution-protocol-mode-a).
 
 ---
 
-## 1. Instance-Level Registry (Not Vendor-Level)
+## 1. Executor Instances
 
 In `.loop/config.json`, `executors` maps **instance IDs** rather than vendor names. The same CLI binary can appear multiple times with different models, reasoning effort, sandboxes, or accounts:
 
@@ -47,7 +47,7 @@ In `.loop/config.json`, `executors` maps **instance IDs** rather than vendor nam
 
 ## 2. Five Zero-Custody Auth Red Lines
 
-Every built-in and community adapter **MUST** comply with these 5 red lines:
+Every built-in and community adapter must implement the [Approval Envelope and Zero-Custody red lines](../SKILL.md#mandatory-security--governance-red-lines). Apply them in the driver as follows.
 
 1. **Zero Credential Custody (BYO Local CLI Only)**
    - Never read, copy, import, proxy, or cache OAuth tokens, browser cookies, API keys, or CLI credential stores (`~/.codex/auth.json`, `~/.claude/`, `~/.dsh/`, keychains).
@@ -140,13 +140,13 @@ export const myAdapter = {
 
 Dry-run dispatch persists `prepared_run` with `run_id`, `run_dir`, `task_file`, `stage`, `instance` and a `fingerprint` of the package and task inputs. Live dispatch for the same stage and instance reuses the directory. A changed fingerprint regenerates the generated task in place. Each invocation honors its explicit `--task-file`.
 
-Before calling `run()`, the CLI consumes `prepared_run` and atomically saves `inflight_run` with the run identifiers, stage, executor instance and start time. `grow-loop status` shows the record. Codex uses `runAdapterProcess({ onStdoutLine })` to read complete stdout lines as they arrive, calls the synchronous `onSessionStarted(threadId)` on `thread.started`, and still parses the full JSONL log for the final result. The CLI immediately persists the ID to `inflight_run` and updates `last_session_id` when the executor still matches the pack's active instance and the route has not changed. `dispatch --resume` uses a compatible saved session for the same stage and instance. An explicit `--resume <session-id>` supplies the native ID directly. External runs clear `inflight_run` on exit. An interrupted Codex process leaves the pack available to resume. This includes a nonzero exit after `thread.started` without a signal, terminal event or final message, which can occur when the process is terminated on Windows.
+Before calling `run()`, the CLI consumes `prepared_run` and atomically saves `inflight_run` with the run identifiers, stage, executor instance and start time. `grow-loop status` shows the record. Codex uses `runAdapterProcess({ onStdoutLine })` to read complete stdout lines as they arrive, calls the synchronous `onSessionStarted(threadId)` on `thread.started`, and still parses the full JSONL log for the final result. The CLI immediately persists the ID to `inflight_run` and updates `last_session_id` when the executor still matches the pack's active instance and the route has not changed. `grow-loop dispatch --resume` uses a compatible saved session for the same stage and instance. An explicit `--resume <session-id>` supplies the native ID directly. External runs clear `inflight_run` on exit. An interrupted Codex process leaves the pack available to resume. This includes a nonzero exit after `thread.started` without a signal, terminal event or final message, which can occur when the process is terminated on Windows.
 
-The `self` adapter receives the same start time and returns `host_action_required`. Its `inflight_run` stays open until `record implement` or a valid `record review --report <report.md>`. Both commands accept optional `--executor-tool`, `--executor-model` and `--executor-effort`. Recording completion updates `result.json` and the event log with the executor details and `elapsed_seconds`. Evidence includes that time and the final implementer's tool and model per pack.
+The `self` adapter receives the same start time and returns `host_action_required`. Its `inflight_run` stays open until `grow-loop record implement` or a valid `grow-loop record review --report <report.md>`. Both commands accept optional `--executor-tool`, `--executor-model` and `--executor-effort`. Recording completion updates `result.json` and the event log with the executor details and `elapsed_seconds`. Evidence includes that time and the final implementer's tool and model per pack.
 
 ### Git checkpoints
 
-The coordinator records `base_commit` and `base_branch` at package start. Verification, review dispatch, the `COMMIT` directive and commit recording check external commits since that baseline. Recorded pack commits and the commit being recorded are excluded. Changes outside the active pack's `scope_files` and `co_change_files` and all completed packs' committed paths generate one advisory notice per commit. Overlaps trigger `EXTERNAL_COMMIT` with the changed paths. `grow-loop resume --action approve --decision "<decision>"` records the decision, resets the baseline to the current HEAD and restores the original stage. `--action abort` ends the loop. Unavailable Git or HEAD produces a skipped check. The `COMMIT` directive also lists out-of-scope working tree changes in `stray_files`, and `record commit --from-git` warns about artifacts in that commit.
+See the coordinator protocol for the [external commit gate](../SKILL.md#step-7--check-external-commits-before-local-closure) and [local commit registration](../SKILL.md#step-8--commit-locally-and-generate-evidence).
 
 ### Closing review reports
 

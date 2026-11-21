@@ -87,7 +87,7 @@ function outJson(obj) {
 }
 
 function printHelp() {
-  process.stdout.write(`grow-loop v0.1.0 — Harness-agnostic multi-package delivery loop
+  process.stdout.write(`grow-loop v0.2.0 — Harness-agnostic multi-package delivery loop
 
 Usage:
   grow-loop init      [--repo <dir>] [--state-dir <dir>] [--profile standard-test|live-smoke] [--manifest <file> | --handoff <file>] [--project <name>] [--no-gitignore] [--force]

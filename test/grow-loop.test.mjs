@@ -43,6 +43,65 @@ const __dirname = path.dirname(__filename);
 const PKG_ROOT = path.resolve(__dirname, '..');
 const CLI_PATH = path.join(PKG_ROOT, 'bin', 'grow-loop.mjs');
 
+test('documented grow-loop commands and options exist on the CLI', () => {
+  const help = execFileSync(process.execPath, [CLI_PATH, '--help'], { encoding: 'utf8' });
+  const commands = new Map();
+  for (const [, command, subcommand, options] of help.matchAll(/^  grow-loop ([a-z][a-z-]*)(?: +([a-z][a-z-]*)(?= |$))?(.*)$/gm)) {
+    commands.set(subcommand ? `${command} ${subcommand}` : command, new Set(options.match(/--[a-z-]+/g)));
+  }
+
+  // The help line for record is abbreviated. Read the options from each actual branch.
+  const source = fs.readFileSync(CLI_PATH, 'utf8');
+  const recordHandler = source.match(/^function cmdRecord\(sub, flags\) \{[\s\S]*?^\}/m)[0];
+  for (const [, subcommand, body] of recordHandler.matchAll(/^  if \(sub === '([a-z]+)'\) \{([\s\S]*?)^  \}/gm)) {
+    const command = `record ${subcommand}`;
+    const options = commands.get(command) ?? new Set();
+    for (const [, property, bracket, inCheck] of body.matchAll(/\bflags(?:\.([a-z-]+)\b|\['([a-z-]+)'\])|'([a-z-]+)' in flags\b/g)) {
+      options.add(`--${property ?? bracket ?? inCheck}`);
+    }
+    commands.set(command, options);
+  }
+  commands.delete('record');
+  if (/\bcmd === 'help'/.test(source)) commands.set('help', new Set());
+
+  const docs = ['README.md', 'SKILL.md', ...fs.readdirSync(path.join(PKG_ROOT, 'docs'))
+    .filter((name) => name.endsWith('.md')).map((name) => `docs/${name}`)];
+  const invocation = /^\s*(?:[$&]\s+)?(?:grow-loop|node\s+(?:"[^"\r\n]*\bgrow-loop\.mjs"|'[^'\r\n]*\bgrow-loop\.mjs'|(?:[^\s"']*[\\/])?grow-loop\.mjs|<GROW_LOOP_BIN>))(?=\s|$)/;
+  const globalOptions = new Set(['--repo', '--state-dir', '--help', '--h']);
+  const problems = [];
+  for (const doc of docs) {
+    const lines = fs.readFileSync(path.join(PKG_ROOT, doc), 'utf8').split(/\r?\n/);
+    for (let index = 0; index < lines.length; index++) {
+      const location = `${doc}:${index + 1}`;
+      let line = lines[index];
+      while (invocation.test(line) && /[\\`]\s*$/.test(line) && index + 1 < lines.length) {
+        line = `${line.replace(/[\\`]\s*$/, '')} ${lines[++index].trimStart()}`;
+      }
+      const examples = [line, ...Array.from(line.matchAll(/`+([^`]+)`+/g), ([, code]) => code)];
+      for (const example of examples.filter((value) => invocation.test(value))) {
+        const args = example.replace(invocation, '').trim();
+        const [, command, subcommand] = args.match(/^([\w-]+)(?:\s+([\w-]+))?/) ?? [];
+        if (!command) continue; // Bare CLI name or a placeholder such as <command>.
+        const key = ['pack', 'todo', 'lesson', 'record'].includes(command) ? `${command} ${subcommand ?? ''}`.trim() : command;
+        const options = commands.get(command.startsWith('--') ? 'help' : key);
+        if (!options) {
+          problems.push(`${location} unknown command: grow-loop ${key}`);
+          continue;
+        }
+        // Keep quoted values together so text such as "retry --later" is not an option.
+        const tokens = args.match(/"(?:\\.|[^"\\])*"|'[^']*'|<[^>]+>|[^\s"'<>]+/g) ?? [];
+        const optionNames = tokens.map((token) => token.match(/^\[?(--[^=\]]+)/)?.[1]).filter(Boolean);
+        for (const option of optionNames) {
+          if (!globalOptions.has(option) && !options.has(option)) {
+            problems.push(`${location} unknown option for grow-loop ${key}: ${option}`);
+          }
+        }
+      }
+    }
+  }
+  assert.deepEqual(problems, [], problems.join('\n'));
+});
+
 function makeTempDir(prefix = 'grow-loop-test-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }

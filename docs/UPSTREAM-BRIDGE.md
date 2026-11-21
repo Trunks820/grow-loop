@@ -1,6 +1,6 @@
 # Upstream Bridge (`manifest.json` Contract)
 
-`grow-loop` accepts its own JSON manifest through `grow-loop init --manifest <file>` and JSON handoffs from `grow-me` through `--handoff`.
+Use a loop manifest for a hand-authored package list, or import a JSON handoff from grow-me. See the [quick start](../README.md#快速开始) for profile selection and the [coordinator protocol](../SKILL.md#coordinator-execution-protocol-mode-a) for package execution.
 
 ---
 
@@ -97,10 +97,18 @@ For an `ai-dev-workflow` HTML plan, use `grow-me` to produce the JSON before imp
 
 ```bash
 echo [] | node <grow-me>/scripts/validate-task.mjs --handoff <页面.html> > handoff.json
-grow-loop import --handoff handoff.json --reason "Append the reviewed plan"
 ```
 
-For a new workspace, run `grow-loop init --handoff task.manifest.json` (or pass `handoff.json`). Choose one of `--manifest` and `--handoff`. To replace the entire manifest and reset workspace configuration and state, run `grow-loop init --force --handoff <file>`. For an existing workspace, `grow-loop import --handoff <file> --reason "<reason>"` appends the packages and audits the change. Package IDs must be new to that workspace.
+For a new workspace, use one of the following initialization commands. The handoff command also accepts the converted `handoff.json` above. If both input flags are omitted on first initialization, the CLI creates an empty manifest.
+
+```sh
+grow-loop init --manifest delivery.json
+grow-loop init --handoff task.manifest.json
+```
+
+In an existing workspace, `grow-loop import --handoff handoff.json --reason "Append the reviewed plan"` appends packages and records why. Package IDs must be new to that workspace. To replace the entire manifest and reset workspace configuration and state, use `grow-loop init --force --manifest <file>` or `grow-loop init --force --handoff <file>`. Replacement also works when there is a pending manifest diff. An explicit input to ordinary initialization is rejected when a workspace manifest already exists.
+
+Run commands from the target repository or keep using the same `--repo` and `--state-dir` settings. See the [workspace defaults](../README.md#快速开始).
 
 ### Conversion
 
@@ -117,7 +125,7 @@ For a new workspace, run `grow-loop init --handoff task.manifest.json` (or pass 
 
 After a manual edit, use `grow-loop status` to review the diff before `manifest-ack`. Acknowledgment records the diff and reason as `manifest_changed` in `events.jsonl`, updates `manifest.snapshot.json`, and syncs the pack order and active pack. Committed and removed pack records are retained.
 
-Before dispatch, read the relevant code and fill in `pitfalls`, `co_change_files`, and `preserve_behaviors`. Copy settled decisions from the plan verbatim. `next` and `dispatch` (including dry-runs) report empty arrays and pitfalls that lack a named code reference in `warnings`. Dispatch can proceed with these warnings.
+See [how to fill the package brief](../SKILL.md#step-1--read-the-code-and-complete-the-package-brief) for the three code-reading fields and verbatim decisions.
 
 The snapshot is created during initialization. A workspace from an older version takes its current manifest as the baseline on the first command. The comparison uses parsed JSON and reports changes to pack membership, the relative order of retained packs, and field values. Use the CLI to update loop state.
 
@@ -132,7 +140,7 @@ Put shared checks in the state directory's `config.json` under `verification.com
 | `verification.output_encoding` | `utf-8` | Decodes command output using a `TextDecoder` encoding such as `gbk`. Log files are saved as UTF-8. |
 | `verification.retry_once` | `true` | Reruns the sequence from the beginning after the first failed attempt. Each attempt stops at the first failing command and writes its own logs. |
 
-A successful second attempt is recorded as `flaky` with both run directories and no repair charge or lesson. When a failure turns out to be environmental, run `grow-loop verify --mark-env "<reason>"` before dispatching the repair. The CLI records the reason, restores the pre-failure repair budget and routing, removes the failure's lesson, and immediately reruns verification. If verification still fails, the pack waits in `VERIFY` without a new repair charge or lesson.
+Blank lines and entries that begin with `#` are skipped. See the [verification flow](../SKILL.md#step-3--run-verification-before-review) for retry outcomes and how to handle an environment failure.
 
 ---
 
@@ -140,4 +148,4 @@ A successful second attempt is recorded as `flaky` with both run directories and
 
 1. Convert the issue list or PRD into a JSON manifest such as `delivery.json` using the schema above.
 2. Run `grow-loop init --manifest delivery.json --profile standard-test` (or select `live-smoke`).
-3. Run `grow-loop probe` and `grow-loop next`.
+3. Continue with [workspace configuration and preflight](../SKILL.md#coordinator-execution-protocol-mode-a).

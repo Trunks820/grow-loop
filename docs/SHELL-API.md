@@ -1,6 +1,6 @@
 # 壳接口
 
-`grow-loop status --format shell` 输出一个 JSON 对象。`grow-loop status` 继续输出原有格式。读取状态和提交回答时，请沿用同一组 `--repo`、`--state-dir` 参数或工作区环境设置。
+`grow-loop status --format shell` 输出一个 JSON 对象。`grow-loop status` 继续输出原有格式。读取状态和提交回答时，请沿用同一组 `--repo`、`--state-dir` 参数或工作区环境设置。总控在包停住时按问题和选项回填，再继续执行。[总控执行协议](../SKILL.md#coordinator-execution-protocol-mode-a)
 
 ## 状态 `grow-loop.status/1`
 
@@ -33,7 +33,7 @@
 
 清单待确认时优先显示 `MANIFEST_CHANGED`。状态读取展示当前已登记的停点。运行 `next` 会执行开工检查，提交阶段还会检查 Git，因此下一条命令可能发现新的门禁。
 
-`next_command` 沿用 `next` 的建议。实现阶段先建议 `dispatch --dry-run`，已有预演后建议正式 `dispatch`。等待 `self` 时，实施成功后可运行 `record implement --passed`，自审完成后运行 `record review --report <report.md>`。`record commit --from-git` 在完成本地提交后登记。`NEEDS_FILL` 时先改清单，再运行建议的 `manifest-ack`。
+`next_command` 沿用 `next` 的建议。实现阶段先建议 `grow-loop dispatch --dry-run`，已有预演后建议正式 `grow-loop dispatch`。等待 `self` 时，实施成功后可运行 `grow-loop record implement --passed`，自审完成后运行 `grow-loop record review --report <report.md>`。`grow-loop record commit --from-git` 在完成本地提交后登记。`NEEDS_FILL` 时先改清单，再运行建议的 `manifest-ack`。
 
 ### `packs[]`
 
@@ -97,7 +97,7 @@
 grow-loop answer --question <问题ID> --option <选项ID> --text "回答原话"
 ```
 
-选项要求文字时，传入非空文字。壳可用参数数组传入 `--text=<原话>`，包括前后空格、换行或以 `--` 开头的文字。问题已处理、停点已换或选项无效时，命令退出码为 `1`，错误说明写入标准错误。停点变化时请重新读取 `status --format shell` 及其中的 `question`。
+选项要求文字时，传入非空文字。壳可用参数数组传入 `--text=<原话>`，包括前后空格、换行或以 `--` 开头的文字。问题已处理、停点已换或选项无效时，命令退出码为 `1`，错误说明写入标准错误。停点变化时请重新读取 `grow-loop status --format shell` 及其中的 `question`。
 
 门禁的有效选项沿用 `resume`，把填写的文字交给 `--decision`。理由随 `gate_resumed.decision` 入账，继续执行时沿用 `resolved_gates` 或 `decisions`，写入任务书的“已经定了的”。确认清单沿用 `manifest-ack --reason`，在 `manifest_changed.details.answer_text` 保留回填原话，并在仍有当前包时写入该包的决定。现有脱敏规则照常生效。成功后的 JSON 使用对应命令的返回格式，壳可再次取状态继续。
 
