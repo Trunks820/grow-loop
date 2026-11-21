@@ -118,13 +118,13 @@ export const myAdapter = {
    * Execute the CLI with stdout/stderr streamed to runDir/stdout.log & stderr.log.
    * Writes redacted runDir/result.json and returns normalized result.
    */
-  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor }) {
+  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor, startedAt, onSessionStarted }) {
     return writeRunResult(runDir, {
       instance_id: instanceId,
       kind: 'my-cli',
       stage,
       read_only: Boolean(readOnly),
-      status: 'completed', // 'completed' | 'failed' | 'infra_error' | 'host_action_required'
+      status: 'completed', // 'completed' | 'failed' | 'infra_error' | 'host_action_required' | 'interrupted'
       exit_code: 0,
       elapsed_seconds: 12.3,
       session_id: 'optional-native-session-id',
@@ -136,9 +136,21 @@ export const myAdapter = {
 };
 ```
 
+### Dispatch state and resume
+
+Dry-run dispatch persists `prepared_run` with `run_id`, `run_dir`, `task_file`, `stage`, `instance` and a `fingerprint` of the package and task inputs. Live dispatch for the same stage and instance reuses the directory. A changed fingerprint regenerates the generated task in place. Each invocation honors its explicit `--task-file`.
+
+Before calling `run()`, the CLI consumes `prepared_run` and atomically saves `inflight_run` with the run identifiers, stage, executor instance and start time. `grow-loop status` shows the record. Codex uses `runAdapterProcess({ onStdoutLine })` to read complete stdout lines as they arrive, calls the synchronous `onSessionStarted(threadId)` on `thread.started`, and still parses the full JSONL log for the final result. The CLI immediately persists the ID to `inflight_run` and updates `last_session_id` when the executor still matches the pack's active instance and the route has not changed. `dispatch --resume` uses a compatible saved session for the same stage and instance. An explicit `--resume <session-id>` supplies the native ID directly. External runs clear `inflight_run` on exit. An interrupted Codex process leaves the pack available to resume. This includes a nonzero exit after `thread.started` without a signal, terminal event or final message, which can occur when the process is terminated on Windows.
+
+The `self` adapter receives the same start time and returns `host_action_required`. Its `inflight_run` stays open until `record implement` or a valid `record review --report <report.md>`. Both commands accept optional `--executor-tool`, `--executor-model` and `--executor-effort`. Recording completion updates `result.json` and the event log with the executor details and `elapsed_seconds`. Evidence includes that time and the final implementer's tool and model per pack.
+
+### Git checkpoints
+
+The coordinator records `base_commit` and `base_branch` at package start. Verification, review dispatch, the `COMMIT` directive and commit recording check external commits since that baseline. Recorded pack commits and the commit being recorded are excluded. Changes outside the active pack's `scope_files` and `co_change_files` and all completed packs' committed paths generate one advisory notice per commit. Overlaps trigger `EXTERNAL_COMMIT` with the changed paths. `grow-loop resume --action approve --decision "<decision>"` records the decision, resets the baseline to the current HEAD and restores the original stage. `--action abort` ends the loop. Unavailable Git or HEAD produces a skipped check. The `COMMIT` directive also lists out-of-scope working tree changes in `stray_files`, and `record commit --from-git` warns about artifacts in that commit.
+
 ### Closing review reports
 
-A completed review adapter can return the path to its final message as `final_md`. `grow-loop dispatch --stage review` reads that file, records the verdict and findings, and uses the dispatched instance and its configured `model` as the reviewer identity. For a self-review or an adapter without `final_md`, save the same report and run `grow-loop record review --report <report.md>`. Self-review records the `self` instance by default. Use `--reviewer <instance>` to identify a different configured reviewer.
+A completed review adapter can return the path to its final message as `final_md`. `grow-loop dispatch --stage review` reads that file, records the verdict and findings, and uses the dispatched instance and its configured `model` as the reviewer identity. For a self-review or an adapter without `final_md`, save the same report and run `grow-loop record review --report <report.md>`. Self-review uses the dispatched instance, or `self` for reviews submitted without dispatch. Use `--reviewer <instance>` to supply the reviewer identity.
 
 Write one standalone `VERDICT: PASS` or `VERDICT: FAIL` line. Surrounding whitespace and whole-line Markdown bold are allowed. Follow it with exactly one fenced `json` block.
 

@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 import {
   addScopeTodos,
@@ -12,16 +12,19 @@ import {
   ensureDir,
   ensureGitignoreEntry,
   getStatePaths,
+  invalidateSession,
   loadWorkspace,
   ManifestChangedError,
   readJsonSafe,
   readManifest,
+  rememberSession,
   resolveStateDir,
   saveState,
   writeJsonAtomic,
   writeManifestWithReason
 } from '../src/state.mjs';
 import {
+  buildNextDirective,
   getBudgets,
   getPackDef,
   getRepairRounds,
@@ -41,6 +44,8 @@ import { generateEvidencePack } from '../src/evidence.mjs';
 import { buildRedactor } from '../src/redact.mjs';
 import { getVerificationCommands, runVerification } from '../src/verify.mjs';
 import { parseReviewReport } from '../src/review-report.mjs';
+import { ALLOWED_GATE_REASONS } from '../src/gate.mjs';
+import { checkExternalCommits, readGitHeadCommit } from '../src/git-watch.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -97,10 +102,11 @@ Usage:
   grow-loop lesson disable --id <ID> --reason "<text>"
   grow-loop lesson list [--status draft|confirmed|disabled]
   grow-loop next      [--repo <dir>] [--state-dir <dir>]
-  grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume] [--task-file <path>]
+  grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume [<session-id>]] [--task-file <path>]
   grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--pack <id>] [--timeout <sec>] [--mark-env "<reason>"]
   grow-loop record    <implement|verify|review|commit|lesson> [flags]
-  grow-loop record review --report <report.md> [--reviewer <instance>]
+  grow-loop record implement --passed [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
+  grow-loop record review --report <report.md> [--reviewer <instance>] [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
   grow-loop record lesson --summary "<text>" [--pack <ID>] [--rule "<text>"] [--scope global|tags] [--tags a,b]
   grow-loop resume    --decision "<text>" [--action approve|repair|retry|commit|switch_instance|abort] [--instance <id>]
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
@@ -215,6 +221,7 @@ async function cmdProbe(flags) {
 
 function cmdStatus(flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir'], { allowPendingManifest: true });
+  const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
   const summary = ctx.state.pack_order.map((id) => {
     const p = ctx.state.packs[id];
     return {
@@ -226,6 +233,7 @@ function cmdStatus(flags) {
       repairs: `${p.tier1_repairs}/${p.tier2_repairs}`,
       reviews: p.review_rounds,
       infra_failures: p.infra_failures,
+      inflight_run: redactor.redactValue(p.inflight_run ?? null),
       commit: p.commit?.sha?.slice(0, 9) || null,
       gate: p.gate?.reason || null
     };
@@ -347,7 +355,7 @@ function cmdPackTier(ctx, flags, reason) {
     const instance = resolveTierInstance(ctx.config, tier);
     details.previous_instance = pack.active_instance;
     details.active_instance = instance;
-    if (instance !== pack.active_instance) pack.last_session_id = null;
+    if (instance !== pack.active_instance) invalidateSession(pack);
     pack.current_tier = tier;
     pack.active_instance = instance;
     pack.escalated = true;
@@ -360,6 +368,7 @@ function cmdPackTier(ctx, flags, reason) {
         current_tier: pack.current_tier,
         active_instance: pack.active_instance,
         last_session_id: pack.last_session_id,
+        last_session_route: pack.last_session_route,
         escalated: pack.escalated,
         escalation_reason: pack.escalation_reason
       });
@@ -490,7 +499,7 @@ function cmdLesson(sub, flags) {
   }
 }
 
-function recordReviewReport(ctx, { packId, reportPath, reviewer, reviewerModel, reviewRound, runId }) {
+function recordReviewReport(ctx, { packId, reportPath, reviewer, reviewerModel, reviewRound, runId, executor, dispatch }) {
   let markdown;
   let report;
   try {
@@ -517,7 +526,77 @@ function recordReviewReport(ctx, { packId, reportPath, reviewer, reviewerModel, 
     process.exitCode = 1;
     return invalid;
   }
-  return recordReviewOutcome(ctx, { ...report, packId, reportPath, reviewer, reviewerModel, reviewRound });
+  return recordReviewOutcome(ctx, { ...report, packId, reportPath, reviewer, reviewerModel, reviewRound, runId, executor, dispatch });
+}
+
+function taskFingerprint(ctx, pack) {
+  const { paths } = ctx;
+  const inputs = {
+    status: pack.status,
+    tier1_repairs: pack.tier1_repairs,
+    tier2_repairs: pack.tier2_repairs,
+    review_rounds: pack.review_rounds,
+    current_tier: pack.current_tier,
+    active_instance: pack.active_instance,
+    last_verify: pack.last_verify,
+    findings: pack.pending_blocking_findings,
+    decisions: pack.decisions,
+    gates: pack.resolved_gates,
+    config: ctx.config
+  };
+  const hash = createHash('sha256').update(JSON.stringify(inputs));
+  for (const file of [paths.manifestSnapshotPath, paths.lessonsJsonPath, paths.techDebtJsonPath]) {
+    hash.update('\0');
+    try {
+      hash.update(fs.readFileSync(file));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  return hash.digest('hex');
+}
+
+function prepareDispatch(ctx, pack, packDef, stage, instanceId, suppliedTask) {
+  const prepared = pack.prepared_run;
+  const reusable = prepared?.stage === stage && prepared.instance === instanceId;
+  const startedAt = new Date().toISOString();
+  const stamp = startedAt.replace(/[:.]/g, '-');
+  const runsDir = path.join(ctx.paths.runsDir, pack.id);
+  ensureDir(runsDir);
+  const runDir = reusable ? prepared.run_dir
+    : fs.mkdtempSync(path.join(runsDir, [stamp, stage, encodeURIComponent(instanceId), ''].join('-')));
+  ensureDir(runDir);
+  ensureDir(path.join(ctx.paths.artifactsDir, pack.id));
+  const fingerprint = taskFingerprint(ctx, pack);
+  const generatedTask = path.join(runDir, 'task.md');
+  let taskFile = suppliedTask;
+  if (!taskFile) {
+    taskFile = reusable && prepared.task_file === generatedTask && prepared.fingerprint === fingerprint && fs.existsSync(generatedTask)
+      ? generatedTask : buildTaskPrompt(ctx, { pack, packDef, stage, runDir });
+  }
+  return { run_id: path.basename(runDir), run_dir: runDir, task_file: taskFile, stage, instance: instanceId, fingerprint };
+}
+
+function savedSession(pack, stage, instanceId) {
+  const run = pack.inflight_run;
+  if (run?.stage === stage && run.instance === instanceId && !run.route_changed &&
+      run.active_instance === pack.active_instance && run.session_id) return run.session_id;
+  if (!pack.last_session_id || instanceId !== pack.active_instance) return null;
+  const route = pack.last_session_route;
+  if (route?.id === pack.last_session_id) {
+    return route.stage === stage && route.instance === instanceId ? pack.last_session_id : null;
+  }
+  return stage === 'implement' ? pack.last_session_id : null;
+}
+
+function dispatchStillRunning(run) {
+  if (!run?.pid || run.kind === 'self') return false;
+  try {
+    process.kill(run.pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
 }
 
 async function cmdDispatch(flags) {
@@ -527,40 +606,48 @@ async function cmdDispatch(flags) {
   const packDef = getPackDef(ctx.manifest, packId);
   if (!pack || !packDef) throw new Error(`Pack "${packId}" not found`);
   if (pack.status === 'COMMITTED') throw new Error(`Pack ${packId} is already committed.`);
+  if (ctx.state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
 
   const stage = String(flags.stage || (pack.status === 'REVIEW' ? 'review' : 'implement')).toLowerCase();
+  if (!['review', 'implement'].includes(stage)) throw new Error('Use --stage implement or review.');
   const readOnly = stage === 'review';
   const reviewRound = pack.review_rounds + 1;
   const instanceId = flags.instance || (readOnly ? resolveTierInstance(ctx.config, 'reviewer') : pack.active_instance || resolveTierInstance(ctx.config, pack.current_tier || 'tier1'));
   const instanceCfg = ctx.config?.executors?.[instanceId] || { kind: 'self' };
   const adapter = getAdapter(instanceCfg.kind || 'self');
   const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
-
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const runId = `${stamp}-${stage}-${instanceId}${flags['dry-run'] ? '-dryrun' : ''}`;
-  const runDir = path.join(ctx.paths.runsDir, pack.id, runId);
-  ensureDir(runDir);
-  ensureDir(path.join(ctx.paths.artifactsDir, pack.id));
+  const gitCheck = checkPackGit(ctx, pack, packDef, readOnly);
+  if (gitCheck.action === 'PAUSE_FOR_HUMAN') {
+    outJson(gitCheck);
+    return;
+  }
+  const inflight = pack.inflight_run;
+  if (!flags['dry-run'] && dispatchStillRunning(inflight)) {
+    throw new Error('This pack already has a running dispatch. Check grow-loop status.');
+  }
+  if (!flags['dry-run'] && inflight?.kind === 'self' && !inflight.route_changed) {
+    throw new Error('This pack has a self run awaiting grow-loop record ' + inflight.stage + '.');
+  }
   const warnings = taskBriefWarnings(packDef, ctx.config);
-
-  const taskFilePath = flags['task-file']
-    ? path.resolve(flags['task-file'])
-    : buildTaskPrompt(ctx, { pack, packDef, stage, runDir });
-
-  const resumeSessionId = flags.resume ? (typeof flags.resume === 'string' ? flags.resume : pack.last_session_id) : null;
+  const suppliedTask = flags['task-file'] === undefined ? null : path.resolve(requireText(flags['task-file'], 'task-file'));
+  if (suppliedTask && !fs.statSync(suppliedTask, { throwIfNoEntry: false })?.isFile()) {
+    throw new Error('Specify a readable task file with --task-file <path>.');
+  }
+  let resumeSessionId = null;
+  if (flags.resume === true) resumeSessionId = savedSession(pack, stage, instanceId);
+  else if (flags.resume !== undefined) resumeSessionId = requireText(flags.resume, 'resume');
+  if (flags.resume === true && !resumeSessionId) warnings.push('当前阶段和执行实例没有可续的会话，本次会启动新会话。');
+  const prepared = prepareDispatch(ctx, pack, packDef, stage, instanceId, suppliedTask);
+  const { run_id: runId, run_dir: runDir, task_file: taskFilePath } = prepared;
+  const adapterInput = {
+    instanceId, cfg: instanceCfg, repoDir: ctx.state.repo_dir, runDir, taskFilePath,
+    stage, readOnly, resumeSessionId, redactor
+  };
 
   if (flags['dry-run']) {
-    const receipt = await adapter.dryRun({
-      instanceId,
-      cfg: instanceCfg,
-      repoDir: ctx.state.repo_dir,
-      runDir,
-      taskFilePath,
-      stage,
-      readOnly,
-      resumeSessionId,
-      redactor
-    });
+    const receipt = await adapter.dryRun(adapterInput);
+    pack.prepared_run = prepared;
+    saveState(ctx.stateDir, ctx.state);
     appendEvent(ctx.stateDir, ctx.config, {
       type: 'dispatch_dry_run',
       pack_id: pack.id,
@@ -568,91 +655,123 @@ async function cmdDispatch(flags) {
       instance: instanceId,
       run_id: runId
     });
-    outJson({ run_id: runId, run_dir: runDir, dry_run: receipt, warnings });
+    outJson({ run_id: runId, run_dir: runDir, dry_run: receipt, warnings, ...gitCheck });
     return;
   }
 
-  appendEvent(ctx.stateDir, ctx.config, {
-    type: 'dispatch_started',
-    pack_id: pack.id,
-    stage,
-    instance: instanceId,
-    read_only: readOnly,
-    run_id: runId,
-    resumed_session: resumeSessionId || null
-  });
-  if (stage === 'implement' && pack.last_verify?.repair_undo) {
-    delete pack.last_verify.repair_undo;
-    saveState(ctx.stateDir, ctx.state);
-  }
-
-  const result = await adapter.run({
-    instanceId,
-    cfg: instanceCfg,
-    repoDir: ctx.state.repo_dir,
-    runDir,
-    taskFilePath,
-    stage,
-    readOnly,
-    resumeSessionId,
-    timeoutSec: flags.timeout ? Number(flags.timeout) : undefined,
-    redactor
-  });
-
+  const startedAt = new Date().toISOString();
+  pack.inflight_run = {
+    run_id: runId, run_dir: runDir, task_file: taskFilePath, stage, instance: instanceId,
+    kind: adapter.kind, tier: pack.current_tier || 'tier1', active_instance: pack.active_instance,
+    started_at: startedAt, session_id: resumeSessionId, pid: process.pid
+  };
+  const dispatch = { tier: pack.inflight_run.tier, instance: instanceId };
+  pack.prepared_run = null;
+  if (stage === 'implement' && pack.last_verify?.repair_undo) delete pack.last_verify.repair_undo;
+  saveState(ctx.stateDir, ctx.state);
+  let result;
+  let startedSessionId;
   let transition = null;
-  if (stage === 'implement' && result.status !== 'host_action_required') {
-    // An operator may have changed the route, scope, or todos while the adapter ran.
-    ctx.state = readJsonSafe(ctx.paths.statePath);
-    transition = recordImplementOutcome(ctx, {
-      packId: pack.id,
-      passed: result.status === 'completed',
-      infraError: result.infra_error || null,
-      sessionId: result.session_id || null,
-      runId,
-      dispatch: { tier: pack.current_tier || 'tier1', instance: instanceId },
-      summary: result.infra_error ? `Adapter ${instanceId} hit ${result.infra_error}` : `Adapter ${instanceId} exited with code ${result.exit_code}`
+  try {
+    appendEvent(ctx.stateDir, ctx.config, {
+      type: 'dispatch_started', pack_id: pack.id, stage, instance: instanceId, read_only: readOnly,
+      run_id: runId, started_at: startedAt, resumed_session: resumeSessionId || null
     });
-    if (adapter.kind === 'codex' && result.final_md) {
-      let report;
-      try {
-        report = parseOutOfScopeItems(fs.readFileSync(result.final_md, 'utf8'), { includeSection: true });
-      } catch {
-        // The adapter outcome remains valid if its optional final message is unreadable.
+    result = await adapter.run({
+      ...adapterInput,
+      startedAt,
+      timeoutSec: flags.timeout ? Number(flags.timeout) : undefined,
+      onSessionStarted(sessionId) {
+        startedSessionId = sessionId;
+        const latest = readJsonSafe(ctx.paths.statePath);
+        const current = latest.packs[packId];
+        const run = current?.inflight_run;
+        if (run?.run_id !== runId || current.status === 'COMMITTED' || latest.loop_status === 'ABORTED') return;
+        run.session_id = sessionId;
+        if (!run.route_changed && current.active_instance === instanceId) {
+          rememberSession(current, sessionId, stage, instanceId);
+        }
+        saveState(ctx.stateDir, latest);
       }
-      if (report?.items.length) {
-        addScopeTodos(ctx, { packId: pack.id, runId, texts: report.items, reason: 'Reported by the executor as out of scope.' });
-      } else if (report?.hasSection) {
-        warnings.push('执行者的最终回复含「超范围没改」一节，但未解析出待办。');
+    });
+    if (result.status !== 'host_action_required') {
+      // An operator may have changed the route, scope, or todos while the adapter ran.
+      ctx.state = readJsonSafe(ctx.paths.statePath);
+      const current = ctx.state.packs[packId];
+      const run = current?.inflight_run;
+      if (run?.run_id === runId && current.status !== 'COMMITTED' && ctx.state.loop_status !== 'ABORTED') {
+        current.inflight_run = null;
+        const executor = {
+          executor_tool: adapter.kind, executor_model: instanceCfg.model ?? null,
+          executor_effort: instanceCfg.reasoning_effort ?? null
+        };
+        dispatch.routeChanged = run.route_changed;
+        if (current.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
+          transition = buildNextDirective(ctx, current, getPackDef(ctx.manifest, packId));
+        } else if (stage === 'implement' && result.status !== 'interrupted') {
+          transition = recordImplementOutcome(ctx, {
+            packId, passed: result.status === 'completed', infraError: result.infra_error || null,
+            sessionId: startedSessionId || result.session_id || resumeSessionId, runId, dispatch, executor,
+            summary: result.infra_error ? `Adapter ${instanceId} hit ${result.infra_error}` : `Adapter ${instanceId} exited with code ${result.exit_code}`
+          });
+          if (adapter.kind === 'codex') recordOutOfScopeReport(ctx, packId, runId, result.final_md, warnings);
+        } else if (readOnly && result.status === 'completed' && !result.infra_error && result.final_md) {
+          transition = recordReviewReport(ctx, {
+            packId, reportPath: result.final_md, reviewer: instanceId, reviewerModel: instanceCfg.model || null,
+            reviewRound, runId, executor, dispatch
+          });
+        }
       }
     }
-  } else if (readOnly && result.status === 'completed' && !result.infra_error && result.final_md) {
-    ctx.state = readJsonSafe(ctx.paths.statePath);
-    transition = recordReviewReport(ctx, {
-      packId: pack.id,
-      reportPath: result.final_md,
-      reviewer: instanceId,
-      reviewerModel: instanceCfg.model || null,
-      reviewRound,
-      runId
-    });
+  } finally {
+    if (result?.status !== 'host_action_required') {
+      const latest = readJsonSafe(ctx.paths.statePath);
+      const current = latest.packs[packId];
+      if (current?.inflight_run?.run_id === runId) {
+        current.inflight_run = null;
+        saveState(ctx.stateDir, latest);
+      }
+    }
   }
 
-  outJson({ run_id: runId, run_dir: runDir, result, transition, warnings });
+  outJson({ run_id: runId, run_dir: runDir, result, transition, warnings, ...gitCheck });
 }
 
-function readGitHeadCommit(repoDir) {
-  const meta = execFileSync('git', ['-C', repoDir, 'log', '-1', '--format=%H|%s'], { encoding: 'utf8' }).trim();
-  const [sha, ...msgParts] = meta.split('|');
-  const stat = execFileSync('git', ['-C', repoDir, 'show', '--shortstat', '--format=', sha], { encoding: 'utf8' }).trim();
-  const files = Number((stat.match(/(\d+)\s+files?\s+changed/) || [])[1] || 0);
-  const insertions = Number((stat.match(/(\d+)\s+insertions?\(\+\)/) || [])[1] || 0);
-  const deletions = Number((stat.match(/(\d+)\s+deletions?\(-\)/) || [])[1] || 0);
-  return { sha, message: msgParts.join('|'), files, insertions, deletions };
+function recordOutOfScopeReport(ctx, packId, runId, finalMd, warnings) {
+  if (!finalMd) return;
+  let report;
+  try {
+    report = parseOutOfScopeItems(fs.readFileSync(finalMd, 'utf8'), { includeSection: true });
+  } catch {
+    return;
+  }
+  if (report.items.length) {
+    addScopeTodos(ctx, { packId, runId, texts: report.items, reason: 'Reported by the executor as out of scope.' });
+  } else if (report.hasSection) {
+    warnings.push('执行者的最终回复含「超范围没改」一节，但未解析出待办。');
+  }
+}
+
+function checkPackGit(ctx, pack, packDef, shouldCheck) {
+  if (!pack) return {};
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) return buildNextDirective(ctx, pack, packDef);
+  if (!shouldCheck || pack.status === 'COMMITTED') return {};
+  const gitWatch = checkExternalCommits(ctx, pack, packDef);
+  if (gitWatch?.status === 'blocked') return buildNextDirective(ctx, pack, packDef);
+  return gitWatch ? { git_watch: gitWatch } : {};
+}
+
+function executorFlags(flags) {
+  return Object.fromEntries(['tool', 'model', 'effort']
+    .filter((field) => Object.hasOwn(flags, 'executor-' + field))
+    .map((field) => ['executor_' + field, requireText(flags['executor-' + field], 'executor-' + field)]));
 }
 
 function cmdRecord(sub, flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir']);
   const packId = flags.pack || ctx.state.active_pack_id;
+  const pack = ctx.state.packs[packId];
+  const packDef = getPackDef(ctx.manifest, packId);
 
   if (sub === 'implement') {
     const res = recordImplementOutcome(ctx, {
@@ -661,6 +780,7 @@ function cmdRecord(sub, flags) {
       infraError: flags['infra-error'] || null,
       sessionId: flags['session-id'] || null,
       runId: flags['run-id'] || null,
+      executor: executorFlags(flags),
       summary: flags.summary || '',
       rule: flags.rule || ''
     });
@@ -669,8 +789,13 @@ function cmdRecord(sub, flags) {
   }
 
   if (sub === 'verify') {
+    const gitCheck = checkPackGit(ctx, pack, packDef, pack?.status === 'VERIFY');
+    if (gitCheck.action === 'PAUSE_FOR_HUMAN') {
+      outJson(gitCheck);
+      return;
+    }
     const claimsPass = Boolean(flags.passed) && !flags.failed;
-    if (claimsPass && getVerificationCommands(ctx.config, getPackDef(ctx.manifest, packId)).length && !flags['allow-self-report']) {
+    if (claimsPass && getVerificationCommands(ctx.config, packDef).length && !flags['allow-self-report']) {
       throw new Error('Verification commands are configured: run "grow-loop verify" so the CLI checks real exit codes, or pass --allow-self-report to record an unchecked pass.');
     }
     const res = recordVerifyOutcome(ctx, {
@@ -682,23 +807,33 @@ function cmdRecord(sub, flags) {
       rule: flags.rule || '',
       locator: flags.locator || ''
     });
-    outJson(res);
+    outJson({ ...res, ...gitCheck });
     return;
   }
 
   if (sub === 'review') {
+    const gitCheck = checkPackGit(ctx, pack, packDef, pack?.status === 'REVIEW');
+    if (gitCheck.action === 'PAUSE_FOR_HUMAN') {
+      outJson(gitCheck);
+      return;
+    }
     if ('report' in flags) {
       if (typeof flags.report !== 'string' || !flags.report.trim()) throw new Error('Specify --report <report.md>.');
       if (['findings-file', 'findings', 'verdict', 'summary'].some((flag) => flag in flags)) {
         throw new Error('With --report, put the verdict, summary and findings in the Markdown report.');
       }
-      outJson(recordReviewReport(ctx, {
+      const reviewer = flags.reviewer || (pack?.inflight_run?.stage === 'review' && pack.inflight_run.kind === 'self'
+        ? pack.inflight_run.instance : 'self');
+      const res = recordReviewReport(ctx, {
         packId,
         reportPath: path.resolve(flags.report),
-        reviewer: flags.reviewer || 'self'
-      }));
+        reviewer,
+        executor: executorFlags(flags)
+      });
+      outJson({ ...res, ...gitCheck });
       return;
     }
+    if (Object.keys(executorFlags(flags)).length) throw new Error('Use --report to record the self-review executor.');
     let findings = [];
     if (flags['findings-file']) {
       const parsed = JSON.parse(fs.readFileSync(path.resolve(flags['findings-file']), 'utf8'));
@@ -713,12 +848,19 @@ function cmdRecord(sub, flags) {
       summary: flags.summary || '',
       reviewer: flags.reviewer || null
     });
-    outJson(res);
+    outJson({ ...res, ...gitCheck });
     return;
   }
 
   if (sub === 'commit') {
+    if (pack?.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
+      outJson(buildNextDirective(ctx, pack, packDef));
+      return;
+    }
     const gitInfo = flags['from-git'] ? readGitHeadCommit(ctx.state.repo_dir) : null;
+    if (flags['from-git'] && !gitInfo) {
+      throw new Error('Unable to read the Git HEAD commit for --from-git. Use --sha <commit-hash> to record it manually.');
+    }
     const sha = flags.sha || gitInfo?.sha;
     if (!sha) throw new Error('Specify --from-git or --sha <commit-hash>');
     const res = recordCommitOutcome(ctx, {
@@ -727,14 +869,14 @@ function cmdRecord(sub, flags) {
       message: flags.message || gitInfo?.message || '',
       files: flags.files ?? gitInfo?.files ?? 0,
       insertions: flags.insertions ?? gitInfo?.insertions ?? 0,
-      deletions: flags.deletions ?? gitInfo?.deletions ?? 0
+      deletions: flags.deletions ?? gitInfo?.deletions ?? 0,
+      fromGit: Boolean(gitInfo)
     });
     outJson(res);
     return;
   }
 
   if (sub === 'lesson') {
-    const pack = ctx.state.packs[packId];
     const entry = addLesson(ctx.stateDir, ctx.config, {
       pack_id: packId || 'GLOBAL',
       stage: flags.stage || 'MANUAL',
@@ -757,12 +899,20 @@ function cmdRecord(sub, flags) {
 
 async function cmdVerify(flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir']);
+  const packId = flags.pack || ctx.state.active_pack_id;
+  const pack = ctx.state.packs[packId];
+  const gitCheck = checkPackGit(ctx, pack, getPackDef(ctx.manifest, packId),
+    pack?.status === 'VERIFY' || Boolean(pack?.last_verify?.repair_undo && typeof flags['mark-env'] === 'string' && flags['mark-env'].trim()));
+  if (gitCheck.action === 'PAUSE_FOR_HUMAN') {
+    outJson(gitCheck);
+    return;
+  }
   const res = await runVerification(ctx, {
-    packId: flags.pack || ctx.state.active_pack_id,
+    packId,
     timeoutSec: flags.timeout ? Number(flags.timeout) : undefined,
     markEnv: flags['mark-env']
   });
-  outJson(res);
+  outJson({ ...res, ...gitCheck });
 }
 
 function cmdResume(flags) {

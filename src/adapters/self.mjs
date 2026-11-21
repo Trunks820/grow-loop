@@ -43,7 +43,7 @@ export const selfAdapter = {
     );
   },
 
-  async run({ instanceId, runDir, taskFilePath, stage, readOnly, redactor }) {
+  async run({ instanceId, cfg, runDir, taskFilePath, stage, readOnly, redactor, startedAt }) {
     return writeRunResult(
       runDir,
       {
@@ -53,7 +53,11 @@ export const selfAdapter = {
         read_only: Boolean(readOnly),
         status: 'host_action_required',
         task_file: path.resolve(taskFilePath),
-        elapsed_seconds: 0,
+        started_at: startedAt,
+        elapsed_seconds: null,
+        executor_tool: 'self',
+        executor_model: cfg?.model ?? null,
+        executor_effort: cfg?.reasoning_effort ?? null,
         infra_error: null,
         note: `Host harness should execute instructions in ${taskFilePath}, then call "grow-loop record ${stage === 'review' ? 'review' : 'implement'} ...".`
       },

@@ -1,10 +1,13 @@
-import { appendEvent, readJsonSafe, saveState } from './state.mjs';
+import path from 'node:path';
+import { appendEvent, invalidateSession, readJsonSafe, rememberSession, saveState } from './state.mjs';
 import { buildRedactor } from './redact.mjs';
 import { taskBriefWarnings } from './task-builder.mjs';
 import { getVerificationCommands } from './verify.mjs';
 import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
 import { addLesson, closeLessonsForPack, deferInRoundTechDebt, recordReviewTechDebt, removeLesson, selectLessonsForPack } from './lessons.mjs';
 import { getBlockingReviewSeverities } from './review-report.mjs';
+import { checkExternalCommits, readCommitFiles, readGitPosition, scanStrayFiles } from './git-watch.mjs';
+import { writeRunResult } from './adapters/base.mjs';
 
 export function getBudgets(config) {
   return {
@@ -93,6 +96,7 @@ export function checkDependencies(state, packDef) {
  */
 export function startOrAdvanceActivePack(ctx) {
   const { stateDir, config, manifest, state } = ctx;
+  if (state.loop_status === 'ABORTED') return { action: 'ABORTED' };
   const activeId = state.active_pack_id || state.pack_order.find((id) => state.packs[id]?.status !== 'COMMITTED');
   if (!activeId) {
     state.loop_status = 'COMPLETED';
@@ -120,7 +124,12 @@ export function startOrAdvanceActivePack(ctx) {
       };
     }
 
-    pack.started_at = pack.started_at || new Date().toISOString();
+    if (!pack.started_at) {
+      pack.started_at = new Date().toISOString();
+      const position = readGitPosition(state.repo_dir);
+      pack.base_commit = position?.head ?? null;
+      pack.base_branch = position?.branch ?? null;
+    }
     pack.resolved_gates = pack.resolved_gates || {};
     const br = evaluateBlastRadius(config, packDef, pack);
     pack.blast_radius = br;
@@ -290,9 +299,13 @@ export function buildNextDirective(ctx, pack, packDef) {
   }
 
   if (pack.status === 'READY_TO_COMMIT') {
+    const gitWatch = checkExternalCommits(ctx, pack, packDef);
+    if (gitWatch?.status === 'blocked') return buildNextDirective(ctx, pack, packDef);
     return {
       action: 'COMMIT',
       ...packInfo,
+      ...scanStrayFiles(ctx, pack, packDef),
+      ...(gitWatch && { git_watch: gitWatch }),
       approval_note: 'Local commit ONLY (git add explicit files + git commit). NEVER git push / merge / deploy without RELEASE gate.',
       next_command: `Commit locally, then call: grow-loop record commit --from-git`
     };
@@ -362,7 +375,7 @@ export function applyRepairLadder(ctx, pack, source, reasonSummary) {
     pack.tier2_repairs += 1;
     pack.status = 'IMPLEMENT';
     // Reset native session ID when switching executor instance
-    pack.last_session_id = null;
+    invalidateSession(pack);
 
     appendEvent(stateDir, config, {
       type: 'escalated_to_tier2',
@@ -425,19 +438,59 @@ function getWritablePack(state, packId) {
   const pack = state.packs[packId || state.active_pack_id];
   if (!pack) throw new Error('No active pack found');
   if (pack.status === 'COMMITTED') throw new Error(`Pack ${pack.id} is already committed.`);
+  if (state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
   return pack;
+}
+
+function completeSelfRun(ctx, pack, stage, payload, status, instance) {
+  const run = pack.inflight_run;
+  const cfg = ctx.config?.executors?.[instance];
+  const executor = {
+    executor_tool: payload.executor?.executor_tool ?? cfg?.kind ?? null,
+    executor_model: payload.executor?.executor_model ?? cfg?.model ?? null,
+    executor_effort: payload.executor?.executor_effort ?? cfg?.reasoning_effort ?? null
+  };
+  if (payload.dispatch || !run || run.kind !== 'self' || run.stage !== stage) return { executor };
+
+  if (payload.runId && payload.runId !== run.run_id) {
+    throw new Error('Pass --run-id ' + run.run_id + ' to record the dispatched self run, or omit --run-id.');
+  }
+  const result = readJsonSafe(path.join(run.run_dir, 'result.json'), {});
+  const elapsedSeconds = result.elapsed_seconds ?? Math.max(0, (Date.now() - Date.parse(run.started_at)) / 1000);
+  const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
+  for (const field of Object.keys(executor)) {
+    executor[field] = payload.executor?.[field] ?? result[field] ?? executor[field];
+  }
+  const { note, recorded_at, ...receipt } = result;
+  writeRunResult(run.run_dir, {
+    ...receipt, ...executor, instance_id: run.instance, stage, kind: 'self', status,
+    started_at: run.started_at, elapsed_seconds: elapsedSeconds, infra_error: payload.infraError || null
+  }, redactor);
+  pack.inflight_run = null;
+  appendEvent(ctx.stateDir, ctx.config, {
+    type: 'self_run_recorded', pack_id: pack.id, run_id: run.run_id, stage,
+    instance: run.instance, status, elapsed_seconds: elapsedSeconds, ...executor
+  });
+  return { executor, selfRunId: run.run_id };
 }
 
 export function recordImplementOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
   const pack = getWritablePack(state, payload.packId);
-  if (pack.last_verify) delete pack.last_verify.repair_undo;
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
+    return buildNextDirective(ctx, pack, getPackDef(ctx.manifest, pack.id));
+  }
   const runTier = payload.dispatch?.tier ?? pack.current_tier;
-  const runInstance = payload.dispatch?.instance ?? pack.active_instance;
-  const canResume = !payload.dispatch || runInstance === pack.active_instance;
+  const selfRun = !payload.dispatch && pack.inflight_run?.kind === 'self' && pack.inflight_run.stage === 'implement'
+    ? pack.inflight_run : null;
+  const runInstance = payload.dispatch?.instance ?? selfRun?.instance ?? pack.active_instance;
+  const canResume = runInstance === pack.active_instance && !payload.dispatch?.routeChanged && !selfRun?.route_changed;
+  const { executor, selfRunId } = completeSelfRun(ctx, pack, 'implement', payload,
+    payload.infraError ? 'infra_error' : (payload.passed ? 'completed' : 'failed'), runInstance);
+  if (pack.last_verify) delete pack.last_verify.repair_undo;
 
-  if (payload.sessionId && canResume) pack.last_session_id = payload.sessionId;
-  if (payload.runId) pack.last_run_id = payload.runId;
+  if (payload.sessionId && canResume) rememberSession(pack, payload.sessionId, 'implement', runInstance);
+  if (payload.runId || selfRunId) pack.last_run_id = payload.runId || selfRunId;
 
   // Infrastructure failure immunity: NEVER consumes tier1/tier2 repair budgets
   if (payload.infraError) {
@@ -456,7 +509,7 @@ export function recordImplementOutcome(ctx, payload) {
     if (canResume && onInfra === 'fallback' && instanceCfg.fallback_instance && config?.executors?.[instanceCfg.fallback_instance]) {
       const prev = pack.active_instance;
       pack.active_instance = instanceCfg.fallback_instance;
-      pack.last_session_id = null;
+      invalidateSession(pack);
       pack.status = 'IMPLEMENT';
       appendEvent(stateDir, config, {
         type: 'infra_fallback',
@@ -491,6 +544,7 @@ export function recordImplementOutcome(ctx, payload) {
       instance: runInstance,
       session_id: payload.sessionId || (canResume ? pack.last_session_id : null),
       run_id: pack.last_run_id,
+      ...executor,
       summary: payload.summary || 'Implementation completed'
     });
     saveState(stateDir, state);
@@ -509,7 +563,7 @@ export function recordImplementOutcome(ctx, payload) {
 
 const verifyRepairFields = [
   'tier1_repairs', 'tier2_repairs', 'current_tier', 'active_instance',
-  'last_session_id', 'escalated', 'escalation_reason', 'gate'
+  'last_session_id', 'last_session_route', 'escalated', 'escalation_reason', 'gate'
 ];
 
 export function markVerificationEnvironment(ctx, packId, reason) {
@@ -552,6 +606,9 @@ export function recordVerifyOutcome(ctx, payload) {
       && (pack.status !== 'VERIFY' || state.loop_status === 'ABORTED'
         || (pack.last_verify?.at ?? null) !== payload.previousVerifyAt)) {
     throw new Error(`Pack ${pack.id} changed during verification. The logs were saved, but the result was not recorded.`);
+  }
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
+    return buildNextDirective(ctx, pack, getPackDef(ctx.manifest, pack.id));
   }
 
   // 'cli' = grow-loop ran the configured commands and checked exit codes itself;
@@ -646,6 +703,9 @@ export function recordVerifyOutcome(ctx, payload) {
 export function recordReviewOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
   const pack = getWritablePack(state, payload.packId);
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
+    return buildNextDirective(ctx, pack, getPackDef(ctx.manifest, pack.id));
+  }
   const budgets = getBudgets(config);
   if (payload.reportPath && (pack.status !== 'REVIEW' ||
     (payload.reviewRound !== undefined && payload.reviewRound !== pack.review_rounds + 1))) {
@@ -653,8 +713,11 @@ export function recordReviewOutcome(ctx, payload) {
   }
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
   const { blockingSeverities } = budgets;
-  const reviewer = payload.reviewer || resolveTierInstance(config, 'reviewer');
-  const reviewerModel = payload.reviewerModel === undefined ? config?.executors?.[reviewer]?.model : payload.reviewerModel;
+  const selfReviewer = pack.inflight_run?.kind === 'self' && pack.inflight_run.stage === 'review'
+    ? pack.inflight_run.instance : null;
+  const reviewer = payload.reviewer || selfReviewer || resolveTierInstance(config, 'reviewer');
+  const { executor, selfRunId } = completeSelfRun(ctx, pack, 'review', payload, 'completed', selfReviewer || reviewer);
+  const reviewerModel = payload.reviewerModel === undefined ? executor.executor_model : payload.reviewerModel;
   const summary = redactor.redactString(payload.summary || '');
 
   pack.review_rounds += 1;
@@ -704,6 +767,8 @@ export function recordReviewOutcome(ctx, payload) {
     max_rounds: budgets.maxReviewRounds,
     reviewer: pack.last_review.reviewer,
     reviewer_model: pack.last_review.reviewer_model,
+    run_id: payload.runId || selfRunId || null,
+    ...executor,
     verdict: verdictNormalized,
     blocking_count: blocking.length,
     non_blocking_count: nonBlocking.length,
@@ -747,7 +812,7 @@ export function recordReviewOutcome(ctx, payload) {
       pack.escalation_reason = `Review cap (${pack.review_rounds}/${budgets.maxReviewRounds}) hit on tier1 with ${blocking.length} blocking findings`;
       countRepairRound(pack);
       pack.tier2_repairs += 1;
-      pack.last_session_id = null;
+      invalidateSession(pack);
       pack.status = 'IMPLEMENT';
       appendEvent(stateDir, config, {
         type: 'escalated_to_tier2',
@@ -794,6 +859,10 @@ export function recordReviewOutcome(ctx, payload) {
 export function recordCommitOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
   const pack = getWritablePack(state, payload.packId);
+  const packDef = getPackDef(ctx.manifest, pack.id);
+  const gitWatch = checkExternalCommits(ctx, pack, packDef, payload.sha);
+  if (gitWatch?.status === 'blocked') return buildNextDirective(ctx, pack, packDef);
+  const changedFiles = readCommitFiles(state.repo_dir, payload.sha);
 
   pack.commit = {
     sha: payload.sha,
@@ -801,6 +870,7 @@ export function recordCommitOutcome(ctx, payload) {
     files: Number(payload.files || 0),
     insertions: Number(payload.insertions || 0),
     deletions: Number(payload.deletions || 0),
+    ...(changedFiles && { changed_files: changedFiles }),
     pushed: false,
     committed_at: new Date().toISOString()
   };
@@ -835,7 +905,9 @@ export function recordCommitOutcome(ctx, payload) {
     outcome: 'committed',
     committed_pack: pack.id,
     next_pack_id: nextId,
-    loop_status: state.loop_status
+    loop_status: state.loop_status,
+    ...(gitWatch && { git_watch: gitWatch }),
+    ...(payload.fromGit && scanStrayFiles(ctx, pack, packDef, changedFiles))
   };
 }
 
@@ -854,6 +926,19 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
   const at = new Date().toISOString();
   const questions = prevGate?.questions?.length ? { questions: redactor.redactValue(prevGate.questions) } : {};
+  let approvedPosition = null;
+  if (gateReason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
+    if (!prevGate.allowed_resume_actions.includes(act)) {
+      throw new Error('Use --action approve or abort for an EXTERNAL_COMMIT gate.');
+    }
+    if (act === 'approve') {
+      if (typeof decision !== 'string' || !decision.trim()) {
+        throw new Error('Specify a non-empty --decision to approve the external commits.');
+      }
+      approvedPosition = readGitPosition(state.repo_dir);
+      if (!approvedPosition) throw new Error('Git HEAD is unavailable. Restore access to Git before approving the external commits.');
+    }
+  }
 
   appendEvent(stateDir, config, {
     type: 'gate_resumed',
@@ -893,7 +978,7 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
 
   if (act === 'switch_instance') {
     pack.active_instance = instance;
-    pack.last_session_id = null;
+    invalidateSession(pack);
     pack.gate = null;
     pack.status = 'IMPLEMENT';
     saveState(stateDir, state);
@@ -922,6 +1007,7 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
     pack.resolved_gates[prevGate.reason] = {
       approved_at: at,
       decision: redactor.redactString(decision || ''),
+      ...(approvedPosition && { base_commit: approvedPosition.head, base_branch: approvedPosition.branch }),
       ...questions
     };
   }
@@ -930,6 +1016,15 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
     pack.active_instance = resolveTierInstance(config, 'tier2');
   }
   pack.gate = null;
+
+  if (approvedPosition) {
+    pack.base_commit = approvedPosition.head;
+    pack.base_branch = approvedPosition.branch;
+    pack.status = prevGate.resume_status;
+    pack.gate = prevGate.prior_gate ?? null;
+    saveState(stateDir, state);
+    return { outcome: 'approved', pack_id: pack.id, status: pack.status, base_commit: pack.base_commit };
+  }
 
   // If resuming a preflight gate, re-check any remaining preflight gates (AMBIGUITY / EXTERNAL_EFFECT)
   const preflightGateReasons = new Set([

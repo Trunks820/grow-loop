@@ -78,16 +78,18 @@ node <GROW_LOOP_BIN> next --repo <repo>
 
 | Returned `action` | What Coordinator Must Do |
 |---|---|
-| `PAUSE_FOR_HUMAN` | **STOP the loop immediately.** Present `gate.reason`, `gate.summary`, `gate.questions` (if any), and the exact `resume_hint` options to the user. Wait for human input, then call `grow-loop resume --decision "..." --action <...>`. |
+| `PAUSE_FOR_HUMAN` | **STOP the loop immediately.** Present `gate.reason`, `gate.summary`, `gate.questions` (if any), and the exact `resume_hint` options to the user. For `EXTERNAL_COMMIT`, include the listed commits and conflicting paths. Wait for human input, then call `grow-loop resume --decision "..." --action <...>`. |
 | `IMPLEMENT` | Execute implementation on the assigned `tier` & `instance` (see Step 2). |
 | `VERIFY` | Run `grow-loop verify`. The CLI runs global `verification.commands` followed by the pack's `verify_commands` and records the outcome from exit codes. **Verify ALWAYS runs before Review.** |
 | `REVIEW` | Run a **read-only closing review**. External dispatch records the returned Markdown report automatically. For self-review, submit the Markdown with `grow-loop record review --report <report.md>`. |
-| `COMMIT` | Stage explicit changed files (`git status`, no untracked junk/secrets), make a **local** commit only (never push!), then call `grow-loop record commit --from-git`. |
+| `COMMIT` | Review `stray_files`, move flagged artifacts to the specified directory, stage explicit package files, commit locally, and call `grow-loop record commit --from-git`. |
 | `COMPLETED` | All packs are committed! Run `grow-loop evidence` to generate the redacted two-layer evidence pack and report to the user. |
 
 ### Step 2: Executing `IMPLEMENT` (External Adapter vs `self`)
 - Before dispatch, the coordinator reads the relevant code and fills in the pack's `pitfalls`, `co_change_files`, and `preserve_behaviors`. Name the file or function for each pitfall. When following an existing rule, name the function that implements it. Copy the plan's `decisions` with the original question, wording, and time if known. Check `warnings` from `next` and `dispatch --dry-run`.
 - Check the files listed under “可能要一起改的文件” and confirm any changes to the authorized scope. Save reports, screenshots, and drafts in the generated task brief's artifact directory. For artifacts physically outside the working tree, use an external `--state-dir`.
+- A preview saves `prepared_run` with its run ID, directory, task path, stage, executor instance and fingerprint. Live dispatch for the same stage and instance reuses the directory. It keeps the task when the fingerprint matches and regenerates it in place when the confirmed manifest or task inputs change. Pass `--task-file` on any invocation that should use a supplied task.
+- Before launching an adapter, dispatch saves `inflight_run` and consumes the preview. Use `status` to inspect the running record. Codex's streamed `thread.started` event saves the native session ID immediately. After an interruption, run `dispatch --resume` with the same stage and instance to use the saved session. An instance change invalidates the old route's session. If there is no matching session, dispatch reports that it will start a new one. `--resume <session-id>` passes a specific ID. External runs clear the running record when they finish.
 - **If `instance` uses an external CLI adapter (`codex`, `claude`, `dsh`, `custom-cmd`):**
   1. First run dry-run preflight:
      ```bash
@@ -99,13 +101,15 @@ node <GROW_LOOP_BIN> next --repo <repo>
      ```
   3. `dispatch` automatically records the outcome (including infra-failure immunity if `429`/auth/timeout occurs) and returns the next transition.
 - **If `instance` is `self` (the current host harness executes directly):**
-  1. Optionally run `dispatch --dry-run` to materialize `task.md` with auto-injected lessons and pending blocking findings.
+  1. Run a live `dispatch` to start timing and get the task. An optional `dispatch --dry-run` first lets you inspect it.
   2. Implement the bounded changes directly in the repo, respecting `new_tests_policy` (`forbidden` means zero new test files!).
   3. Record completion:
      ```bash
-     node <GROW_LOOP_BIN> record implement --repo <repo> --passed --summary "<concise summary>"
+     node <GROW_LOOP_BIN> record implement --repo <repo> --passed --summary "<concise summary>" \
+       --executor-tool "<tool>" --executor-model "<model>" --executor-effort "<effort>"
      ```
      (Or `--failed --summary "..."` if implementation hit a code blocker, or `--infra-error INFRA_QUOTA` if hit a rate limit.)
+     The three executor flags are optional. Recording the outcome closes `inflight_run` and adds executor details and elapsed time to the event log and run result.
 
 ### Step 3: Executing `VERIFY` (Verify-First Rule)
 - Run local checks through the CLI. Each attempt stops at the first failure and saves per-command logs under the pack's `runs/` directory.
@@ -123,7 +127,7 @@ node <GROW_LOOP_BIN> next --repo <repo>
 - Classify each finding as `BLOCKER`, `HIGH`, `MEDIUM`, or `LOW`. The blocking severities are set by `review.blocking_severities` (default `BLOCKER` and `HIGH`) and shown in `next` and the review task. A blocking finding creates a lesson draft, with any supplied `rule` prefilled.
 - Findings outside the blocking severities are recorded in `.loop/tech-debt.md`. After a failed review, the repair task includes them under `顺手一起修（不阻断）`.
 - For a non-divergent Round 2, check the listed prior findings and new regressions introduced by the repair that meet the configured blocking severities. Re-report unresolved non-blocking items under their original titles. On passage, those items become pending and the omitted items are marked fixed. If the package is committed after human approval at the review cap, all remaining in-round items become pending.
-- External dispatch reads the returned Markdown report automatically. For self-review, run `dispatch --stage review --dry-run` to get the task, then save a Markdown report matching its Required Output Format and submit it:
+- External dispatch reads the returned Markdown report automatically. For self-review, run `dispatch --stage review` to start timing, then save a Markdown report matching its Required Output Format and submit it. The same optional executor flags apply.
   ```bash
   node <GROW_LOOP_BIN> record review --repo <repo> --report <report.md>
   ```
@@ -153,15 +157,17 @@ Task briefs include up to eight confirmed rules. The package's own rules come fi
   - Failing again triggers `PAUSED_FOR_HUMAN` (`BUDGET_EXCEEDED`).
 - **Closing Review Cap (`2`):** Max `2` closing reviews (`max_review_rounds: 2`). Hitting `2/2` on `tier1` auto-escalates once to `tier2` (after `VERIFY`, pauses for human commit sign-off without opening a 3rd review); hitting `2/2` on `tier2` pauses immediately (`REVIEW_CAP_REACHED`).
 - **Infra Failure Immunity:** `INFRA_QUOTA` (`429`), `INFRA_AUTH`, `INFRA_TIMEOUT`, and `INFRA_CLI_CRASH` **NEVER** consume `tier1` or `tier2` repair budgets.
+- **External Commit Gate:** At package start, the CLI records `base_commit` and `base_branch`. Before verification, review dispatch, the `COMMIT` directive, and commit recording, it lists commits added since the baseline, excluding recorded package commits and the commit being recorded. Commits outside this package's `scope_files` and `co_change_files` and all completed packages' committed files are reported and logged once. Overlaps trigger `EXTERNAL_COMMIT`. Present the findings for `approve` or `abort`. Approval records the operator's wording, advances the baseline to the current HEAD, and restores the interrupted stage. An unavailable Git repository or HEAD is reported as a skipped check.
 
 ### Step 6: Commit & Generate Evidence Pack
-1. When `next` returns `COMMIT`, review `git status` and `git diff --stat`, stage explicit files, commit locally (no `git push`), and record:
+1. When `next` returns `COMMIT`, review `stray_files` and `git diff --stat`, stage explicit files, commit locally, and record:
    ```bash
    node <GROW_LOOP_BIN> record commit --repo <repo> --from-git
    ```
+   The command reports any out-of-scope files in the commit that look like artifacts. The artifact notice is advisory.
 2. Repeat `grow-loop next` until `action === "COMPLETED"`.
 3. Generate the final redacted two-layer evidence pack:
    ```bash
    node <GROW_LOOP_BIN> evidence --repo <repo>
    ```
-   Verify `scanHits` is empty (`[]`) before sharing `.loop/evidence.md`.
+   Verify `scanHits` is empty (`[]`) before sharing `.loop/evidence.md`. The evidence includes self-run time and the final implementer's tool and model for each package.

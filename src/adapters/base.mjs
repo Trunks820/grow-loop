@@ -199,7 +199,8 @@ export function runBoundedCommand(command, args, options = {}) {
  * Execute a CLI adapter process, streaming output directly to runDir logs.
  */
 export async function runAdapterProcess({
-  command, args, cwd, stdinText, runDir, timeoutSec = 3600, shell = false, redactor, env, outputEncoding = 'utf-8'
+  command, args, cwd, stdinText, runDir, timeoutSec = 3600, shell = false, redactor, env, outputEncoding = 'utf-8',
+  onStdoutLine
 }) {
   const stdoutDecoder = new TextDecoder(outputEncoding, { ignoreBOM: true });
   const stderrDecoder = new TextDecoder(outputEncoding, { ignoreBOM: true });
@@ -212,14 +213,30 @@ export async function runAdapterProcess({
   const outStream = fs.createWriteStream(stdoutPath, { encoding: 'utf8' });
   const errStream = fs.createWriteStream(stderrPath, { encoding: 'utf8' });
   const logsFinished = Promise.all([finished(outStream), finished(errStream)]);
-  const processFinished = new Promise((resolve) => {
+  const processFinished = new Promise((resolve, reject) => {
     let stdoutTail = '';
     let stderrTail = '';
     let timedOut = false;
     let settled = false;
     let timer;
+    let child;
+    let partialLine = '';
+    let callbackError;
 
-    const finish = (code, error = '') => {
+    const emitLines = (text, end = false) => {
+      if (!onStdoutLine || callbackError) return;
+      const lines = (partialLine + text).split('\n');
+      partialLine = lines.pop();
+      if (end && partialLine) lines.push(partialLine);
+      try {
+        for (const line of lines) onStdoutLine(line.replace(/\r$/, ''));
+      } catch (error) {
+        callbackError = error;
+        child?.kill();
+      }
+    };
+
+    const finish = (code, signal, error = '') => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -227,9 +244,15 @@ export async function runAdapterProcess({
       const stderrEnd = stderrDecoder.decode() + error;
       outStream.end(stdoutEnd);
       errStream.end(stderrEnd);
+      emitLines(stdoutEnd, true);
+      if (callbackError) {
+        reject(callbackError);
+        return;
+      }
       const safeRedactor = redactor || buildRedactor();
       resolve({
         exitCode: code ?? -1,
+        signal,
         timedOut,
         elapsedSeconds: Number(((Date.now() - startedAt) / 1000).toFixed(2)),
         stdoutPath,
@@ -239,7 +262,6 @@ export async function runAdapterProcess({
       });
     };
 
-    let child;
     try {
       child = spawn(spawnCommand, spawnArgs, {
         cwd,
@@ -249,7 +271,7 @@ export async function runAdapterProcess({
         stdio: ['pipe', 'pipe', 'pipe']
       });
     } catch (err) {
-      finish(-1, String(err.message || err));
+      finish(-1, null, String(err.message || err));
       return;
     }
 
@@ -273,6 +295,7 @@ export async function runAdapterProcess({
       const text = stdoutDecoder.decode(chunk, { stream: true });
       outStream.write(text);
       stdoutTail = (stdoutTail + text).slice(-16384);
+      emitLines(text);
     });
     child.stderr.on('data', (chunk) => {
       const text = stderrDecoder.decode(chunk, { stream: true });
@@ -280,8 +303,8 @@ export async function runAdapterProcess({
       stderrTail = (stderrTail + text).slice(-16384);
     });
 
-    child.on('error', (err) => finish(-1, `\n${err.message || err}`));
-    child.on('close', (code) => finish(code));
+    child.on('error', (err) => finish(-1, null, '\n' + (err.message || err)));
+    child.on('close', (code, signal) => finish(code, signal));
 
     if (stdinText) {
       child.stdin.write(stdinText);

@@ -120,7 +120,7 @@ grow-loop dispatch --stage implement
 grow-loop verify   # CLI 先跑全局命令，再跑本包命令
 # 外部审查完成并返回报告路径后，CLI 自动读取报告并转移状态
 grow-loop dispatch --stage review
-# 自审时，先用 --dry-run 生成审查任务书，按其中的格式写 Markdown 报告，再交给 loop
+# self 审查也从正式派发开始，交报告时可注明实际工具、模型和档位
 grow-loop record review --report <report.md>
 grow-loop record commit --from-git
 
@@ -132,6 +132,22 @@ grow-loop evidence
 ```
 
 报告读不出或格式有误时，CLI 会退出并给出报告路径和错误位置，包继续等待审查。旧的 `record review --verdict`、`--findings-file` 和 `--findings` 参数仍可用。 [审查报告格式](docs/ADAPTER-SPEC.md#closing-review-reports)
+
+## 派发记录与续跑
+
+`dispatch --dry-run` 将运行号、运行目录、任务书、阶段、执行实例和任务书指纹存入 `prepared_run`。同阶段同实例正式派发时复用运行目录。同一指纹直接使用原任务书，包状态、修复次数、审查轮次、确认后的清单等输入变化时在原目录重写 `task.md`。本次指定 `--task-file <path>` 时使用该文件。正式派发会清掉预演记录。
+
+正式派发在启动执行器前写入 `inflight_run`，可用 `grow-loop status` 查看运行号、目录、阶段、执行实例、开始时间和已收到的会话号。Codex 发出 `thread.started` 后立即保存会话号。执行中断后可对同阶段同实例运行 `grow-loop dispatch --resume`，CLI 会使用当前运行或上次派发保存的匹配会话。切换执行实例会使旧档会话失效。没有匹配会话时启动新会话并提示。指定 `--resume <session-id>` 可显式使用已知会话号。外部派发结束后清掉 `inflight_run`。
+
+`self` 档从正式派发开始计时。完成后用 `record implement --passed` 或 `record review --report <report.md>` 登记，可附 `--executor-tool`、`--executor-model` 和 `--executor-effort`。CLI 清掉 `inflight_run`，把执行者及用时写入流水账和该次运行的 `result.json`。证据包累计用时包含这些记录，每包显示最终实现者的工具和模型。
+
+## 提交前的文件和分支检查
+
+包开工时记录 `base_commit` 和 `base_branch`。验证、审查派发、`next` 返回 `COMMIT` 以及 `record commit` 时，CLI 对比基线与当前 HEAD，排除 loop 已登记的包提交和正在登记的提交。若外部提交改到本包 `scope_files`、`co_change_files` 或已完成包提交过的文件，CLI 会列出提交、改动文件和冲突路径，触发 `EXTERNAL_COMMIT`。核对后用 `grow-loop resume --action approve --decision "<原话>"` 从原阶段继续，基线更新为当前 HEAD，决定写入流水账。也可用 `--action abort` 终止循环。无交集的提交只提醒并记账一次。Git、仓库或 HEAD 不可用时会说明并跳过比对。
+
+已经开工但缺少基线的包，从第一次能读取的 HEAD 开始比对。
+
+`next` 的 `COMMIT` 输出用 `stray_files` 列出范围外的未跟踪和改动文件。图片、日志及文件名含 `report`、`summary`、`notes`、`draft` 或 `final` 的 Markdown 等会标记为疑似产物，并提示产物目录。`record commit --from-git` 也会提醒该笔提交中的范围外疑似产物。产物提醒允许流程继续。
 
 ## 验证命令与环境
 

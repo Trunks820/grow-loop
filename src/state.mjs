@@ -150,7 +150,10 @@ export function createInitialPackState(packDef) {
     review_rounds: 0,
     infra_failures: 0,
     last_session_id: null,
+    last_session_route: null,
     last_run_id: null,
+    inflight_run: null,
+    prepared_run: null,
     last_verify: null,
     last_review: null,
     pending_blocking_findings: [],
@@ -158,9 +161,21 @@ export function createInitialPackState(packDef) {
     gate: null,
     blast_radius: null,
     commit: null,
+    base_commit: null,
+    base_branch: null,
     started_at: null,
     completed_at: null
   };
+}
+
+export function invalidateSession(pack) {
+  pack.last_session_id = null;
+  if (pack.inflight_run) pack.inflight_run.route_changed = true;
+}
+
+export function rememberSession(pack, sessionId, stage, instance) {
+  pack.last_session_id = sessionId;
+  pack.last_session_route = { id: sessionId, stage, instance };
 }
 
 export function createInitialState(repoDir, stateDir, profileName, manifest) {

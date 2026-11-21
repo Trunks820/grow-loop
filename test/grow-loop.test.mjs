@@ -74,6 +74,18 @@ function shellQuote(p) {
   return JSON.stringify(p);
 }
 
+function fixtureGit(repoDir, ...args) {
+  return execFileSync('git', [
+    '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.com', ...args
+  ], { cwd: repoDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+function fixtureCommit(repoDir, message, ...files) {
+  fixtureGit(repoDir, 'add', '--', ...files);
+  fixtureGit(repoDir, 'commit', '--no-gpg-sign', '-m', message);
+  return fixtureGit(repoDir, 'rev-parse', 'HEAD');
+}
+
 function setupCtx(packs, configOverrides = {}) {
   const repoDir = makeTempDir('grow-loop-repo-');
   const stateDir = resolveStateDir(repoDir);
@@ -565,6 +577,7 @@ test('running Codex dispatch keeps its task and route while final markdown produ
       const fs = require('node:fs');
       const args = process.argv.slice(2);
       process.stdin.resume();
+      console.log(JSON.stringify({ type: 'thread.started', thread_id: 'running-executor-session' }));
       fs.writeFileSync(${JSON.stringify(ready)}, 'ready');
       const timer = setInterval(() => {
         if (!fs.existsSync(${JSON.stringify(release)})) return;
@@ -585,6 +598,9 @@ test('running Codex dispatch keeps its task and route while final markdown produ
     try {
       for (let i = 0; i < 200 && !fs.existsSync(ready); i++) await delay(25);
       assert.ok(fs.existsSync(ready), 'Codex fixture did not start');
+      const pending = () => readJsonSafe(ctx.paths.statePath).packs.A.inflight_run?.session_id;
+      for (let i = 0; i < 200 && pending() !== 'running-executor-session'; i++) await delay(25);
+      assert.equal(cli('status').packs[0].inflight_run.session_id, 'running-executor-session');
       cli('pack', 'tier', '--id', 'A', '--tier', 'tier2', '--reason', '切到二档接力');
       cli('pack', 'scope', '--id', 'A', '--add', 'src/b.mjs', '--reason', '补齐下一次任务的范围');
       cli('todo', 'add', '--pack', 'A', '--text', '独立待办', '--reason', '任务运行中补记');
@@ -603,6 +619,7 @@ test('running Codex dispatch keeps its task and route while final markdown produ
     assert.equal(persisted.current_tier, 'tier2');
     assert.equal(persisted.active_instance, 'tier2-cli');
     assert.equal(persisted.last_session_id, null);
+    assert.equal(persisted.inflight_run, null);
     assert.equal(persisted.escalated, true);
     assert.match(persisted.escalation_reason, /切到二档接力/);
     assert.equal(persisted.tier1_repairs, 1);
@@ -865,6 +882,7 @@ test('grow-loop verify runs configured commands itself; self-reported passes nee
     // CLI-run verification fails on the real exit code and schedules a repair
     const v1 = runCli(['verify', '--repo', repoDir]);
     assert.equal(v1.passed, false);
+    assert.equal(v1.git_watch.status, 'skipped');
     assert.equal(v1.commands.length, 2);
     assert.equal(v1.commands[1].exit_code, 3);
     assert.match(v1.summary, /exited 3: assertion failed: fixed\.txt missing/);
@@ -1500,6 +1518,7 @@ test('dispatch previews warn about incomplete briefs, scan references and create
     // Dispatch recreates the directory if it has been removed since the preview.
     fs.rmdirSync(artifactsDir);
     const second = cli('dispatch', '--dry-run');
+    assert.equal(second.run_dir, initial.run_dir);
     assert.deepEqual(second.warnings, ['第 1 条避坑提示未点名代码：跟现有规则一致']);
     assert.deepEqual(cli('next').warnings, second.warnings);
     assert.ok(fs.statSync(artifactsDir).isDirectory());
@@ -1928,6 +1947,285 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
     assert.match(md, /\| \*\*W02\*\* \|/);
     assert.doesNotMatch(md, /sk-secretkey/);
     assert.match(md, /\[REDACTED:API_KEY\]/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('Codex saves a split thread.started event before exit and resumes after interrupted dispatch', async () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'W7', scope_files: ['app.js'] }]);
+  const cli = (...args) => runCli(args, repoDir);
+  const mock = path.join(repoDir, 'mock-codex.cjs');
+  const marker = path.join(repoDir, 'adapter-pid');
+  const finish = path.join(repoDir, 'finish');
+  const session = 'fixture-codex-thread';
+  let running;
+  let adapterPid;
+  try {
+    fs.writeFileSync(mock, [
+      "const fs = require('node:fs');",
+      'const args = process.argv.slice(2);',
+      'const marker = ' + JSON.stringify(marker) + ';',
+      'const finish = ' + JSON.stringify(finish) + ';',
+      'const id = ' + JSON.stringify(session) + ';',
+      'const resuming = args.includes("resume");',
+      'if (resuming && args[args.indexOf("resume") + 1] !== id) process.exit(2);',
+      'if (fs.existsSync(finish) && !resuming) process.exit(3);',
+      'process.stdin.resume();',
+      'process.stdout.write("{\\"type\\":\\"thread.");',
+      'setTimeout(() => {',
+      '  process.stdout.write("started\\",\\"thread_id\\":" + JSON.stringify(id) + "}\\r\\n");',
+      '  fs.writeFileSync(marker, String(process.pid));',
+      '  if (!fs.existsSync(finish)) setInterval(() => {}, 500);',
+      '}, 40);'
+    ].join('\n'));
+    ctx.config.executors['tier1-cli'] = { kind: 'codex', executable: process.execPath, prefix_args: [mock] };
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    cli('next');
+
+    const readPack = () => readJsonSafe(ctx.paths.statePath).packs.W7;
+    for (const stopCoordinator of [false, true]) {
+      fs.rmSync(marker, { force: true });
+      const args = stopCoordinator ? ['--resume'] : [];
+      running = promisify(execFile)(process.execPath, [CLI_PATH, 'dispatch', '--timeout', '20', ...args], {
+        cwd: repoDir, encoding: 'utf8', env: { ...process.env, GROW_LOOP_STATE_DIR: '' }
+      });
+      running.catch(() => {});
+      for (let i = 0; i < 200; i++) {
+        if (fs.existsSync(marker) && readPack().inflight_run?.pid === running.child.pid &&
+            readPack().inflight_run?.session_id === session) break;
+        await delay(25);
+      }
+      adapterPid = Number(fs.readFileSync(marker, 'utf8'));
+      const inflight = cli('status').packs[0].inflight_run;
+      assert.equal(inflight.pid, running.child.pid);
+      assert.equal(inflight.session_id, session);
+      assert.equal(inflight.stage, 'implement');
+      assert.equal(inflight.instance, 'tier1-cli');
+      assert.ok(Number.isFinite(Date.parse(inflight.started_at)));
+      assert.ok(fs.existsSync(inflight.run_dir));
+      assert.equal(readPack().last_session_id, session);
+
+      if (stopCoordinator) running.child.kill('SIGKILL');
+      process.kill(adapterPid, 'SIGKILL');
+      adapterPid = null;
+      if (stopCoordinator) {
+        await assert.rejects(running);
+        assert.deepEqual(readPack().inflight_run, inflight);
+      } else {
+        const interrupted = JSON.parse((await running).stdout);
+        assert.equal(interrupted.result.status, 'interrupted');
+        assert.equal(readPack().tier1_repairs, 0);
+        assert.equal(readPack().inflight_run, null);
+      }
+      assert.equal(readPack().last_session_id, session);
+    }
+    fs.writeFileSync(finish, 'finish');
+    const resumed = cli('dispatch', '--resume');
+    assert.equal(resumed.transition.outcome, 'ready_for_verify');
+    assert.equal(resumed.result.session_id, session);
+    assert.equal(readPack().inflight_run, null);
+    const starts = readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'dispatch_started');
+    assert.deepEqual(starts.map(({ resumed_session }) => resumed_session), [null, session, session]);
+  } finally {
+    if (running?.child.exitCode === null && !running.child.signalCode) running.child.kill('SIGKILL');
+    if (adapterPid) {
+      try { process.kill(adapterPid, 'SIGKILL'); } catch {}
+    }
+    await running?.catch(() => {});
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('self dispatch records implementation and review time and commit checks flag a fixture screenshot', () => {
+  const root = makeTempDir('grow-loop-w7-artifacts-');
+  const repoDir = path.join(root, 'repo');
+  const stateDir = path.join(root, 'loop');
+  const paths = getStatePaths(stateDir);
+  const cli = (...args) => runCli([...args, '--state-dir', stateDir], repoDir);
+  try {
+    fs.mkdirSync(repoDir);
+    fixtureGit(repoDir, 'init');
+    fs.writeFileSync(path.join(repoDir, 'app.js'), 'export const value = 1;\n');
+    fs.writeFileSync(path.join(repoDir, 'fixture-notes.md'), 'fixture baseline');
+    fixtureCommit(repoDir, 'fixture baseline', 'app.js', 'fixture-notes.md');
+    const manifestPath = path.join(root, 'manifest.json');
+    const manifest = { packs: [
+      { id: 'self-pack', scope_files: ['app.js'] },
+      { id: 'external-pack', scope_files: ['next.js'], co_change_files: ['approved.log'] }
+    ] };
+    writeJsonAtomic(manifestPath, manifest);
+    cli('init', '--manifest', manifestPath);
+    const cfg = readJsonSafe(paths.configPath);
+    cfg.routing = { tier1: 'self', tier2: 'self', reviewer: 'self' };
+    cfg.verification.commands = [shellQuote(process.execPath) + ' --check app.js'];
+    writeJsonAtomic(paths.configPath, cfg);
+
+    cli('next');
+    const preview = cli('dispatch', '--dry-run');
+    const taskFile = preview.dry_run.task_file;
+    assert.ok(fs.readFileSync(taskFile, 'utf8').includes(path.join(paths.artifactsDir, 'self-pack').replaceAll('\\', '/')));
+    assert.ok(path.relative(repoDir, paths.artifactsDir).startsWith('..' + path.sep));
+    const saved = () => readJsonSafe(paths.statePath).packs['self-pack'];
+    assert.equal(saved().prepared_run.task_file, taskFile);
+    assert.match(saved().prepared_run.fingerprint, /^[0-9a-f]{64}$/);
+    const fixedTime = new Date('2001-01-01T00:00:00Z');
+    fs.utimesSync(taskFile, fixedTime, fixedTime);
+    const previewTime = fs.statSync(taskFile).mtimeMs;
+    const impl = cli('dispatch');
+    assert.equal(impl.run_id, preview.run_id);
+    assert.equal(impl.run_dir, preview.run_dir);
+    assert.equal(impl.result.task_file, taskFile);
+    assert.equal(fs.statSync(taskFile).mtimeMs, previewTime);
+    assert.deepEqual(fs.readdirSync(path.dirname(impl.run_dir)), [impl.run_id]);
+    assert.deepEqual(fs.readdirSync(impl.run_dir).filter((name) => name.endsWith('.md')), ['task.md']);
+    assert.equal(saved().prepared_run, null);
+    assert.equal(saved().inflight_run.run_id, impl.run_id);
+    assert.equal(impl.result.elapsed_seconds, null);
+    fs.appendFileSync(path.join(repoDir, 'app.js'), 'export const next = 2;\n');
+    cli('record', 'implement', '--passed', '--executor-tool', 'host-codex', '--executor-model', 'fixture-model',
+      '--executor-effort', 'high');
+    const implResult = readJsonSafe(path.join(impl.run_dir, 'result.json'));
+    assert.equal(implResult.status, 'completed');
+    assert.equal(implResult.executor_tool, 'host-codex');
+    assert.equal(implResult.executor_model, 'fixture-model');
+    assert.equal(implResult.executor_effort, 'high');
+    assert.ok(implResult.elapsed_seconds > 0);
+    assert.equal(saved().inflight_run, null);
+    assert.equal(cli('verify').passed, true);
+
+    const reviewPreview = cli('dispatch', '--stage', 'review', '--dry-run');
+    manifest.packs[0].preserve_behaviors = ['保留原有输出'];
+    writeJsonAtomic(paths.manifestPath, manifest);
+    cli('manifest-ack', '--reason', '补录审查要核对的既有行为');
+    const review = cli('dispatch', '--stage', 'review');
+    assert.equal(review.run_id, reviewPreview.run_id);
+    assert.equal(review.result.task_file, reviewPreview.dry_run.task_file);
+    assert.match(fs.readFileSync(review.result.task_file, 'utf8'), /保留原有输出/);
+    const reportPath = path.join(paths.artifactsDir, 'self-pack', 'review.md');
+    fs.writeFileSync(reportPath, reviewMarkdown('pass', []));
+    cli('record', 'review', '--report', reportPath, '--executor-tool', 'host-review',
+      '--executor-model', 'review-model', '--executor-effort', 'medium');
+    const reviewResult = readJsonSafe(path.join(review.run_dir, 'result.json'));
+    assert.ok(reviewResult.elapsed_seconds > 0);
+    assert.equal(reviewResult.executor_tool, 'host-review');
+    assert.equal(reviewResult.executor_model, 'review-model');
+    assert.equal(reviewResult.executor_effort, 'medium');
+    assert.equal(saved().inflight_run, null);
+    const events = readEvents(paths.eventsPath);
+    assert.ok(events.some((event) => event.type === 'implement_completed' && event.executor_tool === 'host-codex' &&
+      event.executor_model === 'fixture-model' && event.executor_effort === 'high' && event.run_id === impl.run_id));
+    assert.ok(events.some((event) => event.type === 'review_recorded' && event.executor_tool === 'host-review' &&
+      event.executor_model === 'review-model' && event.executor_effort === 'medium' && event.run_id === review.run_id));
+    assert.equal(cli('next').action, 'COMMIT');
+    fixtureCommit(repoDir, 'fixture self implementation', 'app.js');
+    assert.equal(cli('record', 'commit', '--from-git').outcome, 'committed');
+    const md = fs.readFileSync(cli('evidence').path, 'utf8');
+    const seconds = (implResult.elapsed_seconds + reviewResult.elapsed_seconds).toFixed(2);
+    assert.ok(md.includes('self · host-codex / fixture-model'));
+    assert.ok(md.includes('| **self-pack** | 3 (dry-run: 2) | ' + seconds + ' |'));
+
+    const mock = path.join(root, 'external-executor.cjs');
+    const providedTask = path.join(root, 'provided-task.md');
+    fs.writeFileSync(providedTask, 'fixture supplied task');
+    fs.writeFileSync(mock, [
+      "const fs = require('node:fs');",
+      'if (fs.readFileSync(0, "utf8") !== "fixture supplied task") process.exit(5);',
+      'fs.writeFileSync("next.js", "export const next = 3;");',
+      'fs.writeFileSync("approved.log", "fixture scope");',
+      'fs.writeFileSync("fixture screenshot.png", "fixture screenshot");',
+      'fs.writeFileSync("fixture-notes.md", "fixture notes changed");',
+      'fs.writeFileSync("other.txt", "fixture outside scope");'
+    ].join('\n'));
+    cfg.executors.external = { kind: 'codex', executable: process.execPath, prefix_args: [mock] };
+    writeJsonAtomic(paths.configPath, cfg);
+    cli('next');
+    assert.equal(cli('dispatch', '--instance', 'external', '--task-file', providedTask).transition.outcome, 'ready_for_verify');
+    assert.equal(cli('verify').passed, true);
+    cli('record', 'review', '--verdict', 'pass');
+    const next = cli('next');
+    assert.equal(next.action, 'COMMIT');
+    assert.deepEqual(next.stray_files, [
+      { path: 'fixture-notes.md', status: ' M', artifact: true },
+      { path: 'fixture screenshot.png', status: '??', artifact: true },
+      { path: 'other.txt', status: '??', artifact: false }
+    ]);
+    assert.equal(next.artifacts_dir, path.join(paths.artifactsDir, 'external-pack'));
+    fixtureCommit(repoDir, 'fixture commit containing a screenshot', 'next.js', 'approved.log', 'fixture screenshot.png');
+    const recorded = cli('record', 'commit', '--from-git');
+    assert.equal(recorded.outcome, 'committed');
+    assert.deepEqual(recorded.stray_files, [{ path: 'fixture screenshot.png', status: 'committed', artifact: true }]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('Git checkpoints warn once for unrelated commits and gate current and completed pack changes', () => {
+  const { repoDir, ctx } = setupCtx([
+    { id: 'A', scope_files: ['done.js'] },
+    { id: 'B', scope_files: ['active.js'], co_change_files: ['companion.js'] }
+  ], { verification: { commands: [shellQuote(process.execPath) + ' --check active.js'] } });
+  const cli = (...args) => runCli(args, repoDir);
+  const write = (file, content) => fs.writeFileSync(path.join(repoDir, file), content);
+  const saved = () => readJsonSafe(ctx.paths.statePath).packs.B;
+  try {
+    fixtureGit(repoDir, 'init', '-b', 'fixture-branch');
+    for (const file of ['done.js', 'active.js', 'companion.js']) write(file, 'let value = 1;\n');
+    fixtureCommit(repoDir, 'fixture baseline', 'done.js', 'active.js', 'companion.js');
+    cli('next');
+    write('done.js', 'let value = 2;\n');
+    const completed = fixtureCommit(repoDir, 'fixture pack A implementation', 'done.js');
+    cli('record', 'commit', '--from-git');
+    cli('next');
+    assert.equal(saved().base_commit, completed);
+    assert.equal(saved().base_branch, 'fixture-branch');
+    cli('record', 'implement', '--passed');
+
+    write('unrelated.js', 'let other = 1;\n');
+    const unrelated = fixtureCommit(repoDir, 'fixture external unrelated', 'unrelated.js');
+    const verified = cli('verify');
+    assert.equal(verified.passed, true);
+    assert.deepEqual(verified.git_watch.commits, [{ sha: unrelated, files: ['unrelated.js'] }]);
+    assert.equal(cli('dispatch', '--stage', 'review', '--dry-run').git_watch, undefined);
+
+    write('active.js', 'let value = 3;\n');
+    const scoped = fixtureCommit(repoDir, 'fixture external active overlap', 'active.js');
+    const reviewGate = cli('dispatch', '--stage', 'review');
+    assert.equal(reviewGate.action, 'PAUSE_FOR_HUMAN');
+    assert.equal(reviewGate.gate.reason, 'EXTERNAL_COMMIT');
+    assert.deepEqual(reviewGate.gate.conflicting_files, ['active.js']);
+    assert.ok(reviewGate.gate.external_commits.some(({ sha }) => sha === scoped));
+    assert.deepEqual(reviewGate.gate.allowed_resume_actions, ['approve', 'abort']);
+    assert.equal(runCliFailure(['resume', '--action', 'commit'], repoDir).status, 1);
+    assert.equal(cli('record', 'commit', '--sha', scoped).action, 'PAUSE_FOR_HUMAN');
+    const decision = '  对照过当前文件，允许从此处继续。\n已核对外部提交。  ';
+    assert.equal(cli('resume', '--action', 'approve', '--decision', decision).status, 'REVIEW');
+    assert.equal(saved().base_commit, scoped);
+    assert.equal(saved().resolved_gates.EXTERNAL_COMMIT.decision, decision);
+    cli('record', 'review', '--verdict', 'pass');
+
+    write('done.js', 'let value = 4;\n');
+    const later = fixtureCommit(repoDir, 'fixture external completed overlap', 'done.js');
+    const commitGate = cli('next');
+    assert.equal(commitGate.action, 'PAUSE_FOR_HUMAN');
+    assert.deepEqual(commitGate.gate.external_commits, [{ sha: later, files: ['done.js'] }]);
+    assert.deepEqual(commitGate.gate.conflicting_files, ['done.js']);
+    assert.equal(cli('resume', '--decision', '已核对完成包的改动，继续').status, 'READY_TO_COMMIT');
+    assert.equal(cli('next').action, 'COMMIT');
+
+    write('companion.js', 'let value = 5;\n');
+    const companion = fixtureCommit(repoDir, 'fixture external companion overlap', 'companion.js');
+    write('active.js', 'let value = 6;\n');
+    const own = fixtureCommit(repoDir, 'fixture pack B implementation', 'active.js');
+    const recordGate = cli('record', 'commit', '--from-git');
+    assert.equal(recordGate.action, 'PAUSE_FOR_HUMAN');
+    assert.deepEqual(recordGate.gate.external_commits, [{ sha: companion, files: ['companion.js'] }]);
+    assert.deepEqual(recordGate.gate.conflicting_files, ['companion.js']);
+    assert.equal(cli('resume', '--decision', '批准此 HEAD，保留本包提交').base_commit, own);
+    assert.equal(cli('record', 'commit', '--from-git').outcome, 'committed');
+    assert.equal(saved().commit.sha, own);
+    const notices = readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'external_commits_noticed');
+    assert.deepEqual(notices.map(({ commits }) => commits), [[{ sha: unrelated, files: ['unrelated.js'] }]]);
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
