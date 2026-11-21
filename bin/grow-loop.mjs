@@ -6,15 +6,19 @@ import { execFileSync } from 'node:child_process';
 
 import {
   appendEvent,
+  checkManifest,
   createInitialState,
   ensureDir,
   ensureGitignoreEntry,
   getStatePaths,
   loadWorkspace,
+  ManifestChangedError,
   readJsonSafe,
+  readManifest,
   resolveStateDir,
   saveState,
-  writeJsonAtomic
+  writeJsonAtomic,
+  writeManifestWithReason
 } from '../src/state.mjs';
 import {
   getPackDef,
@@ -67,9 +71,10 @@ function printHelp() {
   process.stdout.write(`grow-loop v0.1.0 — Harness-agnostic multi-package delivery loop
 
 Usage:
-  grow-loop init      [--repo <dir>] [--state-dir <dir>] [--profile standard-test|live-smoke] [--project <name>] [--no-gitignore]
+  grow-loop init      [--repo <dir>] [--state-dir <dir>] [--profile standard-test|live-smoke] [--manifest <file>] [--project <name>] [--no-gitignore] [--force]
   grow-loop probe     [--repo <dir>] [--state-dir <dir>] [--timeout <ms>]
   grow-loop status    [--repo <dir>] [--state-dir <dir>]
+  grow-loop manifest-ack --reason "<text>" [--repo <dir>] [--state-dir <dir>]
   grow-loop next      [--repo <dir>] [--state-dir <dir>]
   grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume] [--task-file <path>]
   grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--timeout <sec>]
@@ -78,6 +83,7 @@ Usage:
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
 
 Default state directory: <repo>/.loop/ (auto-added to .gitignore; override with --state-dir or GROW_LOOP_STATE_DIR)
+To replace an existing manifest and reset workspace state, use grow-loop init --force --manifest <file>.
 `);
 }
 
@@ -90,51 +96,64 @@ function cmdInit(flags) {
   if (!fs.existsSync(profilePath)) {
     throw new Error(`Unknown profile "${profileName}". Available: standard-test, live-smoke`);
   }
+  if (flags.manifest !== undefined && (typeof flags.manifest !== 'string' || !flags.manifest.trim())) {
+    throw new Error('Specify a file with --manifest.');
+  }
 
-  ensureDir(stateDir);
   const paths = getStatePaths(stateDir);
   const profileTemplate = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
+  const replaceManifest = Boolean(flags.force && flags.manifest);
+  let existingConfig;
+  if (!replaceManifest) {
+    try {
+      existingConfig = readJsonSafe(paths.configPath);
+    } catch (error) {
+      // Preserve an existing config, even if it cannot provide redaction settings.
+      if (!(error instanceof SyntaxError)) throw error;
+    }
+  }
 
+  let manifest = replaceManifest ? null : readManifest(paths.manifestPath);
+  if (manifest) {
+    const { pending } = checkManifest(paths, manifest, existingConfig || profileTemplate, { allowPendingManifest: true });
+    const replaceCommand = 'grow-loop init --force --manifest <file>';
+    if (pending) {
+      if (flags.manifest) pending.replace_command = replaceCommand;
+      throw new ManifestChangedError(pending);
+    }
+    if (flags.manifest) {
+      throw new Error(`A workspace manifest already exists. Use "${replaceCommand}" to replace it and reset workspace state.`);
+    }
+  }
+
+  const writeManifest = !manifest;
+  if (writeManifest) {
+    if (flags.manifest) {
+      manifest = readManifest(path.resolve(flags.manifest));
+      if (!manifest) throw new Error('--manifest must point to a grow-loop JSON manifest.');
+    } else {
+      manifest = { project: flags.project || path.basename(repoDir), upstream_source: flags.upstream || null, packs: [] };
+    }
+  }
+
+  const existingState = flags.force ? null : readJsonSafe(paths.statePath);
   if (!fs.existsSync(paths.configPath) || flags.force) {
     writeJsonAtomic(paths.configPath, profileTemplate);
   }
+  if (writeManifest) writeJsonAtomic(paths.manifestPath, manifest);
 
-  let manifest = readJsonSafe(paths.manifestPath);
-  if (!manifest || flags.force) {
-    manifest = {
-      project: flags.project || path.basename(repoDir),
-      upstream_source: flags.upstream || null,
-      packs: [
-        {
-          id: 'W01',
-          title: 'Example first work package (replace with your real packs)',
-          goal: 'Describe the bounded deliverable and preserved behavior for W01.',
-          depends_on: [],
-          risk: 'medium',
-          estimated_files: 10,
-          cross_module: false,
-          scope_files: [],
-          acceptance_criteria: ['AC-W01-01: Replace with observable verification criterion'],
-          open_questions: [],
-          external_effects: [],
-          tags: []
-        }
-      ]
-    };
-    writeJsonAtomic(paths.manifestPath, manifest);
+  if (!existingState) {
+    saveState(stateDir, createInitialState(repoDir, stateDir, profileName, manifest));
   }
-
-  let state = readJsonSafe(paths.statePath);
-  if (!state || flags.force) {
-    state = createInitialState(repoDir, stateDir, profileName, manifest);
-    saveState(stateDir, state);
+  if (writeManifest || !fs.existsSync(paths.manifestSnapshotPath)) {
+    writeJsonAtomic(paths.manifestSnapshotPath, manifest);
   }
 
   const gitignoreResult = flags['no-gitignore']
     ? { updated: false, reason: 'skipped_by_flag' }
     : ensureGitignoreEntry(repoDir, stateDir);
 
-  appendEvent(stateDir, profileTemplate, {
+  appendEvent(stateDir, flags.force ? profileTemplate : existingConfig || profileTemplate, {
     type: 'loop_initialized',
     profile: profileName,
     state_dir: stateDir,
@@ -153,8 +172,10 @@ function cmdInit(flags) {
       state: paths.statePath
     },
     next_steps: [
-      `Edit ${paths.manifestPath} with your ordered work packages (or import from grow-me / ai-dev-workflow).`,
       `Review ${paths.configPath} to map tier1 / tier2 / reviewer instances and verify commands.`,
+      ...((manifest.packs || []).length ? [] : [
+        `Add your work packages to ${paths.manifestPath}, then run: grow-loop manifest-ack --reason "<reason>"`
+      ]),
       'Run: grow-loop probe',
       'Run: grow-loop next'
     ]
@@ -170,7 +191,7 @@ async function cmdProbe(flags) {
 }
 
 function cmdStatus(flags) {
-  const ctx = loadWorkspace(flags.repo, flags['state-dir']);
+  const ctx = loadWorkspace(flags.repo, flags['state-dir'], { allowPendingManifest: true });
   const summary = ctx.state.pack_order.map((id) => {
     const p = ctx.state.packs[id];
     return {
@@ -191,8 +212,17 @@ function cmdStatus(flags) {
     profile: ctx.state.profile,
     state_dir: ctx.stateDir,
     active_pack_id: ctx.state.active_pack_id,
-    packs: summary
+    packs: summary,
+    ...(ctx.manifestChange ? { manifest_change_pending: ctx.manifestChange } : {})
   });
+}
+
+function cmdManifestAck(flags) {
+  const ctx = loadWorkspace(flags.repo, flags['state-dir'], { allowPendingManifest: true });
+  const changes = writeManifestWithReason(ctx, ctx.manifest, flags.reason, 'manifest_ack');
+  outJson(changes
+    ? { ok: true, message: 'Manifest changes acknowledged.', changes }
+    : { ok: true, message: 'No manifest changes.' });
 }
 
 function cmdNext(flags) {
@@ -426,6 +456,7 @@ async function main() {
     if (cmd === 'init') cmdInit(flags);
     else if (cmd === 'probe') await cmdProbe(flags);
     else if (cmd === 'status') cmdStatus(flags);
+    else if (cmd === 'manifest-ack') cmdManifestAck(flags);
     else if (cmd === 'next') cmdNext(flags);
     else if (cmd === 'dispatch') await cmdDispatch(flags);
     else if (cmd === 'verify') await cmdVerify(flags);
@@ -434,7 +465,11 @@ async function main() {
     else if (cmd === 'evidence') cmdEvidence(flags);
     else throw new Error(`Unknown command "${cmd}". Run "grow-loop --help".`);
   } catch (err) {
-    process.stderr.write(`[grow-loop error] ${err.message || err}\n`);
+    if (err instanceof ManifestChangedError) {
+      outJson({ ok: false, error: 'manifest_changed', message: err.message, ...err.pending });
+    } else {
+      process.stderr.write(`[grow-loop error] ${err.message || err}\n`);
+    }
     process.exitCode = 1;
   }
 }

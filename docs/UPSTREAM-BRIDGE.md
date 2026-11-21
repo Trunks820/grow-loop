@@ -1,6 +1,6 @@
 # Upstream Bridge (`manifest.json` Contract)
 
-`grow-loop` is intentionally decoupled from any specific requirements or planning tool. Whether your work packages come from **[grow-me](https://github.com/Trunks820/grow-me)** (companion upstream tool, under active polish), **`ai-dev-workflow`**, a PRD Markdown table, Jira/Linear/GitHub Issues, or hand-written JSON, you only need to populate `.loop/manifest.json`.
+`grow-loop` accepts work packages from planning tools, PRDs, issue trackers, and hand-written JSON. Prepare a manifest in the format below and import it with `grow-loop init --manifest <file>`. You can also convert a task list from [grow-me](https://github.com/Trunks820/grow-me) or `ai-dev-workflow`.
 
 ---
 
@@ -81,12 +81,14 @@ When your upstream workflow produces a requirement spec, task breakdown (`开发
 2. **Copy `depends_on` and file scope** directly from the development checklist into `depends_on`, `scope_files`, and `estimated_files`.
 3. **Copy observable test case IDs** (e.g., `TC-001` / `AC-W01-01`) into `acceptance_criteria`.
 4. **Keep unresolved decisions in `open_questions`** instead of letting the coding agent guess — `grow-loop` will automatically pause at `AMBIGUITY` right before that pack begins.
-5. **Re-syncing mid-run is safe:** Adding new packs (`W07`, `W08`) or updating titles in `manifest.json` never clobbers already-`COMMITTED` packs; `grow-loop` automatically syncs new packs on the next CLI call.
+5. After manually editing the workspace's `manifest.json`, review the diff with `grow-loop status` and run `grow-loop manifest-ack --reason "<one sentence>"`. Commands such as `next` pause until the edit is acknowledged. The CLI records the diff and reason as `manifest_changed` in `events.jsonl`, updates `manifest.snapshot.json` in the state directory, and syncs the pack order and active pack. Committed and removed pack records are retained. To replace the entire manifest and reset workspace configuration and state, use `grow-loop init --force --manifest <file>`.
+
+The snapshot is created during initialization. A workspace from an older version takes its current manifest as the baseline on the first command. The comparison uses parsed JSON and reports changes to pack membership, the relative order of retained packs, and field values. Use the CLI to update loop state.
 
 ---
 
 ## 3. Bridging from Plain Markdown / GitHub Issues
 
-You don't need any planning framework to use `grow-loop`:
-- Run `grow-loop init --profile standard-test` (or `live-smoke`).
-- Ask your host agent (Codex / Antigravity / Claude Code / Cursor): *"Convert this issue list / PRD into `.loop/manifest.json` following `docs/UPSTREAM-BRIDGE.md`, then run `grow-loop probe` and `grow-loop next`."*
+1. Convert the issue list or PRD into a JSON manifest such as `delivery.json` using the schema above.
+2. Run `grow-loop init --manifest delivery.json --profile standard-test` (or select `live-smoke`).
+3. Run `grow-loop probe` and `grow-loop next`.

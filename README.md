@@ -82,20 +82,26 @@ npm test   # 运行内置 node:test 测试套件
 
 ### 2. 在目标项目中初始化
 
+先按 [清单格式](docs/UPSTREAM-BRIDGE.md) 准备一份 `delivery.json`，把待交付的工作包按执行顺序放进 `packs`。选择对应的 profile 初始化。
+
 ```bash
 # 常规项目（可跑单测）
-node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --profile standard-test
+node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --profile standard-test --manifest delivery.json
 
 # 或老项目 / 重库实测模式（禁新增单测 + 实测脚本）
-node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --profile live-smoke
+node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --profile live-smoke --manifest delivery.json
 
 # 可选：把状态存到外部目录（如 Obsidian），不修改项目 .gitignore
-node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --state-dir /path/to/vault/loop-state
+node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --state-dir /path/to/vault/loop-state --manifest delivery.json
 ```
 
-### 3. 编辑任务清单与执行器映射
-- `.loop/manifest.json`：填入待交付的工作包 `W01..Wn`（可由 [grow-me](https://github.com/Trunks820/grow-me) / `ai-dev-workflow` 或任意 Markdown 清单转换，详见 [docs/UPSTREAM-BRIDGE.md](docs/UPSTREAM-BRIDGE.md)）。
-- `.loop/config.json`：配置本机的 `tier1` / `tier2` / `reviewer` 实例与 `verification` 命令。
+`init` 将清单导入状态目录的 `manifest.json`。首次初始化时省略 `--manifest` 会创建空清单。已有清单时，直接传 `--manifest` 会报错。要替换整份清单，请用 `init --force --manifest <文件>`。这条命令允许替换有待确认改动的旧清单，并重新初始化配置和运行状态。
+
+### 3. 配置执行器与确认清单改动
+
+在 `.loop/config.json` 配置本机的 `tier1`、`tier2`、`reviewer` 实例和 `verification` 命令。
+
+运行中可以手改状态目录里的 `manifest.json`。`grow-loop status` 会显示待确认的改动，其他工作区命令会暂停，显式替换整份清单的 `init --force --manifest` 除外。用 `grow-loop manifest-ack --reason "补充退款回执的验收条件"` 确认后继续。如果前面的命令用了 `--repo` 或 `--state-dir`，确认时沿用这些参数。确认会在 `events.jsonl` 记录 `manifest_changed` 事件，并更新状态目录里的 `manifest.snapshot.json`。包的运行状态由 CLI 命令维护。
 
 ### 4. 探活并驱动闭环
 
@@ -131,7 +137,7 @@ grow-loop/
 ├── SKILL.md                  # 跨宿主 Agent Skill 协议（Codex / Antigravity / Claude / Cursor 通用）
 ├── package.json              # 零依赖 ESM 包定义
 ├── bin/
-│   └── grow-loop.mjs         # CLI 入口（init/probe/status/next/dispatch/record/resume/evidence）
+│   └── grow-loop.mjs         # CLI 入口（init/status/manifest-ack/next 等）
 ├── profiles/
 │   ├── standard-test.json    # 开箱模板 1：常规单测项目
 │   └── live-smoke.json       # 开箱模板 2：禁新单测 + 实测脚本项目

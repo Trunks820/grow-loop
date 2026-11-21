@@ -47,18 +47,18 @@ You **MUST STOP** and ask the human before any of these actions:
 Follow this exact deterministic loop for every work package (`W01`, `W02`, ...):
 
 ### Step 0: Initialize (Once per project/worktree)
-1. Check if `<repo>/.loop/state.json` (or custom `--state-dir`) exists.
-2. If not, pick the right profile and initialize:
+1. For a new workspace, prepare a JSON manifest from the upstream task list, PRD, or issues. Follow the format in `docs/UPSTREAM-BRIDGE.md`.
+2. Pick the profile and import the manifest during initialization.
    - **`standard-test`** (regular repo with unit/integration tests):
      ```bash
-     node <GROW_LOOP_BIN> init --repo <repo> --profile standard-test
+     node <GROW_LOOP_BIN> init --repo <repo> --profile standard-test --manifest <file>
      ```
    - **`live-smoke`** (legacy/DB-heavy repo where new unit tests are forbidden and real-env smoke scripts verify behavior):
      ```bash
-     node <GROW_LOOP_BIN> init --repo <repo> --profile live-smoke
+     node <GROW_LOOP_BIN> init --repo <repo> --profile live-smoke --manifest <file>
      ```
    - Use `--state-dir <path>` only if the user wants state stored outside the repo (e.g., an Obsidian vault). Default `<repo>/.loop/` is preferred and automatically added to `<repo>/.gitignore`.
-3. Populate `.loop/manifest.json` from upstream specs (`grow-me` / `ai-dev-workflow` task list, PRD, or issue list — see `docs/UPSTREAM-BRIDGE.md`) and adjust `.loop/config.json` (executor instances + verify commands).
+3. Adjust `.loop/config.json` for the executor instances and verification commands. Use CLI commands to update loop state.
 4. Run live capability discovery before dispatching external executors:
    ```bash
    node <GROW_LOOP_BIN> probe --repo <repo>
@@ -66,6 +66,9 @@ Follow this exact deterministic loop for every work package (`W01`, `W02`, ...):
    Remember: `probe` verifies local CLI readiness (`cli_ready`), NOT server-side quota.
 
 ### Step 1: Ask the State Machine What to Do Next
+
+After a manual edit to `manifest.json`, `status` shows the pending diff and commands such as `next` pause. Review the diff and run `grow-loop manifest-ack --reason "<one sentence>"` with the same workspace options. The CLI records the reason in `events.jsonl` and updates `manifest.snapshot.json` in the state directory. `init --force --manifest <file>` explicitly replaces the whole manifest and resets workspace configuration and state, even when edits are pending.
+
 ```bash
 node <GROW_LOOP_BIN> next --repo <repo>
 ```

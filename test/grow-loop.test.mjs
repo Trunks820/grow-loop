@@ -9,10 +9,14 @@ import { fileURLToPath } from 'node:url';
 import {
   createInitialState,
   ensureGitignoreEntry,
+  getStatePaths,
   loadWorkspace,
+  readEvents,
+  readJsonSafe,
   resolveStateDir,
   saveState,
-  writeJsonAtomic
+  writeJsonAtomic,
+  writeManifestWithReason
 } from '../src/state.mjs';
 import {
   recordCommitOutcome,
@@ -58,7 +62,7 @@ function runCliFailure(args, cwd) {
       env: { ...process.env, GROW_LOOP_STATE_DIR: '' }
     });
   } catch (err) {
-    return { status: err.status, stderr: String(err.stderr || '') };
+    return { status: err.status, stdout: String(err.stdout || ''), stderr: String(err.stderr || '') };
   }
   throw new Error(`Expected CLI failure for: ${args.join(' ')}`);
 }
@@ -131,6 +135,271 @@ test('state dir defaults to <repo>/.loop with auto .gitignore, while external --
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(externalStateDir, { recursive: true, force: true });
+  }
+});
+
+test('init without a manifest starts empty and preserves existing files unless forced', () => {
+  const repoDir = makeTempDir('grow-loop-init-');
+  try {
+    const importPath = path.join(repoDir, 'source.json');
+    writeJsonAtomic(importPath, { packs: [{ id: 'FIRST' }, { id: 'FIRST' }] });
+    const invalid = runCliFailure(['init', '--manifest', 'source.json'], repoDir);
+    assert.match(invalid.stderr, /unique non-empty string id/);
+    writeJsonAtomic(importPath, null);
+    const invalidShape = runCliFailure(['init', '--manifest', 'source.json'], repoDir);
+    assert.match(invalidShape.stderr, /manifest must be a JSON object with a packs array/i);
+    assert.equal(fs.existsSync(path.join(repoDir, '.loop')), false);
+
+    const init = runCli(['init', '--no-gitignore'], repoDir);
+    const paths = getStatePaths(init.state_dir);
+    assert.deepEqual(Object.keys(init).sort(), ['files', 'gitignore', 'next_steps', 'ok', 'profile', 'repo_dir', 'state_dir']);
+    assert.deepEqual(init.files, { config: paths.configPath, manifest: paths.manifestPath, state: paths.statePath });
+    assert.equal(init.gitignore.reason, 'skipped_by_flag');
+    assert.equal(fs.existsSync(path.join(repoDir, '.gitignore')), false);
+    assert.deepEqual(readJsonSafe(paths.manifestPath).packs, []);
+    assert.deepEqual(readJsonSafe(paths.manifestPath), readJsonSafe(paths.manifestSnapshotPath));
+    const idle = runCli(['status'], repoDir);
+    assert.equal(idle.loop_status, 'IDLE');
+    assert.equal(idle.active_pack_id, null);
+    assert.deepEqual(idle.packs, []);
+
+    const manifest = { project: 'real-project', packs: [{ id: 'FIRST', title: 'First work package' }] };
+    writeJsonAtomic(importPath, manifest);
+    const preserved = [paths.configPath, paths.manifestPath, paths.statePath, paths.manifestSnapshotPath];
+    const original = preserved.map((file) => fs.readFileSync(file, 'utf8'));
+    runCli(['init', '--profile', 'live-smoke'], repoDir);
+    assert.deepEqual(preserved.map((file) => fs.readFileSync(file, 'utf8')), original);
+
+    const eventsBefore = fs.readFileSync(paths.eventsPath, 'utf8');
+    const conflict = runCliFailure(['init', '--manifest', 'source.json', '--profile', 'live-smoke'], repoDir);
+    assert.equal(conflict.status, 1);
+    assert.match(conflict.stderr, /manifest already exists/i);
+    assert.match(conflict.stderr, /init --force --manifest/);
+    assert.deepEqual(preserved.map((file) => fs.readFileSync(file, 'utf8')), original);
+    assert.equal(fs.readFileSync(paths.eventsPath, 'utf8'), eventsBefore);
+
+    writeJsonAtomic(paths.manifestPath, manifest);
+    runCli(['manifest-ack', '--reason', 'The first package is ready'], repoDir);
+    const running = readJsonSafe(paths.statePath);
+    assert.equal(running.loop_status, 'RUNNING');
+    assert.equal(running.active_pack_id, 'FIRST');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('init --force --manifest replaces a pending manifest and resets the workspace', () => {
+  const repoDir = makeTempDir('grow-loop-force-init-');
+  try {
+    const sourcePath = path.join(repoDir, 'source.json');
+    writeJsonAtomic(sourcePath, { packs: [{ id: 'OLD', title: 'Original package' }] });
+    const { state_dir } = runCli(['init', '--manifest', 'source.json'], repoDir);
+    const paths = getStatePaths(state_dir);
+    assert.equal(runCli(['next'], repoDir).pack_id, 'OLD');
+
+    writeJsonAtomic(paths.manifestPath, { packs: [{ id: 'OLD', title: 'Pending manual edit' }] });
+    const blocked = runCliFailure(['init'], repoDir);
+    assert.equal(blocked.status, 1);
+    assert.equal(JSON.parse(blocked.stdout).error, 'manifest_changed');
+    const conflict = runCliFailure(['init', '--manifest', 'source.json'], repoDir);
+    assert.equal(conflict.status, 1);
+    assert.deepEqual(JSON.parse(conflict.stdout), {
+      ...JSON.parse(blocked.stdout),
+      replace_command: 'grow-loop init --force --manifest <file>'
+    });
+    const forceWithoutSource = runCliFailure(['init', '--force'], repoDir);
+    assert.equal(forceWithoutSource.status, 1);
+    assert.deepEqual(JSON.parse(forceWithoutSource.stdout), JSON.parse(blocked.stdout));
+
+    const preserved = [paths.configPath, paths.manifestPath, paths.statePath, paths.manifestSnapshotPath, paths.eventsPath];
+    const before = preserved.map((file) => fs.readFileSync(file, 'utf8'));
+    const invalid = runCliFailure(['init', '--force', '--manifest', 'missing.json'], repoDir);
+    assert.equal(invalid.status, 1);
+    assert.match(invalid.stderr, /--manifest must point to a grow-loop JSON manifest/);
+    assert.deepEqual(preserved.map((file) => fs.readFileSync(file, 'utf8')), before);
+
+    const replacement = { project: 'replacement', packs: [{ id: 'NEW' }] };
+    writeJsonAtomic(sourcePath, replacement);
+    const forced = runCli(['init', '--force', '--manifest', 'source.json', '--profile', 'live-smoke'], repoDir);
+    assert.equal(forced.ok, true);
+    assert.deepEqual(readJsonSafe(paths.manifestPath), replacement);
+    assert.deepEqual(readJsonSafe(paths.manifestSnapshotPath), replacement);
+    assert.equal(readJsonSafe(paths.configPath).profile, 'live-smoke');
+    const state = readJsonSafe(paths.statePath);
+    assert.equal(state.profile, 'live-smoke');
+    assert.deepEqual(Object.keys(state.packs), ['NEW']);
+    assert.equal(runCli(['status'], repoDir).manifest_change_pending, undefined);
+    assert.equal(runCli(['next'], repoDir).pack_id, 'NEW');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('the confirmed manifest replaces a removed active pack, preserves history, and reopens a completed loop', () => {
+  const repoDir = makeTempDir('grow-loop-manifest-sync-');
+  try {
+    const manifest = {
+      project: 'checkout',
+      packs: [
+        { id: 'REMOVED', title: 'Remove legacy checkout' },
+        { id: 'DONE', title: 'Validate checkout', risk: 'low' },
+        { id: 'KEEP', title: 'Update checkout docs' }
+      ]
+    };
+    const importPath = path.join(repoDir, 'delivery.json');
+    writeJsonAtomic(importPath, manifest);
+    const init = runCli(['init', '--manifest', importPath], repoDir);
+    const paths = getStatePaths(init.state_dir);
+    assert.deepEqual(readJsonSafe(paths.manifestPath), manifest);
+    assert.deepEqual(readJsonSafe(paths.manifestSnapshotPath), manifest);
+    assert.deepEqual(runCli(['status'], repoDir).packs.map(({ id }) => id), ['REMOVED', 'DONE', 'KEEP']);
+
+    runCli(['record', 'commit', '--pack', 'DONE', '--sha', '123456789'], repoDir);
+    assert.equal(runCli(['next'], repoDir).pack_id, 'REMOVED');
+    const before = readJsonSafe(paths.statePath);
+    assert.equal(before.active_pack_id, 'REMOVED');
+
+    manifest.packs = [
+      { ...manifest.packs[1], title: 'Reworded title', risk: 'high' },
+      { id: 'NEXT', title: 'Enable the new checkout' },
+      manifest.packs[2]
+    ];
+    writeJsonAtomic(paths.manifestPath, manifest);
+    runCli(['manifest-ack', '--reason', 'Ship the new checkout first'], repoDir);
+    const after = readJsonSafe(paths.statePath);
+    assert.equal(after.active_pack_id, 'NEXT');
+    assert.equal(after.loop_status, 'RUNNING');
+    assert.deepEqual(after.pack_order, ['DONE', 'NEXT', 'KEEP']);
+    assert.deepEqual(after.packs.REMOVED, before.packs.REMOVED);
+    assert.deepEqual(after.packs.DONE, before.packs.DONE);
+    assert.equal(runCli(['next'], repoDir).pack_id, 'NEXT');
+
+    runCli(['record', 'commit', '--sha', '234567891'], repoDir);
+    assert.equal(runCli(['record', 'commit', '--sha', '345678912'], repoDir).loop_status, 'COMPLETED');
+    manifest.packs.push({ id: 'FOLLOWUP', title: 'Verify the rollout' });
+    writeJsonAtomic(paths.manifestPath, manifest);
+    assert.equal(runCli(['status'], repoDir).loop_status, 'COMPLETED');
+    runCli(['manifest-ack', '--reason', 'Add rollout verification'], repoDir);
+    const reopened = readJsonSafe(paths.statePath);
+    assert.equal(reopened.loop_status, 'RUNNING');
+    assert.equal(reopened.active_pack_id, 'FOLLOWUP');
+    assert.equal(runCli(['next'], repoDir).pack_id, 'FOLLOWUP');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('workspace commands block on manifest changes until a reason is recorded', () => {
+  const repoDir = makeTempDir('grow-loop-manifest-ack-');
+  try {
+    const manifest = {
+      project: 'checkout',
+      packs: [
+        { id: 'A', acceptance_criteria: ['Refund is recorded'], tags: ['billing'] },
+        { id: 'B' },
+        { id: 'C' }
+      ]
+    };
+    const sourcePath = path.join(repoDir, 'source.json');
+    writeJsonAtomic(sourcePath, manifest);
+    const { state_dir } = runCli(['init', '--manifest', sourcePath], repoDir);
+    const paths = getStatePaths(state_dir);
+    const original = runCli(['status'], repoDir);
+    const unchangedFiles = [paths.statePath, paths.manifestSnapshotPath, paths.eventsPath];
+    const before = unchangedFiles.map((file) => fs.readFileSync(file, 'utf8'));
+    const edited = {
+      packs: [
+        { id: 'B' },
+        { id: 'A', acceptance_criteria: ['Refund and receipt are recorded'], access_token: 'dummy-value' },
+        { id: 'D' }
+      ],
+      project: 'payments'
+    };
+    writeJsonAtomic(paths.manifestPath, edited);
+    const commands = [['init', '--force'], ['probe'], ['next'], ['dispatch'], ['verify'], ['record', 'lesson'], ['resume'], ['evidence']];
+    const expected = {
+      added_packs: ['D'],
+      removed_packs: ['C'],
+      order_changed: true,
+      old_order: ['A', 'B', 'C'],
+      new_order: ['B', 'A', 'D'],
+      changed_packs: [{
+        id: 'A',
+        fields: [
+          { field: 'acceptance_criteria', old_value: ['Refund is recorded'], new_value: ['Refund and receipt are recorded'] },
+          { field: 'tags', old_value: ['billing'], new_value: null, new_missing: true },
+          { field: 'access_token', old_value: null, new_value: '[REDACTED:SECRET]', old_missing: true }
+        ]
+      }],
+      manifest_fields: [{ field: 'project', old_value: 'checkout', new_value: 'payments' }]
+    };
+    const ack = 'grow-loop manifest-ack --reason "<reason>"';
+    for (const args of commands) {
+      const blocked = runCliFailure(args, repoDir);
+      assert.equal(blocked.status, 1);
+      const result = JSON.parse(blocked.stdout);
+      assert.equal(result.error, 'manifest_changed');
+      assert.equal(result.ack_command, ack);
+      assert.deepEqual(result.changes, expected);
+    }
+    assert.deepEqual(runCli(['status'], repoDir), {
+      ...original,
+      manifest_change_pending: { changes: expected, ack_command: ack }
+    });
+    for (const args of [[], ['--reason'], ['--reason', ''], ['--reason', '   ']]) {
+      const invalid = runCliFailure(['manifest-ack', ...args], repoDir);
+      assert.equal(invalid.status, 1);
+      assert.match(invalid.stderr, /non-empty --reason/);
+    }
+    assert.deepEqual(unchangedFiles.map((file) => fs.readFileSync(file, 'utf8')), before);
+
+    const reason = 'Include the receipt in refund acceptance';
+    assert.deepEqual(runCli(['manifest-ack', '--reason', reason], repoDir).changes, expected);
+    const event = readEvents(paths.eventsPath).at(-1);
+    assert.equal(event.type, 'manifest_changed');
+    assert.equal(event.source, 'manifest_ack');
+    assert.equal(event.reason, reason);
+    assert.deepEqual(event.changes, expected);
+    assert.deepEqual(readJsonSafe(paths.manifestSnapshotPath), edited);
+    assert.equal(runCli(['next'], repoDir).pack_id, 'A');
+
+    // Object key order and whitespace have no effect on the comparison.
+    fs.writeFileSync(paths.manifestPath, JSON.stringify({ project: edited.project, packs: edited.packs }), 'utf8');
+    assert.equal(runCli(['status'], repoDir).manifest_change_pending, undefined);
+    assert.match(runCli(['manifest-ack', '--reason', 'Check for edits'], repoDir).message, /no manifest changes/i);
+    assert.equal(readEvents(paths.eventsPath).filter(({ type }) => type === 'manifest_changed').length, 1);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('legacy workspaces seed a snapshot and internal manifest writes are audited immediately', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A' }]);
+  try {
+    const { paths } = ctx;
+    fs.unlinkSync(paths.manifestSnapshotPath);
+    const legacyManifest = { ...ctx.manifest, packs: [{ id: 'B' }] };
+    writeJsonAtomic(paths.manifestPath, legacyManifest);
+    assert.equal(runCli(['next'], repoDir).pack_id, 'B');
+    assert.deepEqual(readJsonSafe(paths.manifestSnapshotPath), legacyManifest);
+    assert.equal(readEvents(paths.eventsPath).some(({ type }) => type === 'manifest_changed'), false);
+
+    const loaded = loadWorkspace(repoDir);
+    const nextManifest = { ...loaded.manifest, packs: [...loaded.manifest.packs, { id: 'C' }] };
+    const reason = 'Schedule a follow-up';
+    const changes = writeManifestWithReason(loaded, nextManifest, reason, 'internal_test');
+    assert.deepEqual(changes.added_packs, ['C']);
+    assert.equal(changes.order_changed, false);
+    assert.deepEqual(readJsonSafe(paths.manifestPath), nextManifest);
+    assert.deepEqual(readJsonSafe(paths.manifestSnapshotPath), nextManifest);
+    assert.deepEqual(readJsonSafe(paths.statePath).pack_order, ['B', 'C']);
+    const event = readEvents(paths.eventsPath).at(-1);
+    assert.equal(event.type, 'manifest_changed');
+    assert.equal(event.source, 'internal_test');
+    assert.equal(event.reason, reason);
+    assert.deepEqual(runCli(['status'], repoDir).packs.map(({ id }) => id), ['B', 'C']);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
 
@@ -324,7 +593,12 @@ test('infra classifier ignores model/tool text on clean exits and reads only CLI
 test('grow-loop verify runs configured commands itself; self-reported passes need explicit opt-in', () => {
   const repoDir = makeTempDir('grow-loop-verify-');
   try {
-    runCli(['init', '--repo', repoDir, '--profile', 'standard-test']);
+    const manifestPath = path.join(repoDir, 'verify-manifest.json');
+    writeJsonAtomic(manifestPath, {
+      project: 'verify-demo',
+      packs: [{ id: 'W01', title: 'Add a file checked by verification', acceptance_criteria: ['fixed.txt exists'] }]
+    });
+    runCli(['init', '--repo', repoDir, '--profile', 'standard-test', '--manifest', manifestPath]);
     const configPath = path.join(repoDir, '.loop', 'config.json');
     const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     fs.writeFileSync(path.join(repoDir, 'check.mjs'), "import fs from 'node:fs';\nif (!fs.existsSync('fixed.txt')) { console.error('assertion failed: fixed.txt missing'); process.exit(3); }\n", 'utf8');
@@ -536,24 +810,9 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
     execFileSync('git', ['add', 'README.md'], { cwd: repoDir, stdio: 'ignore' });
     execFileSync('git', ['commit', '-m', 'chore: initial commit'], { cwd: repoDir, stdio: 'ignore' });
 
-    // 1. init with live-smoke profile
-    const initRes = runCli(['init', '--repo', repoDir, '--profile', 'live-smoke', '--project', 'demo-app']);
-    assert.equal(initRes.ok, true);
-    assert.equal(initRes.gitignore.updated, true);
-    assert.equal(initRes.state_dir, path.join(repoDir, '.loop'));
-
-    // Replace manifest with 2 real packs and use self executor for deterministic CI testing
-    const configPath = path.join(repoDir, '.loop', 'config.json');
-    const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-    cfg.executors = { self: { kind: 'self', label: 'Host Harness' } };
-    cfg.routing.tier1 = 'self';
-    cfg.routing.tier2 = 'self';
-    cfg.routing.reviewer = 'self';
-    cfg.code_intel = { tool: 'none' };
-    cfg.verification.commands = [`${shellQuote(process.execPath)} --check hello.js`];
-    writeJsonAtomic(configPath, cfg);
-
-    writeJsonAtomic(path.join(repoDir, '.loop', 'manifest.json'), {
+    // 1. init with two real packs and the live-smoke profile
+    const manifestPath = path.join(repoDir, 'delivery.json');
+    writeJsonAtomic(manifestPath, {
       project: 'demo-app',
       packs: [
         {
@@ -578,6 +837,21 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
         }
       ]
     });
+    const initRes = runCli(['init', '--repo', repoDir, '--profile', 'live-smoke', '--manifest', manifestPath]);
+    assert.equal(initRes.ok, true);
+    assert.equal(initRes.gitignore.updated, true);
+    assert.equal(initRes.state_dir, path.join(repoDir, '.loop'));
+
+    // Use the self executor for deterministic CI testing
+    const configPath = path.join(repoDir, '.loop', 'config.json');
+    const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    cfg.executors = { self: { kind: 'self', label: 'Host Harness' } };
+    cfg.routing.tier1 = 'self';
+    cfg.routing.tier2 = 'self';
+    cfg.routing.reviewer = 'self';
+    cfg.code_intel = { tool: 'none' };
+    cfg.verification.commands = [`${shellQuote(process.execPath)} --check hello.js`];
+    writeJsonAtomic(configPath, cfg);
 
     // 2. probe
     const probeRes = runCli(['probe', '--repo', repoDir]);
