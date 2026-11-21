@@ -82,9 +82,12 @@ npm test   # 运行内置 node:test 测试套件
 
 ### 2. 在目标项目中初始化
 
-先按 [清单格式](docs/UPSTREAM-BRIDGE.md) 准备一份 `delivery.json`，把待交付的工作包按执行顺序放进 `packs`。选择对应的 profile 初始化。
+已有 grow-me 的 `task.manifest.json` 时，可以直接初始化。也可以按 loop 的清单格式准备 `delivery.json`，在 `packs` 中按执行顺序列出工作包。选择对应的 profile 初始化。[清单格式与导入指南](docs/UPSTREAM-BRIDGE.md)
 
 ```bash
+# 直接导入 grow-me 交接清单
+node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --profile standard-test --handoff task.manifest.json
+
 # 常规项目（可跑单测）
 node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --profile standard-test --manifest delivery.json
 
@@ -95,13 +98,13 @@ node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --pr
 node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --state-dir /path/to/vault/loop-state --manifest delivery.json
 ```
 
-`init` 将清单导入状态目录的 `manifest.json`。首次初始化时省略 `--manifest` 会创建空清单。已有清单时，直接传 `--manifest` 会报错。要替换整份清单，请用 `init --force --manifest <文件>`。这条命令允许替换有待确认改动的旧清单，并重新初始化配置和运行状态。
+`init` 将清单导入状态目录的 `manifest.json`。`--manifest` 和 `--handoff` 二选一，首次初始化时都省略会创建空清单。已有清单时，用 `grow-loop import --handoff <文件> --reason "<原因>"` 追加工作包。整份替换用 `init --force --manifest <文件>` 或 `init --force --handoff <文件>`，可替换有待确认改动的清单，并重新初始化配置和运行状态。
 
 ### 3. 配置执行器与确认清单改动
 
 在 `.loop/config.json` 配置本机的 `tier1`、`tier2`、`reviewer` 实例和 `verification` 命令。
 
-`grow-loop status` 会显示手改清单后待确认的差异。用 `grow-loop manifest-ack --reason "补充退款回执的验收条件"` 确认后继续。`init --force --manifest` 也可以替换有待确认改动的整份清单。
+交接导入的包在开工前须填写 `scope_files`、`risk` 和 `tags`。导入输出和 `grow-loop status` 会列出缺项，`next` 返回 `NEEDS_FILL` 时按提示补齐。`status` 也会显示手改清单后待确认的差异。用 `grow-loop manifest-ack --reason "补齐文件范围、风险和功能类别"` 确认后再次执行 `next`。
 
 ### 4. 探活并驱动闭环
 

@@ -32,6 +32,7 @@ import {
   recordImplementOutcome,
   recordReviewOutcome,
   recordVerifyOutcome,
+  requireHandoffPreflight,
   resolveTierInstance,
   resumeFromGate,
   startOrAdvanceActivePack
@@ -46,6 +47,7 @@ import { getVerificationCommands, runVerification } from '../src/verify.mjs';
 import { parseReviewReport } from '../src/review-report.mjs';
 import { ALLOWED_GATE_REASONS } from '../src/gate.mjs';
 import { checkExternalCommits, readGitHeadCommit } from '../src/git-watch.mjs';
+import { handoffFillSteps, handoffNeeds, readHandoff } from '../src/handoff.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -87,7 +89,8 @@ function printHelp() {
   process.stdout.write(`grow-loop v0.1.0 — Harness-agnostic multi-package delivery loop
 
 Usage:
-  grow-loop init      [--repo <dir>] [--state-dir <dir>] [--profile standard-test|live-smoke] [--manifest <file>] [--project <name>] [--no-gitignore] [--force]
+  grow-loop init      [--repo <dir>] [--state-dir <dir>] [--profile standard-test|live-smoke] [--manifest <file> | --handoff <file>] [--project <name>] [--no-gitignore] [--force]
+  grow-loop import    --handoff <file> --reason "<text>" [--repo <dir>] [--state-dir <dir>]
   grow-loop probe     [--repo <dir>] [--state-dir <dir>] [--timeout <ms>]
   grow-loop status    [--repo <dir>] [--state-dir <dir>]
   grow-loop manifest-ack --reason "<text>" [--repo <dir>] [--state-dir <dir>]
@@ -112,7 +115,7 @@ Usage:
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
 
 Default state directory: <repo>/.loop/ (auto-added to .gitignore; override with --state-dir or GROW_LOOP_STATE_DIR)
-To replace an existing manifest and reset workspace state, use grow-loop init --force --manifest <file>.
+To replace an existing manifest and reset workspace state, use grow-loop init --force with --manifest <file> or --handoff <file>.
 `);
 }
 
@@ -125,13 +128,15 @@ function cmdInit(flags) {
   if (!fs.existsSync(profilePath)) {
     throw new Error(`Unknown profile "${profileName}". Available: standard-test, live-smoke`);
   }
-  if (flags.manifest !== undefined && (typeof flags.manifest !== 'string' || !flags.manifest.trim())) {
-    throw new Error('Specify a file with --manifest.');
+  const sourceFlag = flags.handoff === undefined ? 'manifest' : chooseFlag(flags, 'manifest', 'handoff');
+  const sourceFile = flags[sourceFlag];
+  if (sourceFile !== undefined && (typeof sourceFile !== 'string' || !sourceFile.trim())) {
+    throw new Error(`Specify a file with --${sourceFlag}.`);
   }
 
   const paths = getStatePaths(stateDir);
   const profileTemplate = JSON.parse(fs.readFileSync(profilePath, 'utf8'));
-  const replaceManifest = Boolean(flags.force && flags.manifest);
+  const replaceManifest = Boolean(flags.force && sourceFile);
   let existingConfig;
   if (!replaceManifest) {
     try {
@@ -145,20 +150,22 @@ function cmdInit(flags) {
   let manifest = replaceManifest ? null : readManifest(paths.manifestPath);
   if (manifest) {
     const { pending } = checkManifest(paths, manifest, existingConfig || profileTemplate, { allowPendingManifest: true });
-    const replaceCommand = 'grow-loop init --force --manifest <file>';
+    const replaceCommand = `grow-loop init --force --${sourceFlag} <file>`;
     if (pending) {
-      if (flags.manifest) pending.replace_command = replaceCommand;
+      if (sourceFile) pending.replace_command = replaceCommand;
       throw new ManifestChangedError(pending);
     }
-    if (flags.manifest) {
+    if (sourceFile) {
       throw new Error(`A workspace manifest already exists. Use "${replaceCommand}" to replace it and reset workspace state.`);
     }
   }
 
   const writeManifest = !manifest;
   if (writeManifest) {
-    if (flags.manifest) {
-      manifest = readManifest(path.resolve(flags.manifest));
+    if (sourceFlag === 'handoff') {
+      manifest = readHandoff(path.resolve(sourceFile));
+    } else if (sourceFile) {
+      manifest = readManifest(path.resolve(sourceFile));
       if (!manifest) throw new Error('--manifest must point to a grow-loop JSON manifest.');
     } else {
       manifest = { project: flags.project || path.basename(repoDir), upstream_source: flags.upstream || null, packs: [] };
@@ -189,6 +196,7 @@ function cmdInit(flags) {
     gitignore: gitignoreResult
   });
 
+  const handoff = sourceFlag === 'handoff' ? summarizeHandoff(manifest.packs, profileTemplate) : null;
   outJson({
     ok: true,
     repo_dir: repoDir,
@@ -200,8 +208,10 @@ function cmdInit(flags) {
       manifest: paths.manifestPath,
       state: paths.statePath
     },
+    ...(handoff && { imported_packs: handoff.imported_packs }),
     next_steps: [
       `Review ${paths.configPath} to map tier1 / tier2 / reviewer instances and verify commands.`,
+      ...(handoff?.next_steps ?? []),
       ...((manifest.packs || []).length ? [] : [
         `Add your work packages to ${paths.manifestPath}, then run: grow-loop manifest-ack --reason "<reason>"`
       ]),
@@ -209,6 +219,33 @@ function cmdInit(flags) {
       'Run: grow-loop next'
     ]
   });
+}
+
+function summarizeHandoff(packs, config) {
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  const importedPacks = packs.map((pack) => ({ id: redactor.redactString(pack.id), needs: handoffNeeds(pack) }));
+  const needs = importedPacks.flatMap((pack) => pack.needs);
+  return { imported_packs: importedPacks, next_steps: needs.length ? handoffFillSteps(needs) : [] };
+}
+
+function cmdImport(flags) {
+  if (flags.manifest !== undefined) throw new Error('Use --handoff with grow-loop import.');
+  const file = requireText(flags.handoff, 'handoff');
+  const reason = requireText(flags.reason, 'reason');
+  const ctx = loadWorkspace(flags.repo, flags['state-dir']);
+  const existingIds = new Set(ctx.state.pack_order);
+  for (const pack of Object.values(ctx.state.packs)) {
+    if (pack.status === 'COMMITTED') existingIds.add(pack.id);
+  }
+  const imported = readHandoff(path.resolve(file), existingIds);
+  const summary = summarizeHandoff(imported.packs, ctx.config);
+  const duplicateIndex = imported.packs.findIndex(({ id }) => Object.hasOwn(ctx.state.packs, id));
+  if (duplicateIndex !== -1) {
+    throw new Error(`Pack ${summary.imported_packs[duplicateIndex].id} already exists.`);
+  }
+  const manifest = { ...ctx.manifest, packs: [...ctx.manifest.packs, ...imported.packs] };
+  writeManifestWithReason(ctx, manifest, reason, 'handoff_import');
+  outJson({ ok: true, ...summary, next_steps: [...summary.next_steps, 'Run: grow-loop next'] });
 }
 
 async function cmdProbe(flags) {
@@ -222,8 +259,10 @@ async function cmdProbe(flags) {
 function cmdStatus(flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir'], { allowPendingManifest: true });
   const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
+  const packDefs = new Map(ctx.manifest.packs.map((pack) => [pack.id, pack]));
   const summary = ctx.state.pack_order.map((id) => {
     const p = ctx.state.packs[id];
+    const needs = handoffNeeds(packDefs.get(id));
     return {
       id: p.id,
       title: p.title,
@@ -235,7 +274,8 @@ function cmdStatus(flags) {
       infra_failures: p.infra_failures,
       inflight_run: redactor.redactValue(p.inflight_run ?? null),
       commit: p.commit?.sha?.slice(0, 9) || null,
-      gate: p.gate?.reason || null
+      gate: p.gate?.reason || null,
+      ...(needs.length && { needs })
     };
   });
   outJson({
@@ -607,6 +647,7 @@ async function cmdDispatch(flags) {
   if (!pack || !packDef) throw new Error(`Pack "${packId}" not found`);
   if (pack.status === 'COMMITTED') throw new Error(`Pack ${packId} is already committed.`);
   if (ctx.state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
+  requireHandoffPreflight(pack, packDef);
 
   const stage = String(flags.stage || (pack.status === 'REVIEW' ? 'review' : 'implement')).toLowerCase();
   if (!['review', 'implement'].includes(stage)) throw new Error('Use --stage implement or review.');
@@ -944,6 +985,7 @@ async function main() {
 
   try {
     if (cmd === 'init') cmdInit(flags);
+    else if (cmd === 'import') cmdImport(flags);
     else if (cmd === 'probe') await cmdProbe(flags);
     else if (cmd === 'status') cmdStatus(flags);
     else if (cmd === 'manifest-ack') cmdManifestAck(flags);

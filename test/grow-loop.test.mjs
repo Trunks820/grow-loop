@@ -250,6 +250,156 @@ test('init --force --manifest replaces a pending manifest and resets the workspa
   }
 });
 
+test('init --handoff preserves plan order and gates preflight until required fields are acknowledged', () => {
+  const repoDir = makeTempDir('grow-loop-handoff-init-');
+  const cli = (...args) => runCli(args, repoDir);
+  const fail = (...args) => runCliFailure(args, repoDir);
+  const sourceFile = 'task.manifest.json';
+  const first = {
+    id: 'W9', title: 'First package', goal: 'Prepare the changes', depends_on: [],
+    acceptance_criteria: ['AC-15 · Checklist is complete'],
+    open_questions: ['Which fixture should be migrated?'],
+    external_effects: ['Replace the fixture data'],
+    scope_files: [], tags: []
+  };
+  const second = {
+    id: 'W2', title: 'Second package', goal: 'Verify the changes', depends_on: ['W9'],
+    acceptance_criteria: [], open_questions: [], external_effects: [],
+    scope_files: ['src/verify.mjs'], tags: ['verification']
+  };
+  const source = { project: 'test-project', upstream_source: 'test-plan', packs: [first, second] };
+  const needs = ['scope_files', 'risk', 'tags'];
+  try {
+    writeJsonAtomic(path.join(repoDir, sourceFile), source);
+    assert.match(fail('init', '--manifest', sourceFile, '--handoff', sourceFile).stderr, /Specify exactly one/);
+    const init = cli('init', '--handoff', sourceFile);
+    assert.deepEqual(init.imported_packs, [{ id: 'W9', needs }, { id: 'W2', needs: ['risk'] }]);
+    assert.ok(init.next_steps.some((step) => step.includes('manifest-ack')));
+    const paths = getStatePaths(init.state_dir);
+    const manifest = readJsonSafe(paths.manifestPath);
+    assert.deepEqual(manifest, {
+      ...source,
+      packs: [
+        { ...first, upstream_ref: 'test-plan#W9', handoff: { source: 'test-plan', needs } },
+        { ...second, upstream_ref: 'test-plan#W2', handoff: { source: 'test-plan', needs: ['risk'] } }
+      ]
+    });
+    assert.deepEqual(cli('status').packs.map(({ id, needs }) => ({ id, needs })), init.imported_packs);
+    const state = readJsonSafe(paths.statePath);
+    assert.equal(state.packs.W9.status, 'PENDING');
+    const fill = cli('next');
+    assert.equal(fill.action, 'NEEDS_FILL');
+    assert.equal(fill.pack_id, 'W9');
+    assert.deepEqual(fill.needs, needs);
+    assert.ok(fill.next_steps.some((step) => step.includes('pack scope')));
+    assert.match(fail('dispatch', '--dry-run').stderr, /finish handoff preflight/);
+    assert.match(fail('record', 'implement', '--passed').stderr, /finish handoff preflight/);
+    assert.deepEqual(readJsonSafe(paths.statePath), state);
+    assert.ok(!readEvents(paths.eventsPath).some(({ type }) => type === 'preflight_evaluated'));
+
+    cli('pack', 'scope', '--id', 'W9', '--add', 'src/fixture.mjs', '--reason', 'Fixture scope');
+    assert.deepEqual(cli('next').needs, ['risk', 'tags']);
+    const partial = readJsonSafe(paths.manifestPath);
+    Object.assign(partial.packs[0], { risk: 'unknown', tags: ['fixtures'] });
+    writeJsonAtomic(paths.manifestPath, partial);
+    assert.equal(JSON.parse(fail('next').stdout).error, 'manifest_changed');
+    cli('manifest-ack', '--reason', 'Classify the work');
+    assert.deepEqual(cli('next').needs, ['risk']);
+    partial.packs[0].risk = 'high';
+    writeJsonAtomic(paths.manifestPath, partial);
+    cli('manifest-ack', '--reason', 'Confirm risk');
+
+    const ambiguity = cli('next');
+    assert.equal(ambiguity.gate.reason, ALLOWED_GATE_REASONS.AMBIGUITY);
+    assert.deepEqual(ambiguity.gate.questions, first.open_questions);
+    assert.deepEqual(readJsonSafe(paths.manifestPath).packs[0].handoff.needs, []);
+    assert.equal(cli('status').packs[0].needs, undefined);
+    assert.equal(cli('status').manifest_change_pending, undefined);
+    assert.match(fail('dispatch', '--dry-run').stderr, /finish handoff preflight/);
+    const effect = cli('resume', '--decision', 'Use the test fixture', '--action', 'approve').next;
+    assert.equal(effect.gate.reason, ALLOWED_GATE_REASONS.EXTERNAL_EFFECT);
+    assert.deepEqual(effect.gate.questions, first.external_effects);
+    const implementation = cli('resume', '--decision', 'Approve replacing the fixture', '--action', 'approve').next;
+    assert.equal(implementation.action, 'IMPLEMENT');
+    assert.equal(implementation.tier, 'tier2');
+    assert.ok(implementation.warnings.some((warning) => warning.includes('避坑提示')));
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('import --handoff audits appends and init --force --handoff shares the replacement rules', () => {
+  const repoDir = makeTempDir('grow-loop-handoff-import-');
+  const cli = (...args) => runCli(args, repoDir);
+  const fail = (...args) => runCliFailure(args, repoDir);
+  const file = 'handoff.json';
+  const filePath = path.join(repoDir, file);
+  const importedPack = {
+    id: 'W8', title: 'Review the fixture', goal: 'Review the result', depends_on: ['LOCAL'],
+    acceptance_criteria: ['Fixture checks pass'], open_questions: [], external_effects: [],
+    scope_files: ['src/fixture.mjs'], tags: ['fixtures']
+  };
+  const report = {
+    valid: true, errors: [], requirements: [], criteria: [], work_entries: [],
+    revision: 4, limits: {}, packs: [importedPack]
+  };
+  try {
+    writeJsonAtomic(path.join(repoDir, 'local.json'), { project: 'local', packs: [{ id: 'LOCAL' }] });
+    const { state_dir } = cli('init', '--manifest', 'local.json');
+    const paths = getStatePaths(state_dir);
+    const append = ['import', '--handoff', file, '--reason', 'Append planned review'];
+    assert.match(fail('import', '--handoff', file).stderr, /non-empty --reason/);
+    assert.match(fail('init', '--handoff', file).stderr, /init --force --handoff/);
+
+    writeJsonAtomic(filePath, { ...report, valid: false, errors: ['Missing goal', 'Missing criterion'] });
+    assert.match(fail(...append).stderr, /Missing goal[\s\S]*Missing criterion/);
+    writeJsonAtomic(filePath, { ...report, errors: ['Invalid dependency'] });
+    assert.match(fail(...append).stderr, /Invalid dependency/);
+    writeJsonAtomic(filePath, { ...report, packs: [{ ...importedPack, depends_on: ['UNKNOWN'] }] });
+    assert.match(fail(...append).stderr, /depends on unknown pack UNKNOWN/);
+    assert.deepEqual(cli('status').packs.map(({ id }) => id), ['LOCAL']);
+
+    writeJsonAtomic(filePath, report);
+    assert.deepEqual(cli(...append).imported_packs, [{ id: 'W8', needs: ['risk'] }]);
+    assert.match(fail(...append).stderr, /Pack W8 already exists/);
+    const manifest = readJsonSafe(paths.manifestPath);
+    assert.equal(manifest.project, 'local');
+    assert.deepEqual(manifest.packs.map(({ id }) => id), ['LOCAL', 'W8']);
+    assert.deepEqual(manifest.packs[1], {
+      ...importedPack, upstream_ref: 'handoff.json (revision 4)#W8',
+      handoff: { source: 'handoff.json (revision 4)', needs: ['risk'] }
+    });
+    assert.deepEqual(readJsonSafe(paths.manifestSnapshotPath), manifest);
+    const writes = readEvents(paths.eventsPath).filter(({ type }) => type === 'manifest_changed');
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].reason, 'Append planned review');
+    assert.equal(writes[0].source, 'handoff_import');
+    assert.deepEqual(writes[0].changes.added_packs, ['W8']);
+    assert.equal(cli('next').action, 'IMPLEMENT');
+
+    manifest.packs[0].title = 'Pending edit';
+    writeJsonAtomic(paths.manifestPath, manifest);
+    assert.equal(JSON.parse(fail(...append).stdout).error, 'manifest_changed');
+    assert.equal(JSON.parse(fail('init', '--handoff', file).stdout).replace_command, 'grow-loop init --force --handoff <file>');
+    assert.match(fail('init', '--force', '--handoff', file).stderr, /depends on unknown pack LOCAL/);
+    assert.deepEqual(readJsonSafe(paths.manifestPath), manifest);
+
+    writeJsonAtomic(filePath, { ...report, packs: [{ ...importedPack, depends_on: [] }] });
+    cli('init', '--force', '--handoff', file, '--profile', 'live-smoke');
+    const replacement = readJsonSafe(paths.manifestPath);
+    assert.equal(replacement.project, 'handoff');
+    assert.equal(replacement.upstream_source, 'handoff.json (revision 4)');
+    assert.deepEqual(replacement.packs.map(({ id }) => id), ['W8']);
+    assert.deepEqual(readJsonSafe(paths.manifestSnapshotPath), replacement);
+    const status = cli('status');
+    assert.equal(status.profile, 'live-smoke');
+    assert.equal(status.active_pack_id, 'W8');
+    assert.equal(status.manifest_change_pending, undefined);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('the confirmed manifest replaces a removed active pack, preserves history, and reopens a completed loop', () => {
   const repoDir = makeTempDir('grow-loop-manifest-sync-');
   try {

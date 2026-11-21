@@ -47,8 +47,12 @@ You **MUST STOP** and ask the human before any of these actions:
 Follow this exact deterministic loop for every work package (`W01`, `W02`, ...):
 
 ### Step 0: Initialize (Once per project/worktree)
-1. For a new workspace, prepare a JSON manifest from the upstream task list, PRD, or issues. Follow the format in `docs/UPSTREAM-BRIDGE.md`.
+1. For a new workspace, use the `task.manifest.json` saved by `grow-me` or prepare a grow-loop JSON manifest from the task list, PRD, or issues. For an `ai-dev-workflow` HTML plan, use grow-me to produce JSON first. [Upstream Bridge](docs/UPSTREAM-BRIDGE.md)
 2. Pick the profile and import the manifest during initialization.
+   - **grow-me handoff** (choose `--handoff` or `--manifest`):
+     ```bash
+     node <GROW_LOOP_BIN> init --repo <repo> --profile standard-test --handoff task.manifest.json
+     ```
    - **`standard-test`** (regular repo with unit/integration tests):
      ```bash
      node <GROW_LOOP_BIN> init --repo <repo> --profile standard-test --manifest <file>
@@ -67,9 +71,9 @@ Follow this exact deterministic loop for every work package (`W01`, `W02`, ...):
 
 ### Step 1: Ask the State Machine What to Do Next
 
-Use the commands in [中途改动](README.md#中途改动) to insert a pack, change its tier, expand its scope, forward findings, or manage out-of-scope todos. Edit the manifest and run `manifest-ack` when changing a goal or acceptance criteria.
+Use `import --handoff <file> --reason "<reason>"` to append a handoff to the existing workspace. Use the mid-loop commands to insert a pack, change its tier, expand its scope, forward findings, or manage out-of-scope todos. Edit the manifest and run `manifest-ack` when changing a goal or acceptance criteria. [中途改动](README.md#中途改动)
 
-After a manual edit to `manifest.json`, `status` shows the pending diff and commands such as `next` pause. Review the diff and run `grow-loop manifest-ack --reason "<one sentence>"` with the same workspace options. The CLI records the reason in `events.jsonl` and updates `manifest.snapshot.json` in the state directory. `init --force --manifest <file>` explicitly replaces the whole manifest and resets workspace configuration and state, even when edits are pending.
+After a manual edit to `manifest.json`, `status` shows the pending diff and commands such as `next` pause. Review the diff and run `grow-loop manifest-ack --reason "<one sentence>"` with the same workspace options. The CLI records the reason in `events.jsonl` and updates `manifest.snapshot.json` in the state directory. To replace the entire manifest and reset workspace configuration and state, use `init --force` with `--manifest <file>` or `--handoff <file>`, even when edits are pending.
 
 ```bash
 node <GROW_LOOP_BIN> next --repo <repo>
@@ -78,6 +82,7 @@ node <GROW_LOOP_BIN> next --repo <repo>
 
 | Returned `action` | What Coordinator Must Do |
 |---|---|
+| `NEEDS_FILL` | Complete the listed handoff fields before dispatch. Add files with `pack scope` or edit `manifest.json` to fill `scope_files`, `risk`, or `tags`. Acknowledge manual edits with `manifest-ack`, then rerun `next`. |
 | `PAUSE_FOR_HUMAN` | **STOP the loop immediately.** Present `gate.reason`, `gate.summary`, `gate.questions` (if any), and the exact `resume_hint` options to the user. For `EXTERNAL_COMMIT`, include the listed commits and conflicting paths. Wait for human input, then call `grow-loop resume --decision "..." --action <...>`. |
 | `IMPLEMENT` | Execute implementation on the assigned `tier` & `instance` (see Step 2). |
 | `VERIFY` | Run `grow-loop verify`. The CLI runs global `verification.commands` followed by the pack's `verify_commands` and records the outcome from exit codes. **Verify ALWAYS runs before Review.** |

@@ -1,6 +1,7 @@
 import path from 'node:path';
-import { appendEvent, invalidateSession, readJsonSafe, rememberSession, saveState } from './state.mjs';
+import { appendEvent, invalidateSession, readJsonSafe, rememberSession, saveState, writeManifestWithReason } from './state.mjs';
 import { buildRedactor } from './redact.mjs';
+import { handoffFillSteps, handoffNeeds } from './handoff.mjs';
 import { taskBriefWarnings } from './task-builder.mjs';
 import { getVerificationCommands } from './verify.mjs';
 import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
@@ -8,6 +9,12 @@ import { addLesson, closeLessonsForPack, deferInRoundTechDebt, recordReviewTechD
 import { getBlockingReviewSeverities } from './review-report.mjs';
 import { checkExternalCommits, readCommitFiles, readGitPosition, scanStrayFiles } from './git-watch.mjs';
 import { writeRunResult } from './adapters/base.mjs';
+
+const PREFLIGHT_GATE_REASONS = new Set([
+  ALLOWED_GATE_REASONS.BLAST_RADIUS_SPLIT,
+  ALLOWED_GATE_REASONS.AMBIGUITY,
+  ALLOWED_GATE_REASONS.EXTERNAL_EFFECT
+]);
 
 export function getBudgets(config) {
   return {
@@ -38,6 +45,12 @@ export function resolveTierInstance(config, tier) {
 
 export function getPackDef(manifest, packId) {
   return (manifest.packs || []).find((p) => p.id === packId) || null;
+}
+
+export function requireHandoffPreflight(pack, packDef) {
+  if (packDef?.handoff && (pack.status === 'PENDING' || PREFLIGHT_GATE_REASONS.has(pack.gate?.reason))) {
+    throw new Error('Run "grow-loop next" and follow its directive to finish handoff preflight.');
+  }
 }
 
 export function evaluateBlastRadius(config, packDef, packState = null) {
@@ -107,12 +120,28 @@ export function startOrAdvanceActivePack(ctx) {
 
   state.active_pack_id = activeId;
   const pack = state.packs[activeId];
-  const packDef = getPackDef(manifest, activeId);
+  let packDef = getPackDef(manifest, activeId);
   if (!packDef) {
     throw new Error(`Active pack "${activeId}" missing from manifest.json`);
   }
 
   if (pack.status === 'PENDING') {
+    const needs = handoffNeeds(packDef);
+    if (needs.length) {
+      return {
+        action: 'NEEDS_FILL',
+        pack_id: activeId,
+        needs,
+        next_steps: [...handoffFillSteps(needs), 'Run: grow-loop next'],
+        warnings: taskBriefWarnings(packDef, config)
+      };
+    }
+    if (packDef.handoff?.needs?.length) {
+      packDef = { ...packDef, handoff: { ...packDef.handoff, needs: [] } };
+      const packs = manifest.packs.map((entry) => entry.id === activeId ? packDef : entry);
+      writeManifestWithReason(ctx, { ...manifest, packs }, 'Required handoff fields are complete.', 'handoff_filled');
+    }
+
     const deps = checkDependencies(state, packDef);
     if (!deps.satisfied) {
       return {
@@ -434,11 +463,12 @@ function stateFor(ctx) {
   return ctx.state;
 }
 
-function getWritablePack(state, packId) {
+function getWritablePack({ state, manifest }, packId) {
   const pack = state.packs[packId || state.active_pack_id];
   if (!pack) throw new Error('No active pack found');
   if (pack.status === 'COMMITTED') throw new Error(`Pack ${pack.id} is already committed.`);
   if (state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
+  requireHandoffPreflight(pack, getPackDef(manifest, pack.id));
   return pack;
 }
 
@@ -476,7 +506,7 @@ function completeSelfRun(ctx, pack, stage, payload, status, instance) {
 
 export function recordImplementOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
-  const pack = getWritablePack(state, payload.packId);
+  const pack = getWritablePack(ctx, payload.packId);
   if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
     return buildNextDirective(ctx, pack, getPackDef(ctx.manifest, pack.id));
   }
@@ -569,7 +599,7 @@ const verifyRepairFields = [
 export function markVerificationEnvironment(ctx, packId, reason) {
   const { stateDir, config, paths } = ctx;
   const state = ctx.state = readJsonSafe(paths.statePath);
-  const pack = getWritablePack(state, packId);
+  const pack = getWritablePack(ctx, packId);
   const lastVerify = pack.last_verify;
   const undo = lastVerify?.repair_undo;
   const repairPending = pack.status === 'IMPLEMENT'
@@ -600,7 +630,7 @@ export function recordVerifyOutcome(ctx, payload) {
   // CLI verification runs commands asynchronously and reports into the latest state.
   if (payload.source === 'cli') ctx.state = readJsonSafe(ctx.paths.statePath);
   const { stateDir, config, state } = ctx;
-  const pack = getWritablePack(state, payload.packId);
+  const pack = getWritablePack(ctx, payload.packId);
   const budgets = getBudgets(config);
   if (payload.source === 'cli' && 'previousVerifyAt' in payload
       && (pack.status !== 'VERIFY' || state.loop_status === 'ABORTED'
@@ -702,7 +732,7 @@ export function recordVerifyOutcome(ctx, payload) {
 
 export function recordReviewOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
-  const pack = getWritablePack(state, payload.packId);
+  const pack = getWritablePack(ctx, payload.packId);
   if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
     return buildNextDirective(ctx, pack, getPackDef(ctx.manifest, pack.id));
   }
@@ -858,7 +888,7 @@ export function recordReviewOutcome(ctx, payload) {
 
 export function recordCommitOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
-  const pack = getWritablePack(state, payload.packId);
+  const pack = getWritablePack(ctx, payload.packId);
   const packDef = getPackDef(ctx.manifest, pack.id);
   const gitWatch = checkExternalCommits(ctx, pack, packDef, payload.sha);
   if (gitWatch?.status === 'blocked') return buildNextDirective(ctx, pack, packDef);
@@ -1027,12 +1057,7 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   }
 
   // If resuming a preflight gate, re-check any remaining preflight gates (AMBIGUITY / EXTERNAL_EFFECT)
-  const preflightGateReasons = new Set([
-    ALLOWED_GATE_REASONS.BLAST_RADIUS_SPLIT,
-    ALLOWED_GATE_REASONS.AMBIGUITY,
-    ALLOWED_GATE_REASONS.EXTERNAL_EFFECT
-  ]);
-  if (prevGate?.reason && preflightGateReasons.has(prevGate.reason) && packDef) {
+  if (PREFLIGHT_GATE_REASONS.has(prevGate?.reason) && packDef) {
     pack.status = 'PENDING';
     saveState(stateDir, state);
     const nextDirective = startOrAdvanceActivePack(ctx);

@@ -59,7 +59,7 @@ export function readJsonSafe(filePath, fallback = null) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
 }
 
-function validateManifest(manifest) {
+export function validateManifest(manifest) {
   if (!Array.isArray(manifest?.packs)) {
     throw new Error('Manifest must be a JSON object with a packs array.');
   }
