@@ -28,6 +28,12 @@
         "AC-W01-02: Existing repository queries pass regression checks"
       ],
       "open_questions": [],
+      "pitfalls": ["Use explicit column lists in `itemRepo.js` queries."],
+      "co_change_files": ["src/repo/itemRepo.js"],
+      "preserve_behaviors": ["Existing queries still return records in creation order."],
+      "decisions": [
+        { "question": "Can existing query callers change?", "decision": "Keep the current DAO signatures.", "at": null }
+      ],
       "external_effects": [],
       "tags": ["db", "repo"]
     },
@@ -67,6 +73,10 @@
 | `cross_module` | No | `true` auto-starts at `tier2` (configurable via `blast_radius.escalate_tier2_cross_module`). |
 | `tier` | No | `"tier1"` or `"tier2"`. Takes priority over automatic tier selection at preflight. The split and approval gates still apply. Use `pack tier` for in-progress changes. |
 | `scope_files` | No | Explicit file allowlist / expected touchpoints injected into `task.md`. Also used as lower bound for `estimated_files`. |
+| `pitfalls` | No | Array of string warnings that name specific code using backticks, file paths, or identifiers such as `itemRepo.findById` or `findById()`. |
+| `co_change_files` | No | Array of repo-relative file paths that the coordinator expects to change together. Keep authorized files in `scope_files`. |
+| `preserve_behaviors` | No | Array of strings describing existing behavior. Included in implementation, repair, and both review rounds. |
+| `decisions` | No | Array of objects with `question`, verbatim `decision`, and an optional `at` timestamp (ISO 8601 or `null`). Task briefs include these alongside package questions and recorded gate decisions. |
 | `forwarded_findings` | No | Findings added by `forward`. Each entry has `from_pack_id`, `content`, `reason`, and `at` (ISO 8601 timestamp). They appear in initial and repair implementation prompts. |
 | `acceptance_criteria` | No | Observable verification criteria injected into `task.md` and checked during `VERIFY`/`REVIEW`. |
 | `open_questions` | No | Non-empty array triggers `PAUSED_FOR_HUMAN` (`AMBIGUITY`) before `IMPLEMENT`. |
@@ -84,6 +94,8 @@ When your upstream workflow produces a requirement spec, task breakdown (`开发
 3. **Copy observable test case IDs** (e.g., `TC-001` / `AC-W01-01`) into `acceptance_criteria`.
 4. **Keep unresolved decisions in `open_questions`** instead of letting the coding agent guess — `grow-loop` will automatically pause at `AMBIGUITY` right before that pack begins.
 5. After manually editing the workspace's `manifest.json`, review the diff with `grow-loop status` and run `grow-loop manifest-ack --reason "<one sentence>"`. Commands such as `next` pause until the edit is acknowledged. The CLI records the diff and reason as `manifest_changed` in `events.jsonl`, updates `manifest.snapshot.json` in the state directory, and syncs the pack order and active pack. Committed and removed pack records are retained. To replace the entire manifest and reset workspace configuration and state, use `grow-loop init --force --manifest <file>`.
+
+Before dispatch, read the relevant code and fill in the three arrays. Copy settled decisions from the plan verbatim. `next` and `dispatch` (including dry-runs) report empty arrays and pitfalls that lack a named code reference in `warnings`. Dispatch can proceed with these warnings.
 
 The snapshot is created during initialization. A workspace from an older version takes its current manifest as the baseline on the first command. The comparison uses parsed JSON and reports changes to pack membership, the relative order of retained packs, and field values. Use the CLI to update loop state.
 

@@ -33,6 +33,7 @@ export function getStatePaths(stateDir) {
     techDebtMdPath: path.join(stateDir, 'tech-debt.md'),
     probeCachePath: path.join(stateDir, 'probe-cache.json'),
     runsDir: path.join(stateDir, 'runs'),
+    artifactsDir: path.join(stateDir, 'artifacts'),
     evidenceMdPath: path.join(stateDir, 'evidence.md')
   };
 }

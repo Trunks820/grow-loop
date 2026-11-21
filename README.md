@@ -128,6 +128,14 @@ grow-loop resume --decision "已确认走单选，批准继续" --action approve
 grow-loop evidence
 ```
 
+## 任务书
+
+初次实现和修复任务书依次列出「避坑提示」「要一起改的文件」「要保住的旧行为」「已经定了的」「可能要一起改的文件」「转来的发现」「产物放哪」。前三栏由指挥的人读代码后填写。任一栏为空或避坑提示未点名代码时，`next` 和 `dispatch`（含 `--dry-run`）会给出提醒，派活照常。
+
+「已经定了的」保留方案与门禁决定的原话，有冲突时以原话为准。两轮审查都会带上这一节和「要保住的旧行为」，复审沿用上一轮问题的收尾范围。引用候选由 `git grep` 扫出并附命中词，须由指挥的人确认。
+
+派活前会创建 `<状态目录>/artifacts/<包ID>/`，任务书会给出报告、截图和草稿的保存位置。产物需放在工作树之外时，初始化并派活时使用外置 `--state-dir`。
+
 ## 中途改动
 
 ```bash
@@ -146,7 +154,7 @@ grow-loop todo dismiss --todo T003 --reason "已确认现有重试覆盖该场�
 - `pack tier` 为待开工包指定开工时采用的档位，拆包等门禁照常生效。已开工包的改档从下次派活起生效。更换执行实例时会清除旧会话，已用的修复次数照计。
 - `pack scope` 去重后扩充 `scope_files`，并把 `estimated_files` 至少提高到范围文件数。可以用逗号分隔文件，也可以重复传 `--add`。修改后的范围会出现在下次生成的实现任务书里。附带 `--todo` 会把该待办标为 `expanded`。
 - `forward` 接受一段文字或一条 open 待办。文字默认来自当前包，可用 `--from` 指定来源包。转待办时沿用它的来源并标为 `forwarded`。目标包的初次实现和修复任务书会列出转来的发现、来源与原因。
-- Codex 实现派活结束后，最终回复中 `## 超范围没改` 下的 `- 位置：说明` 会转成 open 待办。自己执行时用 `todo add` 记录。`todo list` 显示全部待办，`status` 的 `open_todos` 显示待处理项。
+- Codex 实现派活结束后，标题含「超范围没改」的节中，具体列表项会转成 open 待办。有这一节却未解析出待办时，派活结果会提醒。自己执行时用 `todo add` 记录。`todo list` 显示全部待办，`status` 的 `open_todos` 显示待处理项。
 
 写入类命令都需要非空 `--reason`。改清单的命令更新快照，并在 `events.jsonl` 写入 `manifest_changed`，其 `source` 分别为 `pack_insert`、`pack_tier`、`pack_scope`、`forward`。自动及手动新增待办写入 `todo_added`，关闭写入 `todo_dismissed`。修改包目标或验收时，先手改状态目录的 `manifest.json`，再用 `grow-loop manifest-ack --reason "说明为什么改"` 确认，由 `manifest_changed` 记录差异和原因。各命令可沿用工作区的 `--repo` 和 `--state-dir`。
 
@@ -169,7 +177,8 @@ grow-loop/
 │   ├── gate.mjs              # 人工刹车门与 Approval Envelope
 │   ├── lessons.mjs           # 结构化错题本（lessons.json / lessons.md / tech-debt.md）与跨包注入
 │   ├── probe.mjs             # 带超时只读能力探活 + 可选 code_intel 探测
-│   ├── task-builder.mjs      # 生成带错题/阻塞项/单测红线的受控 task.md
+│   ├── task-builder.mjs      # 生成实现、修复和审查任务书 task.md
+│   ├── ref-scan.mjs          # 用 git grep 查找可能需要联改的文件
 │   ├── verify.mjs            # CLI 亲自执行验证命令、按退出码判定并留存日志
 │   ├── redact.mjs            # 凭据/Token/内网 IP 脱敏与残留扫描引擎
 │   ├── evidence.mjs          # 双层脱敏验收证据包生成器（人读总表 + 6 类证据）

@@ -550,11 +550,16 @@ test('running Codex dispatch keeps its task and route while final markdown produ
   const ready = path.join(repoDir, 'executor-ready');
   const release = path.join(repoDir, 'executor-release');
   const mock = path.join(repoDir, 'mock-codex.cjs');
+  const finalPath = path.join(repoDir, 'mock-response.md');
   const final = [
     '## Summary', '- Other: ignore this', '```md', '## 超范围没改', '- Fenced: ignore this', '```',
-    '## 超范围没改', '- src/out.mjs：抽取共享校验', '', '无效行', '- 未说明：', '- src/another.mjs: 补异常处理'
+    '### 超范围没改', '- src/out.mjs：抽取共享校验', '', '无效行', '- 未说明：',
+    '## 超范围没改（2 项）', '1. 补异常处理', '* src/another.mjs: 补异常处理', '- [ ] 暂无。',
+    '## Other', '- Outside: ignore this',
+    '超范围没改的补充', '---', '- 记录跨包依赖', '- **没有**'
   ].join('\r\n');
   try {
+    fs.writeFileSync(finalPath, final, 'utf8');
     fs.writeFileSync(mock, `
       const fs = require('node:fs');
       const args = process.argv.slice(2);
@@ -563,7 +568,7 @@ test('running Codex dispatch keeps its task and route while final markdown produ
       const timer = setInterval(() => {
         if (!fs.existsSync(${JSON.stringify(release)})) return;
         clearInterval(timer);
-        fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], ${JSON.stringify(final)});
+        fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], fs.readFileSync(${JSON.stringify(finalPath)}, 'utf8'));
         console.log(JSON.stringify({ thread_id: 'old-executor-session' }));
       }, 25);
     `);
@@ -588,6 +593,7 @@ test('running Codex dispatch keeps its task and route while final markdown produ
     }
     const run = JSON.parse((await running).stdout);
     assert.equal(run.transition.outcome, 'ready_for_verify');
+    assert.equal(run.warnings.length, 3);
     const task = fs.readFileSync(path.join(run.run_dir, 'task.md'), 'utf8');
     assert.match(task, /REPAIR \(tier1 attempt 1\)/);
     assert.match(task, /`## 超范围没改`.*`- 位置：说明`/);
@@ -604,7 +610,8 @@ test('running Codex dispatch keeps its task and route while final markdown produ
     const todos = cli('status').open_todos;
     assert.deepEqual(todos.map(({ pack_id, run_id, content, status }) => [pack_id, run_id, content, status]), [
       ['A', null, '独立待办', 'open'], ['A', run.run_id, 'src/out.mjs：抽取共享校验', 'open'],
-      ['A', run.run_id, 'src/another.mjs: 补异常处理', 'open']
+      ['A', run.run_id, '未说明：', 'open'], ['A', run.run_id, '补异常处理', 'open'],
+      ['A', run.run_id, 'src/another.mjs: 补异常处理', 'open'], ['A', run.run_id, '记录跨包依赖', 'open']
     ]);
     const completed = readEvents(ctx.paths.eventsPath).find(({ type }) => type === 'implement_completed');
     assert.equal(completed.instance, 'tier1-cli');
@@ -624,6 +631,13 @@ test('running Codex dispatch keeps its task and route while final markdown produ
     cli('pack', 'tier', '--id', 'A', '--tier', 'tier1', '--reason', '复核原档位');
     assert.equal(cli('record', 'implement', '--failed').outcome, 'paused_budget_exceeded');
     assert.equal(cli('status').packs[0].repairs, '2/2');
+
+    cli('resume', '--action', 'retry');
+    fs.writeFileSync(finalPath, '### 超范围没改（0 项）\n- 无\n- 没有\n- 暂无。', 'utf8');
+    const emptyReport = cli('dispatch');
+    assert.equal(emptyReport.transition.outcome, 'ready_for_verify');
+    assert.ok(emptyReport.warnings.some((warning) => warning.includes('未解析出待办')));
+    assert.deepEqual(cli('status').open_todos, todos);
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
@@ -962,6 +976,176 @@ test('review severity floor overrides fail on MEDIUM/LOW only, and 2-round revie
     assert.equal(c.ctx.state.packs.W01.gate.reason, ALLOWED_GATE_REASONS.REVIEW_CAP_REACHED);
   } finally {
     fs.rmSync(c.repoDir, { recursive: true, force: true });
+  }
+});
+
+test('dispatch previews warn about incomplete briefs, scan references and create the external artifact directory', () => {
+  const root = makeTempDir('grow-loop-brief-');
+  const repoDir = path.join(root, 'repo');
+  const stateDir = path.join(root, 'state');
+  const paths = getStatePaths(stateDir);
+  const cli = (...args) => runCli([...args, '--state-dir', stateDir], repoDir);
+  try {
+    fs.mkdirSync(path.join(repoDir, 'src', 'a'), { recursive: true });
+    const pack = { id: 'W3', scope_files: ['src\\a\\b.py', 'src/*.mjs', 'src/missing.ts'] };
+    const manifestPath = path.join(root, 'delivery.json');
+    writeJsonAtomic(manifestPath, { packs: [pack] });
+    cli('init', '--manifest', manifestPath);
+    const next = cli('next');
+    assert.equal(next.action, 'IMPLEMENT');
+    assert.equal(next.warnings.length, 3);
+
+    const initial = cli('dispatch', '--dry-run');
+    const task = fs.readFileSync(path.join(initial.run_dir, 'task.md'), 'utf8');
+    assert.deepEqual(initial.warnings, next.warnings);
+    const headings = ['避坑提示', '要一起改的文件', '要保住的旧行为', '已经定了的', '可能要一起改的文件', '转来的发现', '产物放哪'];
+    assert.deepEqual([...task.matchAll(/^## (.+)$/gm)].map((match) => match[1]).filter((heading) => headings.includes(heading)), headings);
+    assert.match(task, /没扫（当前目录不是 Git 仓库）/);
+    const artifactsDir = path.join(paths.artifactsDir, 'W3');
+    assert.ok(fs.statSync(artifactsDir).isDirectory());
+    assert.ok(task.includes(artifactsDir.replace(/\\/g, '/') + '/'));
+    assert.match(task, /报告、截图和草稿.*仓库/);
+
+    execFileSync('git', ['init'], { cwd: repoDir, stdio: 'ignore' });
+    const files = {
+      'src/a/b.py': 'b.py',
+      'src/scoped.mjs': 'b.py',
+      'together.mjs': 'b.py',
+      'uses-file.md': 'See b.py',
+      'uses-module.txt': 'import src.a.b',
+      'uses-function.js': 'renderWidget(); preserve_widget();',
+      'unrelated.js': 'renderWidgetExtra();'
+    };
+    for (const [file, content] of Object.entries(files)) fs.writeFileSync(path.join(repoDir, file), content);
+    Object.assign(pack, {
+      pitfalls: [
+        '跟现有规则一致', '检查 renderWidget()', '核对 preserve_widget', '参见 `together.mjs`',
+        '复用 src/together-file.mjs', '沿用 foo.bar'
+      ],
+      co_change_files: ['together.mjs'],
+      preserve_behaviors: ['旧调用保持顺序']
+    });
+    writeJsonAtomic(paths.manifestPath, { packs: [pack] });
+    cli('manifest-ack', '--reason', '确认任务书三栏');
+    // Dispatch recreates the directory if it has been removed since the preview.
+    fs.rmdirSync(artifactsDir);
+    const second = cli('dispatch', '--dry-run');
+    assert.deepEqual(second.warnings, ['第 1 条避坑提示未点名代码：跟现有规则一致']);
+    assert.deepEqual(cli('next').warnings, second.warnings);
+    assert.ok(fs.statSync(artifactsDir).isDirectory());
+    const updated = fs.readFileSync(path.join(second.run_dir, 'task.md'), 'utf8');
+    const candidates = updated.split('## 可能要一起改的文件')[1].split('## 转来的发现')[0];
+    assert.match(candidates, /可能要一起改，请确认/);
+    assert.match(candidates, /uses-file\.md.*命中 `b\.py`/);
+    assert.match(candidates, /uses-module\.txt.*命中 `src\.a\.b`/);
+    assert.match(candidates, /uses-function\.js.*命中 `renderWidget`/);
+    assert.doesNotMatch(candidates, /together\.mjs|scoped\.mjs|src\/a\/b\.py|unrelated\.js/);
+    const live = cli('dispatch', '--instance', 'self');
+    assert.equal(live.result.status, 'host_action_required');
+    assert.deepEqual(live.warnings, second.warnings);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('initial, repair and review briefs keep verbatim decisions after an audited acceptance change', () => {
+  const question = '这里是否继续沿用单选？';
+  const plan = { question: '排序规则？', decision: '保留排序；先比较日期，再比较名称。', at: null };
+  const { repoDir, ctx } = setupCtx([{
+    id: 'A',
+    open_questions: [question],
+    decisions: [plan],
+    acceptance_criteria: ['旧验收'],
+    preserve_behaviors: ['兼容现有单选']
+  }], { redaction: { extra_patterns: ['w3private'] } });
+  const cli = (...args) => runCli(args, repoDir);
+  const task = (...args) => fs.readFileSync(path.join(cli('dispatch', '--dry-run', ...args).run_dir, 'task.md'), 'utf8');
+  const original = '  先保留「单选」；\n第二行：照旧调用 `selectOne()`。  ';
+  try {
+    assert.equal(cli('next').gate.reason, ALLOWED_GATE_REASONS.AMBIGUITY);
+    assert.equal(cli('resume', '--decision', original).outcome, 'approved');
+    const approval = readJsonSafe(ctx.paths.statePath).packs.A.resolved_gates.AMBIGUITY;
+    assert.equal(approval.decision, original);
+
+    ctx.manifest.packs[0].acceptance_criteria = ['新的可验证条件'];
+    writeJsonAtomic(ctx.paths.manifestPath, ctx.manifest);
+    cli('manifest-ack', '--reason', '把验收改为可直接核对的条件');
+    const event = readEvents(ctx.paths.eventsPath).find(({ type }) => type === 'manifest_changed');
+    const acceptance = event.changes.changed_packs[0].fields.find(({ field }) => field === 'acceptance_criteria');
+    assert.ok(acceptance);
+    assert.equal(event.reason, '把验收改为可直接核对的条件');
+
+    const initial = task();
+    assert.match(initial, /INITIAL.*tier1/);
+    assert.match(initial, /新的可验证条件/);
+
+    const interrupted = cli('record', 'implement', '--infra-error', 'INFRA_TIMEOUT');
+    assert.equal(interrupted.outcome, 'paused_infra_blocked');
+    const repairDecision = '沿用本地入口；w3private 仅用于当前排查。';
+    assert.equal(cli('resume', '--action', 'repair', '--decision', repairDecision).outcome, 'resumed_implement');
+    const repair = task();
+    assert.match(repair, /REPAIR.*tier1/);
+    assert.match(repair, /INFRA_BLOCKED.*repair/);
+    assert.ok(repair.includes('沿用本地入口；[REDACTED:INTERNAL] 仅用于当前排查。'));
+    assert.doesNotMatch(repair, /w3private/);
+
+    cli('record', 'implement', '--passed');
+    cli('record', 'verify', '--passed', '--allow-self-report');
+    const r1 = task();
+    assert.match(r1, /Round 1\/2/);
+    cli('record', 'review', '--verdict', 'fail', '--summary', '需要补验一个边界');
+    cli('record', 'implement', '--passed');
+    cli('record', 'verify', '--passed', '--allow-self-report');
+    const r2 = task();
+    assert.match(r2, /Round 2\/2/);
+    assert.match(r2, /ROUND 2 NON-DIVERGENT CLOSURE RULE.*Verify ONLY/);
+    assert.match(r2, /## Prior Round Blocking Findings to Verify Closed/);
+    for (const content of [initial, repair, r1, r2]) {
+      assert.match(content, /## 已经定了的\n与本任务书其他描述冲突时，以这里的原话为准。/);
+      assert.ok(content.includes('\n' + original + '\n'));
+      assert.ok(content.includes(question));
+      assert.ok(content.includes(approval.approved_at));
+      assert.ok(content.includes(plan.question) && content.includes('\n' + plan.decision + '\n'));
+    }
+    for (const content of [r1, r2]) {
+      assert.match(content, /## 要保住的旧行为\n.*逐条核对/);
+      assert.match(content, /兼容现有单选/);
+      assert.match(content, /VERDICT: PASS.*VERDICT: FAIL/);
+      assert.match(content, /```json\n\{ "verdict":/);
+    }
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('resume saves nonempty decisions for repair, retry, commit and switch_instance', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A' }]);
+  try {
+    const pack = ctx.state.packs.A;
+    const gate = { reason: ALLOWED_GATE_REASONS.BUDGET_EXCEEDED };
+    const expected = [
+      ['repair', 'resumed_implement', 'IMPLEMENT'],
+      ['retry', 'resumed_implement', 'IMPLEMENT'],
+      ['commit', 'ready_to_commit', 'READY_TO_COMMIT'],
+      ['switch_instance', 'switched_instance', 'IMPLEMENT']
+    ];
+    for (const [action, outcome, status] of expected) {
+      Object.assign(pack, { status: 'PAUSED_FOR_HUMAN', gate });
+      const decision = `  已确认：${action}。  `;
+      assert.equal(resumeFromGate(ctx, { action, decision, instance: 'tier1-backup' }).outcome, outcome);
+      const persisted = readJsonSafe(ctx.paths.statePath).packs.A;
+      assert.equal(persisted.status, status);
+      assert.equal(persisted.gate, null);
+      const saved = persisted.decisions.at(-1);
+      assert.deepEqual({ ...saved, at: undefined }, { action, gate_reason: gate.reason, decision, at: undefined });
+      assert.ok(Number.isFinite(Date.parse(saved.at)));
+    }
+    assert.equal(pack.active_instance, 'tier1-backup');
+    Object.assign(pack, { status: 'PAUSED_FOR_HUMAN', gate });
+    resumeFromGate(ctx, { action: 'retry', decision: '   ' });
+    assert.equal(readJsonSafe(ctx.paths.statePath).packs.A.decisions.length, 4);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
 

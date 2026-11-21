@@ -86,6 +86,8 @@ node <GROW_LOOP_BIN> next --repo <repo>
 | `COMPLETED` | All packs are committed! Run `grow-loop evidence` to generate the redacted two-layer evidence pack and report to the user. |
 
 ### Step 2: Executing `IMPLEMENT` (External Adapter vs `self`)
+- Before dispatch, the coordinator reads the relevant code and fills in the pack's `pitfalls`, `co_change_files`, and `preserve_behaviors`. Name the file or function for each pitfall. When following an existing rule, name the function that implements it. Copy the plan's `decisions` with the original question, wording, and time if known. Check `warnings` from `next` and `dispatch --dry-run`.
+- Check the files listed under “可能要一起改的文件” and confirm any changes to the authorized scope. Save reports, screenshots, and drafts in the generated task brief's artifact directory. For artifacts physically outside the working tree, use an external `--state-dir`.
 - **If `instance` uses an external CLI adapter (`codex`, `claude`, `dsh`, `custom-cmd`):**
   1. First run dry-run preflight:
      ```bash
@@ -116,6 +118,7 @@ node <GROW_LOOP_BIN> next --repo <repo>
 ### Step 4: Executing `REVIEW` (2-Round Cap + Severity Floor)
 - Perform **closing full review** over the full pack diff (do NOT waste turns on repeated incremental reviews mid-pack unless a huge risk emerges).
 - Reviewer MUST be **read-only** (`--stage review` enforces read-only flags on adapters).
+- Check each existing behavior listed in the task brief and report regressions at the applicable severity. Round 2 applies this checklist within its closure scope. The “已经定了的” section carries the original decisions for both rounds.
 - Classify every finding strictly into `BLOCKER` | `HIGH` | `MEDIUM` | `LOW`:
   - **Only `BLOCKER` and `HIGH` block closure.**
   - **`MEDIUM` and `LOW` are archived into `.loop/tech-debt.md` and NEVER block.**

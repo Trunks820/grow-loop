@@ -33,7 +33,7 @@ import {
 } from '../src/router.mjs';
 import { getAdapter } from '../src/adapters/index.mjs';
 import { probeAllInstances } from '../src/probe.mjs';
-import { buildTaskPrompt, parseOutOfScopeItems } from '../src/task-builder.mjs';
+import { buildTaskPrompt, parseOutOfScopeItems, taskBriefWarnings } from '../src/task-builder.mjs';
 import { addLesson } from '../src/lessons.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
 import { buildRedactor } from '../src/redact.mjs';
@@ -448,6 +448,8 @@ async function cmdDispatch(flags) {
   const runId = `${stamp}-${stage}-${instanceId}${flags['dry-run'] ? '-dryrun' : ''}`;
   const runDir = path.join(ctx.paths.runsDir, pack.id, runId);
   ensureDir(runDir);
+  ensureDir(path.join(ctx.paths.artifactsDir, pack.id));
+  const warnings = taskBriefWarnings(packDef, ctx.config);
 
   const taskFilePath = flags['task-file']
     ? path.resolve(flags['task-file'])
@@ -474,7 +476,7 @@ async function cmdDispatch(flags) {
       instance: instanceId,
       run_id: runId
     });
-    outJson({ run_id: runId, run_dir: runDir, dry_run: receipt });
+    outJson({ run_id: runId, run_dir: runDir, dry_run: receipt, warnings });
     return;
   }
 
@@ -515,17 +517,21 @@ async function cmdDispatch(flags) {
       summary: result.infra_error ? `Adapter ${instanceId} hit ${result.infra_error}` : `Adapter ${instanceId} exited with code ${result.exit_code}`
     });
     if (adapter.kind === 'codex' && result.final_md) {
-      let texts = [];
+      let report;
       try {
-        texts = parseOutOfScopeItems(fs.readFileSync(result.final_md, 'utf8'));
+        report = parseOutOfScopeItems(fs.readFileSync(result.final_md, 'utf8'), { includeSection: true });
       } catch {
         // The adapter outcome remains valid if its optional final message is unreadable.
       }
-      addScopeTodos(ctx, { packId: pack.id, runId, texts, reason: 'Reported by the executor as out of scope.' });
+      if (report?.items.length) {
+        addScopeTodos(ctx, { packId: pack.id, runId, texts: report.items, reason: 'Reported by the executor as out of scope.' });
+      } else if (report?.hasSection) {
+        warnings.push('执行者的最终回复含「超范围没改」一节，但未解析出待办。');
+      }
     }
   }
 
-  outJson({ run_id: runId, run_dir: runDir, result, transition });
+  outJson({ run_id: runId, run_dir: runDir, result, transition, warnings });
 }
 
 function readGitHeadCommit(repoDir) {

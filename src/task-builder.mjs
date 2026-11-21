@@ -1,15 +1,43 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureDir } from './state.mjs';
+import { ensureDir, getStatePaths } from './state.mjs';
 import { selectLessonsForPack } from './lessons.mjs';
 import { buildRedactor } from './redact.mjs';
 import { getBudgets } from './router.mjs';
+import { namesCode, scanReferences } from './ref-scan.mjs';
 
-export function parseOutOfScopeItems(markdown) {
+const briefFields = {
+  pitfalls: '避坑提示',
+  co_change_files: '要一起改的文件',
+  preserve_behaviors: '要保住的旧行为'
+};
+
+function textItems(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item.trim()) : [];
+}
+
+export function taskBriefWarnings(packDef, config) {
+  const warnings = [];
+  for (const [field, heading] of Object.entries(briefFields)) {
+    if (!textItems(packDef[field]).length) warnings.push(`「${heading}」未填写。`);
+  }
+  for (const [index, hint] of (Array.isArray(packDef.pitfalls) ? packDef.pitfalls : []).entries()) {
+    if (typeof hint === 'string' && hint.trim() && !namesCode(hint)) {
+      warnings.push(`第 ${index + 1} 条避坑提示未点名代码：${hint}`);
+    }
+  }
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  return warnings.map(redactor.redactString);
+}
+
+export function parseOutOfScopeItems(markdown, { includeSection = false } = {}) {
   const items = [];
   let fence = null;
   let inSection = false;
-  for (const line of markdown.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+  let hasSection = false;
+  const lines = markdown.replace(/^\uFEFF/, '').split(/\r?\n/);
+  const listItem = /^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]+(.+)$/;
+  for (const [index, line] of lines.entries()) {
     const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
     if (fence) {
       if (marker?.[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = null;
@@ -19,16 +47,66 @@ export function parseOutOfScopeItems(markdown) {
       fence = marker[1];
       continue;
     }
-    if (/^ {0,3}#{1,6}(?:[ \t]|$)/.test(line)) {
-      inSection = line.trim() === '## 超范围没改';
+    const item = line.match(listItem)?.[1].trim();
+    const atxHeading = /^ {0,3}#{1,6}(?:[ \t]|$)/.test(line);
+    const setextHeading = !item && /^ {0,3}\S/.test(line) && /^ {0,3}(?:=+|-+)[ \t]*$/.test(lines[index + 1] || '');
+    if (atxHeading || setextHeading) {
+      inSection = line.includes('超范围没改');
+      hasSection ||= inSection;
       continue;
     }
     if (inSection) {
-      const item = line.match(/^ {0,3}-[ \t]+(.+)$/)?.[1].trim();
-      if (item && /^[^：:]+[：:]\s*\S/.test(item)) items.push(item);
+      const text = item?.replace(/^\[[ xX]\]\s*/, '').trim().replace(/^(\*{1,2}|_{1,2})(.+)\1$/, '$2').trim();
+      if (text && !/^(?:无|没有|暂无)[。.!！]?$/.test(text)) items.push(item);
     }
   }
-  return items;
+  return includeSection ? { items, hasSection } : items;
+}
+
+function addBriefField(lines, packDef, field, guidance) {
+  lines.push(`## ${briefFields[field]}`);
+  if (guidance) lines.push(guidance, '');
+  const items = textItems(packDef[field]);
+  lines.push(...(items.length ? items.map((item) => `- ${item}`) : ['未填写。']), '');
+}
+
+function addVerbatim(lines, decision) {
+  if (typeof decision !== 'string' || !decision.trim()) {
+    lines.push('未记录原话。', '');
+    return;
+  }
+  const longest = (decision.match(/`+/g) || []).reduce((max, run) => Math.max(max, run.length), 2);
+  const fence = '`'.repeat(longest + 1);
+  lines.push(`${fence}text`, decision, fence, '');
+}
+
+function addDecisions(lines, packDef, pack) {
+  lines.push('## 已经定了的', '与本任务书其他描述冲突时，以这里的原话为准。', '');
+  const approvals = Object.entries(pack.resolved_gates || {}).map(([gate_reason, approval]) => ({
+    ...approval, gate_reason, action: 'approve', at: approval.approved_at
+  }));
+  const gateDecisions = [...approvals, ...(pack.decisions || [])];
+  const questions = new Set([...textItems(packDef.open_questions), ...gateDecisions.flatMap((entry) => textItems(entry.questions))]);
+  if (questions.size) {
+    lines.push('本包提出的问题', ...[...questions].map((question) => `- ${question}`), '');
+  }
+
+  const decisions = Array.isArray(packDef.decisions) ? packDef.decisions.filter(Boolean) : [];
+  for (const { question, decision, at } of decisions) {
+    lines.push(`- 方案问题：${question || '未记录'}（时间：${at || '未记录'}）`, '');
+    addVerbatim(lines, decision);
+  }
+  for (const { gate_reason, action, decision, at } of gateDecisions) {
+    lines.push(`- 门禁 \`${gate_reason}\`（${action}，时间：${at || '未记录'}）`, '');
+    addVerbatim(lines, decision);
+  }
+  if (!decisions.length && !gateDecisions.length) lines.push('暂无决定记录。', '');
+}
+
+function addArtifactDirectory(lines, stateDir, packId) {
+  const artifactsDir = path.join(getStatePaths(stateDir).artifactsDir, packId);
+  lines.push('## 产物放哪');
+  lines.push(`报告、截图和草稿一律放到 \`${artifactsDir.replace(/\\/g, '/')}/\`。请勿把这些产物写到仓库的其他位置或加入 Git。`, '');
 }
 
 /**
@@ -40,7 +118,7 @@ export function parseOutOfScopeItems(markdown) {
  * - Blocking findings to fix (in REPAIR mode) or Round-2 non-divergent closure scope (in REVIEW R2)
  */
 export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
-  const { stateDir, config } = ctx;
+  const { stateDir, config, state } = ctx;
   const budgets = getBudgets(config);
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
   const lessons = selectLessonsForPack(stateDir, packDef, 8);
@@ -67,6 +145,12 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
       lines.push(`- Authorized scope: ${packDef.scope_files.map((f) => `\`${f}\``).join(', ')}`);
     }
     lines.push('');
+
+    addBriefField(lines, packDef, 'preserve_behaviors', isRound2Closure
+      ? '在本轮收尾范围内逐条核对下列旧行为，按严重程度报告修复新引入的 `BLOCKER` 或 `HIGH` 回归。'
+      : '逐条核对下列旧行为，未保住的按严重程度报告。');
+    addDecisions(lines, packDef, pack);
+    addArtifactDirectory(lines, stateDir, pack.id);
 
     if (pack.pending_blocking_findings?.length) {
       lines.push('## Prior Round Blocking Findings to Verify Closed');
@@ -117,14 +201,31 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
     }
     lines.push('');
 
+    for (const field of Object.keys(briefFields)) addBriefField(lines, packDef, field);
+    addDecisions(lines, packDef, pack);
+
+    lines.push('## 可能要一起改的文件', '', '### 可能要一起改，请确认', '授权范围以本包清单为准。');
+    const references = scanReferences(state?.repo_dir || process.cwd(), stateDir, packDef);
+    if (references.skipped) {
+      lines.push(`没扫（${references.skipped}）。`);
+    } else if (references.matches.size) {
+      for (const [file, term] of references.matches) lines.push(`- \`${file}\`（命中 \`${term}\`）`);
+    } else {
+      lines.push('未找到范围外的引用文件。');
+    }
+    lines.push('');
+
+    lines.push('## 转来的发现');
     if (packDef.forwarded_findings?.length) {
-      lines.push('## 转来的发现');
       for (const finding of packDef.forwarded_findings) {
         lines.push(`- 来源包 ${finding.from_pack_id}。原因：${finding.reason}`);
         lines.push(`  ${finding.content}`);
       }
-      lines.push('');
+    } else {
+      lines.push('暂无。');
     }
+    lines.push('');
+    addArtifactDirectory(lines, stateDir, pack.id);
 
     if (isRepair && pack.pending_blocking_findings?.length) {
       lines.push('## Blocking Findings to Fix');

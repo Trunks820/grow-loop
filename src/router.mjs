@@ -1,4 +1,6 @@
 import { appendEvent, readJsonSafe, saveState } from './state.mjs';
+import { buildRedactor } from './redact.mjs';
+import { taskBriefWarnings } from './task-builder.mjs';
 import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
 import { addLesson, appendTechDebt, closeLessonsForPack, selectLessonsForPack } from './lessons.mjs';
 
@@ -113,6 +115,7 @@ export function startOrAdvanceActivePack(ctx) {
         action: 'BLOCKED_DEPENDENCY',
         pack_id: activeId,
         missing_dependencies: deps.missing,
+        warnings: taskBriefWarnings(packDef, config),
         message: `Pack ${activeId} waiting on uncommitted dependencies: ${deps.missing.join(', ')}`
       };
     }
@@ -217,12 +220,16 @@ export function buildNextDirective(ctx, pack, packDef) {
   const { stateDir, config } = ctx;
   const budgets = getBudgets(config);
   const lessons = selectLessonsForPack(stateDir, packDef, 8);
+  const packInfo = {
+    pack_id: pack.id,
+    title: pack.title,
+    warnings: taskBriefWarnings(packDef, config)
+  };
 
   if (pack.status === 'PAUSED_FOR_HUMAN') {
     return {
       action: 'PAUSE_FOR_HUMAN',
-      pack_id: pack.id,
-      title: pack.title,
+      ...packInfo,
       gate: pack.gate,
       resume_hint: `grow-loop resume --decision "<your decision>" --action <${(pack.gate?.allowed_resume_actions || ['approve']).join('|')}>`
     };
@@ -233,8 +240,7 @@ export function buildNextDirective(ctx, pack, packDef) {
     return {
       action: 'IMPLEMENT',
       mode: isRepair ? 'REPAIR' : 'INITIAL',
-      pack_id: pack.id,
-      title: pack.title,
+      ...packInfo,
       tier: pack.current_tier,
       instance: pack.active_instance,
       repair_budget: {
@@ -253,8 +259,7 @@ export function buildNextDirective(ctx, pack, packDef) {
   if (pack.status === 'VERIFY') {
     return {
       action: 'VERIFY',
-      pack_id: pack.id,
-      title: pack.title,
+      ...packInfo,
       verification: config?.verification || {},
       next_command: 'grow-loop verify (runs verification.commands and records exit codes); use "grow-loop record verify --failed ..." only for failures found outside those commands'
     };
@@ -265,8 +270,7 @@ export function buildNextDirective(ctx, pack, packDef) {
     const reviewerInstance = resolveTierInstance(config, 'reviewer');
     return {
       action: 'REVIEW',
-      pack_id: pack.id,
-      title: pack.title,
+      ...packInfo,
       review_round: nextRound,
       max_review_rounds: budgets.maxReviewRounds,
       non_divergent_closure_only: nextRound >= 2 && budgets.round2NonDivergent,
@@ -281,8 +285,7 @@ export function buildNextDirective(ctx, pack, packDef) {
   if (pack.status === 'READY_TO_COMMIT') {
     return {
       action: 'COMMIT',
-      pack_id: pack.id,
-      title: pack.title,
+      ...packInfo,
       approval_note: 'Local commit ONLY (git add explicit files + git commit). NEVER git push / merge / deploy without RELEASE gate.',
       next_command: `Commit locally, then call: grow-loop record commit --from-git`
     };
@@ -290,8 +293,7 @@ export function buildNextDirective(ctx, pack, packDef) {
 
   return {
     action: pack.status,
-    pack_id: pack.id,
-    title: pack.title
+    ...packInfo
   };
 }
 
@@ -754,15 +756,32 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   const prevGate = pack.gate;
   const packDef = getPackDef(manifest, pack.id);
   const act = String(action || 'approve').toLowerCase();
+  const gateReason = prevGate?.reason || 'UNKNOWN';
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  const at = new Date().toISOString();
+  const questions = prevGate?.questions?.length ? { questions: redactor.redactValue(prevGate.questions) } : {};
 
   appendEvent(stateDir, config, {
     type: 'gate_resumed',
     pack_id: pack.id,
-    gate_reason: prevGate?.reason || 'UNKNOWN',
+    gate_reason: gateReason,
     action: act,
     decision: decision || '',
     switch_instance: instance || null
   });
+
+  if (act === 'switch_instance' && (!instance || !config?.executors?.[instance])) {
+    throw new Error(`Unknown executor instance "${instance}" in config.executors`);
+  }
+  if (['repair', 'retry', 'commit', 'switch_instance'].includes(act) && typeof decision === 'string' && decision.trim()) {
+    (pack.decisions ??= []).push({
+      gate_reason: gateReason,
+      action: act,
+      decision: redactor.redactString(decision),
+      at,
+      ...questions
+    });
+  }
 
   if (act === 'abort') {
     state.loop_status = 'ABORTED';
@@ -779,9 +798,6 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   }
 
   if (act === 'switch_instance') {
-    if (!instance || !config?.executors?.[instance]) {
-      throw new Error(`Unknown executor instance "${instance}" in config.executors`);
-    }
     pack.active_instance = instance;
     pack.last_session_id = null;
     pack.gate = null;
@@ -809,8 +825,9 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   pack.resolved_gates = pack.resolved_gates || {};
   if (prevGate?.reason) {
     pack.resolved_gates[prevGate.reason] = {
-      approved_at: new Date().toISOString(),
-      decision: decision || ''
+      approved_at: at,
+      decision: redactor.redactString(decision || ''),
+      ...questions
     };
   }
   if (prevGate?.reason === ALLOWED_GATE_REASONS.BLAST_RADIUS_SPLIT) {
