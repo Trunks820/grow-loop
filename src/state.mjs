@@ -30,6 +30,7 @@ export function getStatePaths(stateDir) {
     eventsPath: path.join(stateDir, 'events.jsonl'),
     lessonsJsonPath: path.join(stateDir, 'lessons.json'),
     lessonsMdPath: path.join(stateDir, 'lessons.md'),
+    techDebtJsonPath: path.join(stateDir, 'tech-debt.json'),
     techDebtMdPath: path.join(stateDir, 'tech-debt.md'),
     probeCachePath: path.join(stateDir, 'probe-cache.json'),
     runsDir: path.join(stateDir, 'runs'),

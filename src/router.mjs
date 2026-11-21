@@ -3,7 +3,8 @@ import { buildRedactor } from './redact.mjs';
 import { taskBriefWarnings } from './task-builder.mjs';
 import { getVerificationCommands } from './verify.mjs';
 import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
-import { addLesson, appendTechDebt, closeLessonsForPack, loadLessons, renderLessonsMarkdown, selectLessonsForPack } from './lessons.mjs';
+import { addLesson, closeLessonsForPack, loadLessons, recordReviewTechDebt, renderLessonsMarkdown, selectLessonsForPack } from './lessons.mjs';
+import { BLOCKING_REVIEW_SEVERITIES } from './review-report.mjs';
 
 export function getBudgets(config) {
   return {
@@ -280,11 +281,11 @@ export function buildNextDirective(ctx, pack, packDef) {
       review_round: nextRound,
       max_review_rounds: budgets.maxReviewRounds,
       non_divergent_closure_only: nextRound >= 2 && budgets.round2NonDivergent,
-      blocking_severities: [...budgets.blockingSeverities],
+      blocking_severities: BLOCKING_REVIEW_SEVERITIES,
       reviewer_instance: reviewerInstance,
       read_only: true,
       previous_blocking_findings: pack.pending_blocking_findings || [],
-      next_command: `grow-loop dispatch --stage review --dry-run (then grow-loop record review ...)`
+      next_command: 'grow-loop dispatch --stage review (self: grow-loop record review --report <report.md>)'
     };
   }
 
@@ -629,6 +630,15 @@ export function recordReviewOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
   const pack = getWritablePack(state, payload.packId);
   const budgets = getBudgets(config);
+  if (payload.reportPath && (pack.status !== 'REVIEW' ||
+    (payload.reviewRound !== undefined && payload.reviewRound !== pack.review_rounds + 1))) {
+    throw new Error(`Pack ${pack.id} is no longer awaiting this review. Check "grow-loop next" before recording a report.`);
+  }
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  const blockingSeverities = payload.reportPath ? new Set(BLOCKING_REVIEW_SEVERITIES) : budgets.blockingSeverities;
+  const reviewer = payload.reviewer || resolveTierInstance(config, 'reviewer');
+  const reviewerModel = payload.reviewerModel === undefined ? config?.executors?.[reviewer]?.model : payload.reviewerModel;
+  const summary = redactor.redactString(payload.summary || '');
 
   pack.review_rounds += 1;
   const findings = Array.isArray(payload.findings) ? payload.findings : [];
@@ -637,15 +647,12 @@ export function recordReviewOutcome(ctx, payload) {
 
   for (const f of findings) {
     const sev = String(f.severity || 'LOW').toUpperCase();
-    if (budgets.blockingSeverities.has(sev)) {
-      blocking.push({ ...f, severity: sev });
+    if (blockingSeverities.has(sev)) {
+      blocking.push({ ...redactor.redactValue(f), severity: sev });
     } else {
       nonBlocking.push({ ...f, severity: sev });
     }
   }
-
-  // Record MEDIUM / LOW findings as tech debt without blocking closure
-  const debtCount = appendTechDebt(stateDir, config, pack.id, pack.review_rounds, nonBlocking);
 
   // If reviewer passed --verdict fail with zero structured findings, synthesize a single HIGH finding
   // so repair prompts and lessons never drop the failure reason.
@@ -653,23 +660,25 @@ export function recordReviewOutcome(ctx, payload) {
   if (rawVerdictLower === 'fail' && findings.length === 0) {
     blocking.push({
       severity: 'HIGH',
-      title: payload.summary || `Review round ${pack.review_rounds} failed without structured findings`,
-      detail: payload.summary || ''
+      title: summary || `Review round ${pack.review_rounds} failed without structured findings`,
+      detail: summary
     });
   }
 
   // Enforce Severity Floor: only BLOCKER / HIGH may fail a closing review
   const effectivePass = blocking.length === 0;
   const verdictNormalized = effectivePass ? 'PASS' : 'FAIL';
+  const debtCount = recordReviewTechDebt(stateDir, config, pack.id, pack.review_rounds, nonBlocking, effectivePass);
 
   pack.last_review = {
     round: pack.review_rounds,
-    reviewer: payload.reviewer || resolveTierInstance(config, 'reviewer'),
+    reviewer: redactor.redactString(reviewer),
+    reviewer_model: redactor.redactString(reviewerModel || null),
     verdict: verdictNormalized,
     raw_verdict: String(payload.verdict || '').toUpperCase(),
     blocking_count: blocking.length,
     non_blocking_count: nonBlocking.length,
-    summary: payload.summary || '',
+    summary,
     at: new Date().toISOString()
   };
 
@@ -679,11 +688,12 @@ export function recordReviewOutcome(ctx, payload) {
     round: pack.review_rounds,
     max_rounds: budgets.maxReviewRounds,
     reviewer: pack.last_review.reviewer,
+    reviewer_model: pack.last_review.reviewer_model,
     verdict: verdictNormalized,
     blocking_count: blocking.length,
     non_blocking_count: nonBlocking.length,
     tech_debt_recorded: debtCount,
-    summary: payload.summary || ''
+    summary
   });
 
   if (effectivePass) {
@@ -763,7 +773,7 @@ export function recordReviewOutcome(ctx, payload) {
     ctx,
     pack,
     `REVIEW_R${pack.review_rounds}`,
-    payload.summary || `${blocking.length} blocking finding(s) in review round ${pack.review_rounds}`
+    summary || `${blocking.length} blocking finding(s) in review round ${pack.review_rounds}`
   );
 }
 

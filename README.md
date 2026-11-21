@@ -44,8 +44,8 @@
   - `tier1` 最多修 **2 轮** → 第 3 次失败自动升级到 `tier2`（`tier2_repairs = 1`）。
   - `tier2` 最多修 **2 轮** → 仍未过硬刹车 `PAUSED_FOR_HUMAN`（`BUDGET_EXCEEDED`），交给人拍板，绝不无限死循环。
 - **关包审查封顶 + 严重度底线（`2`）**：
-  - 默认采用**关包全量深审**，最多 **2 轮**（`max_review_rounds: 2`）；第 2 轮为严格收敛审（只核对上轮阻塞项是否修干净、有无新 `BLOCKER/HIGH` 回归）。
-  - **仅 `BLOCKER` / `HIGH` 阻塞关包**；`MEDIUM` / `LOW` 自动记入 `.loop/tech-debt.md`，即使审查员口头判 `fail` 也会被状态机强制放行（Severity Floor）。
+  - 默认采用**关包全量深审**，最多 **2 轮**（`max_review_rounds: 2`）。第 2 轮只核对上轮阻塞项、“本轮一起修”项和修复新引入的 `BLOCKER` / `HIGH` 回归。
+  - **仅 `BLOCKER` / `HIGH` 阻塞关包**。`MEDIUM` / `LOW` 进入 `.loop/tech-debt.md`。退回轮标“本轮一起修”，通过后按原标题再报的转为待办，其余划掉并标为已修。
   - 达到 2 轮上限时：若仍在 `tier1`，自动升级 `tier2` 做一次最终修复（验证通过后暂停请人确认提交，不再开第 3 轮对抗审查）；若已在 `tier2`，立即停机找人（`REVIEW_CAP_REACHED`）。
 - **基础设施故障免疫（Infra Immunity）**：
   - `429` 限流（`INFRA_QUOTA`）、认证失效（`INFRA_AUTH`）、超时（`INFRA_TIMEOUT`）、CLI 崩溃（`INFRA_CLI_CRASH`）**绝不消耗** `tier1`/`tier2` 代码修复额度；默认停机通知人，不悄悄换号。
@@ -118,7 +118,10 @@ grow-loop dispatch --stage implement --dry-run
 # 正式派发执行（外部 CLI 自动记录结果；self 模式由当前宿主执行后 record）
 grow-loop dispatch --stage implement
 grow-loop verify   # CLI 先跑全局命令，再跑本包命令
-grow-loop record review --verdict pass --findings-file findings.json --summary "0 blocking findings"
+# 外部审查完成并返回报告路径后，CLI 自动读取报告并转移状态
+grow-loop dispatch --stage review
+# 自审时，先用 --dry-run 生成审查任务书，按其中的格式写 Markdown 报告，再交给 loop
+grow-loop record review --report <report.md>
 grow-loop record commit --from-git
 
 # 当触发人工刹车门时恢复
@@ -127,6 +130,8 @@ grow-loop resume --decision "已确认走单选，批准继续" --action approve
 # 全部包完成后一键产出脱敏双层证据包（.loop/evidence.md）
 grow-loop evidence
 ```
+
+报告读不出或格式有误时，CLI 会退出并给出报告路径和错误位置，包继续等待审查。旧的 `record review --verdict`、`--findings-file` 和 `--findings` 参数仍可用。 [审查报告格式](docs/ADAPTER-SPEC.md#closing-review-reports)
 
 ## 验证命令与环境
 

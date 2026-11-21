@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ensureDir, getStatePaths } from './state.mjs';
-import { selectLessonsForPack } from './lessons.mjs';
+import { inRoundTechDebt, selectLessonsForPack } from './lessons.mjs';
 import { buildRedactor } from './redact.mjs';
+import { BLOCKING_REVIEW_SEVERITIES } from './review-report.mjs';
 import { getBudgets } from './router.mjs';
 import { getVerificationPlan } from './verify.mjs';
 import { namesCode, scanReferences } from './ref-scan.mjs';
@@ -110,6 +111,16 @@ function addArtifactDirectory(lines, stateDir, packId) {
   lines.push(`报告、截图和草稿一律放到 \`${artifactsDir.replace(/\\/g, '/')}/\`。请勿把这些产物写到仓库的其他位置或加入 Git。`, '');
 }
 
+function addReviewFindings(lines, heading, findings, instruction) {
+  if (!findings?.length) return;
+  lines.push(`## ${heading}`);
+  if (instruction) lines.push(instruction, '');
+  for (const { severity, title, summary, locator, detail } of findings) {
+    lines.push(`- **[${severity}]** ${title || summary}${locator ? ` (\`${locator}\`)` : ''}${detail ? `: ${detail}` : ''}`);
+  }
+  lines.push('');
+}
+
 /**
  * Build a bounded, self-contained UTF-8 task prompt for an executor or reviewer run.
  * Executors do NOT inherit the coordinator's chat history, so this injects only:
@@ -132,10 +143,10 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
     lines.push('');
     lines.push('## Hard Constraints');
     lines.push('- **READ-ONLY MODE**: Do NOT edit any source files, do NOT commit/push/deploy, do NOT run destructive commands.');
-    lines.push(`- **Blocking Severities**: Only \`${[...budgets.blockingSeverities].join('`, `')}\` findings may block package closure.`);
+    lines.push(`- **Blocking Severities**: Only \`${BLOCKING_REVIEW_SEVERITIES.join('`, `')}\` findings may block package closure.`);
     lines.push('- `MEDIUM` and `LOW` findings will be archived into `tech-debt.md` and will NOT block this package.');
     if (isRound2Closure) {
-      lines.push('- **ROUND 2 NON-DIVERGENT CLOSURE RULE**: Verify ONLY whether Round 1 blocking findings are cleanly closed AND whether the repair introduced any NEW `BLOCKER` or `HIGH` regressions. Do NOT expand scope into unrelated legacy nitpicks.');
+      lines.push('- **ROUND 2 NON-DIVERGENT CLOSURE RULE**: Verify ONLY the listed prior findings and any new `BLOCKER` or `HIGH` regressions introduced by the repair.');
     }
     lines.push('');
     lines.push('## Scope & Goal');
@@ -153,18 +164,18 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
     addDecisions(lines, packDef, pack);
     addArtifactDirectory(lines, stateDir, pack.id);
 
-    if (pack.pending_blocking_findings?.length) {
-      lines.push('## Prior Round Blocking Findings to Verify Closed');
-      for (const bf of pack.pending_blocking_findings) {
-        lines.push(`- **[${bf.severity}]** ${bf.title || bf.summary}${bf.locator ? ` (\`${bf.locator}\`)` : ''}${bf.detail ? `: ${bf.detail}` : ''}`);
-      }
-      lines.push('');
+    addReviewFindings(lines, 'Prior Round Blocking Findings to Verify Closed', pack.pending_blocking_findings);
+    if (nextRound >= 2) {
+      addReviewFindings(lines, '顺手一起修（不阻断）', inRoundTechDebt(stateDir, pack.id),
+        '只核对下列条目。仍未修好的按原 `title` 再报一次，已修好的省略。');
     }
 
     lines.push('## Required Output Format');
-    lines.push('Output a clear `VERDICT: PASS` or `VERDICT: FAIL`, followed by a JSON block matching:');
+    lines.push('Output one standalone `VERDICT: PASS` or `VERDICT: FAIL` line, followed by exactly one fenced `json` block. The JSON `verdict` must agree with the line.');
+    lines.push('Use `FAIL` if any finding is `BLOCKER` or `HIGH`, and `PASS` otherwise. Give every finding a non-empty `title` and a severity of `BLOCKER`, `HIGH`, `MEDIUM`, or `LOW`. Use `findings: []` when there are no findings.');
+    lines.push('', 'VERDICT: PASS');
     lines.push('```json');
-    lines.push('{ "verdict": "pass|fail", "summary": "...", "findings": [{ "severity": "BLOCKER|HIGH|MEDIUM|LOW", "title": "...", "locator": "File.ext#Class.method", "detail": "...", "rule": "..." }] }');
+    lines.push('{ "verdict": "pass", "summary": "...", "findings": [{ "severity": "LOW", "title": "...", "locator": "File.ext#Class.method", "detail": "...", "rule": "..." }] }');
     lines.push('```');
   } else {
     const isRepair = pack.tier1_repairs > 0 || pack.tier2_repairs > 0;
@@ -228,12 +239,9 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
     lines.push('');
     addArtifactDirectory(lines, stateDir, pack.id);
 
-    if (isRepair && pack.pending_blocking_findings?.length) {
-      lines.push('## Blocking Findings to Fix');
-      for (const bf of pack.pending_blocking_findings) {
-        lines.push(`- **[${bf.severity}]** ${bf.title || bf.summary}${bf.locator ? ` (\`${bf.locator}\`)` : ''}${bf.detail ? `: ${bf.detail}` : ''}`);
-      }
-      lines.push('');
+    if (isRepair) {
+      addReviewFindings(lines, 'Blocking Findings to Fix', pack.pending_blocking_findings);
+      addReviewFindings(lines, '顺手一起修（不阻断）', inRoundTechDebt(stateDir, pack.id));
     }
 
     if (isRepair && pack.last_verify && !pack.last_verify.passed) {

@@ -36,6 +36,7 @@ import { generateEvidencePack } from '../src/evidence.mjs';
 import { classifyInfraError } from '../src/adapters/base.mjs';
 import { codexAdapter } from '../src/adapters/codex.mjs';
 import { getVerificationCommands } from '../src/verify.mjs';
+import { parseReviewReport } from '../src/review-report.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -621,7 +622,9 @@ test('running Codex dispatch keeps its task and route while final markdown produ
     const preview = cli('dispatch', '--dry-run', '--resume');
     assert.equal(preview.dry_run.instance_id, 'tier2-cli');
     assert.match(fs.readFileSync(path.join(preview.run_dir, 'task.md'), 'utf8'), /src\/b\.mjs/);
-    cli('dispatch', '--stage', 'review', '--instance', 'tier1-cli');
+    const review = runCliFailure(['dispatch', '--stage', 'review', '--instance', 'tier1-cli'], repoDir);
+    assert.equal(review.status, 1);
+    assert.equal(JSON.parse(review.stdout).transition.outcome, 'review_report_invalid');
     assert.deepEqual(cli('status').open_todos, todos);
 
     cli('pack', 'tier', '--id', 'A', '--tier', 'tier1', '--reason', '一档再核对一次');
@@ -1157,6 +1160,150 @@ process.exitCode = 5;
     assert.deepEqual(packageOnly.commands.map((c) => [c.command, c.source]), [[packCommand, 'pack']]);
     runCli(['record', 'implement', '--pack', 'W', '--passed'], repoDir);
     assert.match(runCliFailure(['verify', '--pack', 'W'], repoDir).stderr, /No runnable verification\.commands.*or verify_commands/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+function reviewMarkdown(verdict, findings) {
+  return `VERDICT: ${verdict.toUpperCase()}\n\n\`\`\`json\n${JSON.stringify({ verdict, summary: 'Review complete', findings }, null, 2)}\n\`\`\`\n`;
+}
+
+test('review reports validate the conclusion, JSON fence and findings with locations', () => {
+  const pass = reviewMarkdown('pass', [{ severity: 'lOw', title: 'Clarify retry log', locator: 'src/retry.mjs' }]);
+  const bold = pass.replace('VERDICT: PASS', '  **VERDICT: PASS**  ').replaceAll('\n', '\r\n');
+  assert.deepEqual(parseReviewReport(bold), {
+    verdict: 'PASS', summary: 'Review complete', findings: [{ severity: 'LOW', title: 'Clarify retry log', locator: 'src/retry.mjs' }]
+  });
+
+  const cases = [
+    [pass.replace('VERDICT: PASS', 'Review complete'), /VERDICT line/],
+    ['VERDICT: PASS\n```text\n```', /JSON block.*one fenced/],
+    [`${pass}\n\`\`\`json\n{}\n\`\`\``, /Line \d+, JSON block.*only one/],
+    [pass.replace(/```\n$/, ''), /Line 3, JSON block.*closing fence/],
+    ['VERDICT: PASS\n```json\n{\n  "findings": [1,]\n}\n```', /Line 4, column 18, JSON block.*syntax/],
+    ['VERDICT: PASS\n```json\n{\n  "findings": [],\n}\n```', /Line 5, column 1, JSON block.*syntax/],
+    [pass.replace('VERDICT: PASS', 'VERDICT: FAIL'), /verdict.*disagrees with VERDICT on line 1/],
+    [reviewMarkdown('pass', {}), /findings.*array/],
+    ...[undefined, 'CRITICAL', 'P1', 'Medium-High'].map((severity) => [
+      reviewMarkdown('pass', [{ severity: 'LOW', title: 'Valid' }, { severity, title: 'Check severity' }]), /finding 2, severity/
+    ]),
+    [reviewMarkdown('pass', [{ severity: 'LOW' }]), /finding 1, title/],
+    [reviewMarkdown('fail', [{ severity: 'LOW', title: 'Only a low' }]), /findings.*FAIL requires/],
+    [reviewMarkdown('fail', []), /findings.*FAIL requires/],
+    [reviewMarkdown('pass', [{ severity: 'HIGH', title: 'Blocking' }]), /finding 1, severity.*PASS cannot include/]
+  ];
+  for (const [markdown, diagnostic] of cases) {
+    const result = parseReviewReport(markdown);
+    assert.match(result.errors?.join('\n') || '', diagnostic);
+  }
+});
+
+test('dispatch records valid reviews, rejects invalid reports, and settles in-round tech debt after self-review', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'W5', scope_files: ['src/retry.mjs'] }]);
+  const cli = (...args) => runCli(args, repoDir);
+  const fail = (...args) => runCliFailure(args, repoDir);
+  const mock = path.join(repoDir, 'mock-review.cjs');
+  const report = path.join(repoDir, 'review.md');
+  const legacy = '# Prior tech debt\r\n\r\n- Preserve this entry exactly.\r\n';
+  const findings = [
+    { severity: 'HIGH', title: 'Retry skips verification', locator: 'src/retry.mjs#verify' },
+    { severity: 'low', title: 'Clarify retry log', detail: 'Include the attempt number' },
+    { severity: 'MEDIUM', title: 'Forward elapsed time' }
+  ];
+  const readPack = () => readJsonSafe(ctx.paths.statePath).packs.W5;
+  try {
+    fs.writeFileSync(ctx.paths.techDebtMdPath, legacy);
+    fs.writeFileSync(mock, `
+      const fs = require('node:fs');
+      const args = process.argv.slice(2);
+      process.stdin.resume();
+      if (args[args.indexOf('--sandbox') + 1] !== 'read-only') throw new Error('Reviewer must be read-only');
+      fs.copyFileSync(${JSON.stringify(report)}, args[args.indexOf('--output-last-message') + 1]);
+      process.exitCode = args.includes('--mock-fail') ? 2 : 0;
+    `);
+    const reviewer = { kind: 'codex', executable: process.execPath, prefix_args: [mock], model: 'review-model' };
+    ctx.config.executors['reviewer-cli'] = reviewer;
+    ctx.config.executors.self.model = 'host-review-model';
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    cli('next');
+    cli('record', 'implement', '--passed');
+    cli('record', 'verify', '--passed', '--allow-self-report');
+    const awaitingReview = readPack();
+    assert.equal(awaitingReview.status, 'REVIEW');
+
+    const valid = reviewMarkdown('fail', findings);
+    for (const [markdown, expected] of [
+      [valid.replace('VERDICT: FAIL', 'Review complete'), /VERDICT line/],
+      [valid.replace('"low"', '"CRITICAL"'), /finding 2, severity/]
+    ]) {
+      fs.writeFileSync(report, markdown);
+      const rejected = fail('dispatch', '--stage', 'review');
+      assert.equal(rejected.status, 1);
+      const { result, transition } = JSON.parse(rejected.stdout);
+      assert.equal(result.status, 'completed');
+      assert.equal(result.read_only, true);
+      assert.equal(transition.outcome, 'review_report_invalid');
+      assert.equal(transition.report_path, result.final_md);
+      assert.match(transition.errors.join('\n'), expected);
+      assert.deepEqual(readPack(), awaitingReview);
+    }
+    assert.equal(fail('record', 'review', '--report', path.join(repoDir, 'missing.md')).status, 1);
+    assert.deepEqual(readPack(), awaitingReview);
+    const rejectedEvents = readEvents(ctx.paths.eventsPath);
+    assert.equal(rejectedEvents.filter(({ type }) => type === 'review_report_invalid').length, 3);
+    assert.equal(rejectedEvents.filter(({ type }) => type === 'review_recorded').length, 0);
+    assert.equal(fs.existsSync(ctx.paths.techDebtJsonPath), false);
+
+    fs.writeFileSync(report, valid);
+    reviewer.prefix_args = [mock, '--mock-fail'];
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    const failedRun = cli('dispatch', '--stage', 'review');
+    assert.equal(failedRun.result.status, 'failed');
+    assert.equal(failedRun.transition, null);
+    assert.deepEqual(readPack(), awaitingReview);
+    reviewer.prefix_args = [mock];
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+
+    const run = cli('dispatch', '--stage', 'review');
+    assert.equal(run.transition.outcome, 'repair_tier1');
+    assert.equal(readPack().status, 'IMPLEMENT');
+    assert.deepEqual(readPack().pending_blocking_findings, [findings[0]]);
+    assert.equal(readPack().last_review.reviewer, 'reviewer-cli');
+    assert.equal(readPack().last_review.reviewer_model, 'review-model');
+    assert.deepEqual(readJsonSafe(ctx.paths.techDebtJsonPath).items.map(({ status }) => status), ['IN_ROUND', 'IN_ROUND']);
+    const repair = cli('dispatch', '--dry-run');
+    const repairTask = fs.readFileSync(path.join(repair.run_dir, 'task.md'), 'utf8');
+    assert.match(repairTask, /## Blocking Findings to Fix\r?\n- .*Retry skips verification/);
+    assert.match(repairTask, /## 顺手一起修（不阻断）\r?\n- .*Clarify retry log/);
+
+    cli('record', 'implement', '--passed');
+    cli('record', 'verify', '--passed', '--allow-self-report');
+    const roundTwo = cli('dispatch', '--stage', 'review', '--dry-run');
+    const reviewTask = fs.readFileSync(path.join(roundTwo.run_dir, 'task.md'), 'utf8');
+    assert.match(reviewTask, /Round 2\/2/);
+    assert.match(reviewTask, /Verify ONLY the listed prior findings and any new `BLOCKER` or `HIGH` regressions introduced by the repair/);
+    assert.match(reviewTask, /## 顺手一起修（不阻断）\s+只核对下列条目。仍未修好的按原 `title` 再报一次，已修好的省略。\s+- .*Clarify retry log/);
+
+    fs.writeFileSync(report, reviewMarkdown('pass', [findings[2]]));
+    assert.equal(cli('record', 'review', '--report', report).outcome, 'review_passed');
+    assert.equal(readPack().status, 'READY_TO_COMMIT');
+    assert.equal(readPack().review_rounds, 2);
+    assert.equal(readPack().last_review.reviewer, 'self');
+    assert.equal(readPack().last_review.reviewer_model, 'host-review-model');
+    const debt = readJsonSafe(ctx.paths.techDebtJsonPath);
+    assert.equal(debt.legacy_markdown, legacy);
+    assert.deepEqual(debt.items.map(({ finding, status, fixed_in_pack }) => [finding.title, status, fixed_in_pack]), [
+      ['Clarify retry log', 'FIXED', 'W5'], ['Forward elapsed time', 'PENDING', undefined]
+    ]);
+    const rendered = fs.readFileSync(ctx.paths.techDebtMdPath, 'utf8');
+    assert.ok(rendered.includes(`## 旧记录\n\n${legacy}`));
+    assert.match(rendered, /~~\*\*\[LOW\]\*\* Clarify retry log: Include the attempt number~~ — 已修（在 W5 修掉）/);
+    assert.match(rendered, /\[MEDIUM\].*Forward elapsed time — 待办/);
+    const outcomes = readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'review_recorded');
+    assert.deepEqual(outcomes.map(({ reviewer: instance, reviewer_model: model, verdict }) => [instance, model, verdict]), [
+      ['reviewer-cli', 'review-model', 'FAIL'], ['self', 'host-review-model', 'PASS']
+    ]);
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }

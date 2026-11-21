@@ -38,6 +38,7 @@ import { addLesson } from '../src/lessons.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
 import { buildRedactor } from '../src/redact.mjs';
 import { getVerificationCommands, runVerification } from '../src/verify.mjs';
+import { parseReviewReport } from '../src/review-report.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -94,6 +95,7 @@ Usage:
   grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume] [--task-file <path>]
   grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--pack <id>] [--timeout <sec>] [--mark-env "<reason>"]
   grow-loop record    <implement|verify|review|commit|lesson> [flags]
+  grow-loop record review --report <report.md> [--reviewer <instance>]
   grow-loop resume    --decision "<text>" [--action approve|repair|retry|commit|switch_instance|abort] [--instance <id>]
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
 
@@ -440,6 +442,36 @@ function cmdNext(flags) {
   outJson(directive);
 }
 
+function recordReviewReport(ctx, { packId, reportPath, reviewer, reviewerModel, reviewRound, runId }) {
+  let markdown;
+  let report;
+  try {
+    markdown = fs.readFileSync(reportPath, 'utf8');
+  } catch (error) {
+    report = { errors: [`Report file: cannot read Markdown${error.code ? ` (${error.code})` : ''}.`] };
+  }
+  report ??= parseReviewReport(markdown);
+  if (report.errors) {
+    const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
+    const invalid = {
+      outcome: 'review_report_invalid',
+      report_path: redactor.redactString(reportPath),
+      errors: report.errors
+    };
+    appendEvent(ctx.stateDir, ctx.config, {
+      type: invalid.outcome,
+      pack_id: packId,
+      reviewer,
+      run_id: runId || null,
+      report_path: invalid.report_path,
+      errors: invalid.errors
+    });
+    process.exitCode = 1;
+    return invalid;
+  }
+  return recordReviewOutcome(ctx, { ...report, packId, reportPath, reviewer, reviewerModel, reviewRound });
+}
+
 async function cmdDispatch(flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir']);
   const packId = flags.pack || ctx.state.active_pack_id;
@@ -450,6 +482,7 @@ async function cmdDispatch(flags) {
 
   const stage = String(flags.stage || (pack.status === 'REVIEW' ? 'review' : 'implement')).toLowerCase();
   const readOnly = stage === 'review';
+  const reviewRound = pack.review_rounds + 1;
   const instanceId = flags.instance || (readOnly ? resolveTierInstance(ctx.config, 'reviewer') : pack.active_instance || resolveTierInstance(ctx.config, pack.current_tier || 'tier1'));
   const instanceCfg = ctx.config?.executors?.[instanceId] || { kind: 'self' };
   const adapter = getAdapter(instanceCfg.kind || 'self');
@@ -500,7 +533,7 @@ async function cmdDispatch(flags) {
     run_id: runId,
     resumed_session: resumeSessionId || null
   });
-  if (pack.last_verify?.repair_undo) {
+  if (stage === 'implement' && pack.last_verify?.repair_undo) {
     delete pack.last_verify.repair_undo;
     saveState(ctx.stateDir, ctx.state);
   }
@@ -544,6 +577,16 @@ async function cmdDispatch(flags) {
         warnings.push('执行者的最终回复含「超范围没改」一节，但未解析出待办。');
       }
     }
+  } else if (readOnly && result.status === 'completed' && !result.infra_error && result.final_md) {
+    ctx.state = readJsonSafe(ctx.paths.statePath);
+    transition = recordReviewReport(ctx, {
+      packId: pack.id,
+      reportPath: result.final_md,
+      reviewer: instanceId,
+      reviewerModel: instanceCfg.model || null,
+      reviewRound,
+      runId
+    });
   }
 
   outJson({ run_id: runId, run_dir: runDir, result, transition, warnings });
@@ -596,6 +639,18 @@ function cmdRecord(sub, flags) {
   }
 
   if (sub === 'review') {
+    if ('report' in flags) {
+      if (typeof flags.report !== 'string' || !flags.report.trim()) throw new Error('Specify --report <report.md>.');
+      if (['findings-file', 'findings', 'verdict', 'summary'].some((flag) => flag in flags)) {
+        throw new Error('With --report, put the verdict, summary and findings in the Markdown report.');
+      }
+      outJson(recordReviewReport(ctx, {
+        packId,
+        reportPath: path.resolve(flags.report),
+        reviewer: flags.reviewer || 'self'
+      }));
+      return;
+    }
     let findings = [];
     if (flags['findings-file']) {
       const parsed = JSON.parse(fs.readFileSync(path.resolve(flags['findings-file']), 'utf8'));

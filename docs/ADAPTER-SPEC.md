@@ -129,11 +129,42 @@ export const myAdapter = {
       elapsed_seconds: 12.3,
       session_id: 'optional-native-session-id',
       usage: { input_tokens: 0, output_tokens: 0 },
+      final_md: null,      // path to the final Markdown message, when available
       infra_error: null   // null | 'INFRA_QUOTA' | 'INFRA_AUTH' | 'INFRA_TIMEOUT' | 'INFRA_CLI_CRASH'
     }, redactor);
   }
 };
 ```
+
+### Closing review reports
+
+A completed review adapter can return the path to its final message as `final_md`. `grow-loop dispatch --stage review` reads that file, records the verdict and findings, and uses the dispatched instance and its configured `model` as the reviewer identity. For a self-review or an adapter without `final_md`, save the same report and run `grow-loop record review --report <report.md>`. Self-review records the `self` instance by default. Use `--reviewer <instance>` to identify a different configured reviewer.
+
+Write one standalone `VERDICT: PASS` or `VERDICT: FAIL` line. Surrounding whitespace and whole-line Markdown bold are allowed. Follow it with exactly one fenced `json` block.
+
+````markdown
+VERDICT: PASS
+
+```json
+{
+  "verdict": "pass",
+  "summary": "The package meets its acceptance criteria.",
+  "findings": [
+    {
+      "severity": "LOW",
+      "title": "Clarify the retry log",
+      "locator": "src/retry.mjs#scheduleRetry",
+      "detail": "Include the attempt number in the log.",
+      "rule": "Include the attempt number when logging retries."
+    }
+  ]
+}
+```
+````
+
+The JSON `verdict` must agree with the standalone line. `findings` must be an array and can be empty. Each finding requires a non-empty `title` and one of `BLOCKER`, `HIGH`, `MEDIUM`, or `LOW`. Severity is case-insensitive. Use `FAIL` when at least one finding is `BLOCKER` or `HIGH`, and `PASS` otherwise. `summary`, `locator`, `detail`, and `rule` are strings when supplied.
+
+If the file is unreadable or the report is invalid, dispatch prints the report path and errors with the applicable line, column, finding number, or field. It logs `review_report_invalid`, exits nonzero, and leaves the package in `REVIEW` without consuming a review round. Submit a corrected report or rerun the review. Adapter execution failures and infrastructure errors follow their existing handling.
 
 ---
 

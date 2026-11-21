@@ -81,7 +81,7 @@ node <GROW_LOOP_BIN> next --repo <repo>
 | `PAUSE_FOR_HUMAN` | **STOP the loop immediately.** Present `gate.reason`, `gate.summary`, `gate.questions` (if any), and the exact `resume_hint` options to the user. Wait for human input, then call `grow-loop resume --decision "..." --action <...>`. |
 | `IMPLEMENT` | Execute implementation on the assigned `tier` & `instance` (see Step 2). |
 | `VERIFY` | Run `grow-loop verify`. The CLI runs global `verification.commands` followed by the pack's `verify_commands` and records the outcome from exit codes. **Verify ALWAYS runs before Review.** |
-| `REVIEW` | Run a **read-only closing full review** (Round 1 or non-divergent Round 2), then call `grow-loop record review --verdict pass\|fail --findings-file <json> --summary "..."`. |
+| `REVIEW` | Run a **read-only closing review**. External dispatch records the returned Markdown report automatically. For self-review, submit the Markdown with `grow-loop record review --report <report.md>`. |
 | `COMMIT` | Stage explicit changed files (`git status`, no untracked junk/secrets), make a **local** commit only (never push!), then call `grow-loop record commit --from-git`. |
 | `COMPLETED` | All packs are committed! Run `grow-loop evidence` to generate the redacted two-layer evidence pack and report to the user. |
 
@@ -122,12 +122,13 @@ node <GROW_LOOP_BIN> next --repo <repo>
 - Check each existing behavior listed in the task brief and report regressions at the applicable severity. Round 2 applies this checklist within its closure scope. The “已经定了的” section carries the original decisions for both rounds.
 - Classify every finding strictly into `BLOCKER` | `HIGH` | `MEDIUM` | `LOW`:
   - **Only `BLOCKER` and `HIGH` block closure.**
-  - **`MEDIUM` and `LOW` are archived into `.loop/tech-debt.md` and NEVER block.**
-- If `review_round === 2` (`non_divergent_closure_only: true`): verify ONLY whether Round-1 blocking findings are fixed and whether the fix introduced any new `BLOCKER`/`HIGH` regression. Do NOT open new style/perf refactors.
-- Record result via JSON findings file:
+  - **`MEDIUM` and `LOW` are recorded in `.loop/tech-debt.md`.** On a failed review they are included in the repair task under `顺手一起修（不阻断）`.
+- For a non-divergent Round 2, check only the listed prior findings and new `BLOCKER`/`HIGH` regressions introduced by the repair. Re-report unresolved `MEDIUM`/`LOW` items from the prior round under their original titles. On passage, those items become pending and the omitted items are marked fixed.
+- External dispatch reads the returned Markdown report automatically. For self-review, run `dispatch --stage review --dry-run` to get the task, then save a Markdown report matching its Required Output Format and submit it:
   ```bash
-  node <GROW_LOOP_BIN> record review --repo <repo> --verdict pass --findings-file <path-to-findings.json> --summary "..."
+  node <GROW_LOOP_BIN> record review --repo <repo> --report <report.md>
   ```
+- If the CLI reports an invalid report, correct the indicated location and submit the report again. The package stays in `REVIEW` and the round does not advance.
 
 ### Step 5: Built-In `2 + 2 + 2` Brakes (Enforced Automatically by CLI)
 - **Blast-Radius Gate:** `estimated_files >= 25` or `cross_module: true` or `risk: "high"` → auto-starts at `tier2`; `estimated_files >= 50` → pauses with `BLAST_RADIUS_SPLIT`.

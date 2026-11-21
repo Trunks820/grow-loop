@@ -120,23 +120,66 @@ export function renderLessonsMarkdown(lessonsMdPath, store) {
   fs.writeFileSync(lessonsMdPath, lines.join('\n'), 'utf8');
 }
 
-export function appendTechDebt(stateDir, config, packId, reviewRound, findings) {
-  if (!findings || findings.length === 0) return 0;
-  const { techDebtMdPath } = getStatePaths(stateDir);
+export function inRoundTechDebt(stateDir, packId) {
+  const { techDebtJsonPath } = getStatePaths(stateDir);
+  const store = readJsonSafe(techDebtJsonPath, { items: [] });
+  return store.items.filter((item) => item.pack_id === packId && item.status === 'IN_ROUND')
+    .map(({ finding }) => finding);
+}
+
+function renderTechDebtMarkdown(filePath, store) {
+  const lines = ['# grow-loop Non-Blocking Tech Debt (MEDIUM / LOW)', ''];
+  if (store.legacy_markdown) lines.push('## 旧记录', '', store.legacy_markdown, '');
+  lines.push('## 审查记录', '');
+
+  for (const item of store.items) {
+    const { severity, title, locator, detail } = item.finding;
+    const entry = `**[${severity}]** ${title}${locator ? ` (\`${locator}\`)` : ''}${detail ? `: ${detail}` : ''}`.replace(/[\r\n]+/g, ' ');
+    const origin = `${item.pack_id} · Review Round ${item.review_round}`;
+    if (item.status === 'FIXED') lines.push(`- ~~${entry}~~ — 已修（在 ${item.fixed_in_pack} 修掉） · ${origin}`);
+    else lines.push(`- ${entry} — ${item.status === 'IN_ROUND' ? '本轮一起修' : '待办'} · ${origin}`);
+  }
+  fs.writeFileSync(filePath, lines.join('\n') + '\n', 'utf8');
+}
+
+export function recordReviewTechDebt(stateDir, config, packId, reviewRound, findings, passed) {
+  const { techDebtJsonPath, techDebtMdPath } = getStatePaths(stateDir);
+  let store = readJsonSafe(techDebtJsonPath);
+  if (!store) {
+    if (!findings.length) return 0;
+    const legacy = fs.existsSync(techDebtMdPath) ? fs.readFileSync(techDebtMdPath, 'utf8') : '';
+    store = { legacy_markdown: legacy, items: [] };
+  }
+
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
-  const exists = fs.existsSync(techDebtMdPath);
-  const chunks = [];
-  if (!exists) {
-    chunks.push('# grow-loop Non-Blocking Tech Debt (MEDIUM / LOW)\n');
-    chunks.push('> Recorded automatically during closing reviews without blocking package completion.\n');
+  // Include already written items from this round so a retry can reuse them.
+  const previous = store.items.filter((item) => item.pack_id === packId &&
+    (item.status === 'IN_ROUND' || item.last_reported_round === reviewRound));
+  if (!previous.length && !findings.length) return 0;
+
+  const status = passed ? 'PENDING' : 'IN_ROUND';
+  const createdAt = new Date().toISOString();
+  for (const raw of findings) {
+    const finding = redactor.redactValue({ ...raw, title: raw.title || raw.summary || 'Unnamed item' });
+    const index = previous.findIndex((item) => item.finding.title === finding.title);
+    if (index === -1) {
+      store.items.push({ pack_id: packId, review_round: reviewRound, last_reported_round: reviewRound, created_at: createdAt, status, finding });
+    } else {
+      const [item] = previous.splice(index, 1);
+      Object.assign(item, { finding, status, last_reported_round: reviewRound });
+      delete item.fixed_in_pack;
+    }
   }
-  chunks.push(`\n## ${packId} · Review Round ${reviewRound} (${new Date().toISOString()})\n`);
-  for (const f of findings) {
-    const clean = redactor.redactValue(f);
-    const loc = clean.locator ? ` (\`${clean.locator}\`)` : '';
-    chunks.push(`- **[${clean.severity || 'LOW'}]** ${clean.title || clean.summary || 'Unnamed item'}${loc}${clean.detail ? `: ${clean.detail}` : ''}`);
+  if (passed) {
+    for (const item of previous) {
+      if (item.status !== 'IN_ROUND') continue;
+      item.status = 'FIXED';
+      item.fixed_in_pack = packId;
+      item.last_reported_round = reviewRound;
+    }
   }
-  chunks.push('');
-  fs.appendFileSync(techDebtMdPath, chunks.join('\n'), 'utf8');
+
+  writeJsonAtomic(techDebtJsonPath, store);
+  renderTechDebtMarkdown(techDebtMdPath, store);
   return findings.length;
 }
