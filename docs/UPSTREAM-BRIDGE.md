@@ -65,7 +65,9 @@
 | `risk` | No | `"low"` \| `"medium"` \| `"high"`. `"high"` auto-starts at `tier2`. |
 | `estimated_files` | No | `>= 25` auto-starts at `tier2`; `>= 50` triggers `PAUSED_FOR_HUMAN` (`BLAST_RADIUS_SPLIT`). |
 | `cross_module` | No | `true` auto-starts at `tier2` (configurable via `blast_radius.escalate_tier2_cross_module`). |
+| `tier` | No | `"tier1"` or `"tier2"`. Takes priority over automatic tier selection at preflight. The split and approval gates still apply. Use `pack tier` for in-progress changes. |
 | `scope_files` | No | Explicit file allowlist / expected touchpoints injected into `task.md`. Also used as lower bound for `estimated_files`. |
+| `forwarded_findings` | No | Findings added by `forward`. Each entry has `from_pack_id`, `content`, `reason`, and `at` (ISO 8601 timestamp). They appear in initial and repair implementation prompts. |
 | `acceptance_criteria` | No | Observable verification criteria injected into `task.md` and checked during `VERIFY`/`REVIEW`. |
 | `open_questions` | No | Non-empty array triggers `PAUSED_FOR_HUMAN` (`AMBIGUITY`) before `IMPLEMENT`. |
 | `external_effects` | No | Non-empty array (e.g., `["prod-db-migration", "webhook-notify"]`) triggers `PAUSED_FOR_HUMAN` (`EXTERNAL_EFFECT`) before `IMPLEMENT`. |

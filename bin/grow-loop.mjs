@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import {
+  addScopeTodos,
   appendEvent,
   checkManifest,
   createInitialState,
@@ -32,7 +33,7 @@ import {
 } from '../src/router.mjs';
 import { getAdapter } from '../src/adapters/index.mjs';
 import { probeAllInstances } from '../src/probe.mjs';
-import { buildTaskPrompt } from '../src/task-builder.mjs';
+import { buildTaskPrompt, parseOutOfScopeItems } from '../src/task-builder.mjs';
 import { addLesson } from '../src/lessons.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
 import { buildRedactor } from '../src/redact.mjs';
@@ -44,17 +45,24 @@ const PKG_ROOT = path.resolve(__dirname, '..');
 
 function parseArgs(argv) {
   const positionals = [];
-  const flags = {};
+  const flags = Object.create(null);
   for (let i = 0; i < argv.length; i++) {
     const tok = argv[i];
     if (tok.startsWith('--')) {
-      const key = tok.slice(2);
+      const equals = tok.indexOf('=');
+      const key = tok.slice(2, equals === -1 ? undefined : equals);
       const next = argv[i + 1];
-      if (next !== undefined && !next.startsWith('--')) {
-        flags[key] = next;
+      let value = true;
+      if (equals !== -1) {
+        value = tok.slice(equals + 1);
+      } else if (next !== undefined && !next.startsWith('--')) {
+        value = next;
         i++;
+      }
+      if (key === 'add') {
+        (flags.add ??= []).push(value);
       } else {
-        flags[key] = true;
+        flags[key] = value;
       }
     } else {
       positionals.push(tok);
@@ -75,6 +83,13 @@ Usage:
   grow-loop probe     [--repo <dir>] [--state-dir <dir>] [--timeout <ms>]
   grow-loop status    [--repo <dir>] [--state-dir <dir>]
   grow-loop manifest-ack --reason "<text>" [--repo <dir>] [--state-dir <dir>]
+  grow-loop pack insert --file <pack.json> (--after <ID> | --before <ID>) --reason "<text>"
+  grow-loop pack tier --id <ID> --tier tier1|tier2 --reason "<text>"
+  grow-loop pack scope --id <ID> --add <file>[,<file>...] --reason "<text>" [--todo <ID>]
+  grow-loop forward --to <ID> (--text "<text>" | --todo <ID>) --reason "<text>" [--from <ID>]
+  grow-loop todo add --pack <ID> --text "<text>" --reason "<text>"
+  grow-loop todo list
+  grow-loop todo dismiss --todo <ID> --reason "<text>"
   grow-loop next      [--repo <dir>] [--state-dir <dir>]
   grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume] [--task-file <path>]
   grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--timeout <sec>]
@@ -213,6 +228,7 @@ function cmdStatus(flags) {
     state_dir: ctx.stateDir,
     active_pack_id: ctx.state.active_pack_id,
     packs: summary,
+    open_todos: (ctx.state.todos || []).filter((todo) => todo.status === 'open'),
     ...(ctx.manifestChange ? { manifest_change_pending: ctx.manifestChange } : {})
   });
 }
@@ -223,6 +239,188 @@ function cmdManifestAck(flags) {
   outJson(changes
     ? { ok: true, message: 'Manifest changes acknowledged.', changes }
     : { ok: true, message: 'No manifest changes.' });
+}
+
+function requireText(value, flag) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`Specify a non-empty --${flag}.`);
+  return value.trim();
+}
+
+function chooseFlag(flags, first, second) {
+  if ((flags[first] === undefined) === (flags[second] === undefined)) {
+    throw new Error(`Specify exactly one of --${first} or --${second}.`);
+  }
+  return flags[first] === undefined ? second : first;
+}
+
+function requireUncommittedPack(ctx, value, flag) {
+  const id = requireText(value, flag);
+  const packDef = getPackDef(ctx.manifest, id);
+  if (!packDef) throw new Error(`Pack "${id}" not found in the manifest.`);
+  if (ctx.state.packs[id].status === 'COMMITTED') throw new Error(`Pack ${id} is already committed.`);
+  return packDef;
+}
+
+function requireOpenTodo(ctx, value) {
+  const id = requireText(value, 'todo');
+  const todo = (ctx.state.todos || []).find((entry) => entry.id === id);
+  if (!todo) throw new Error(`Todo "${id}" not found.`);
+  if (todo.status !== 'open') throw new Error(`Todo ${id} is already ${todo.status}.`);
+  return todo;
+}
+
+function updatePackDef(ctx, packDef, reason, source, details) {
+  const packs = ctx.manifest.packs.map((pack) => pack.id === packDef.id ? packDef : pack);
+  writeManifestWithReason(ctx, { ...ctx.manifest, packs }, reason, source, { pack_id: packDef.id, ...details });
+}
+
+function cmdPackInsert(ctx, flags, reason) {
+  const position = chooseFlag(flags, 'after', 'before');
+  const anchorId = requireText(flags[position], position);
+  const anchorIndex = ctx.manifest.packs.findIndex((pack) => pack.id === anchorId);
+  if (anchorIndex === -1) throw new Error(`Pack "${anchorId}" not found in the manifest.`);
+  if (position === 'before' && ctx.state.packs[anchorId].status !== 'PENDING') {
+    throw new Error(`Cannot insert before ${anchorId}: it has already started or is committed. Use --after ${anchorId}.`);
+  }
+
+  const file = requireText(flags.file, 'file');
+  let newPack;
+  try {
+    newPack = JSON.parse(fs.readFileSync(path.resolve(file), 'utf8').replace(/^\uFEFF/, ''));
+  } catch (error) {
+    if (error.code === 'ENOENT') throw new Error('--file must point to an existing pack JSON file.');
+    if (error instanceof SyntaxError) throw new Error('--file must contain valid pack JSON.');
+    throw error;
+  }
+  if (typeof newPack?.id !== 'string' || !newPack.id.trim()) {
+    throw new Error('--file must contain one pack object with a non-empty id.');
+  }
+  if (Object.hasOwn(ctx.state.packs, newPack.id)) throw new Error(`Pack ${newPack.id} already exists.`);
+  if (position === 'after' && !Object.hasOwn(newPack, 'depends_on')) newPack.depends_on = [anchorId];
+
+  const index = anchorIndex + (position === 'after' ? 1 : 0);
+  const earlierIds = new Set(ctx.manifest.packs.slice(0, index).map((pack) => pack.id));
+  if (Object.hasOwn(newPack, 'depends_on') && (!Array.isArray(newPack.depends_on) || newPack.depends_on.some((id) =>
+    typeof id !== 'string' || (!earlierIds.has(id) && !(Object.hasOwn(ctx.state.packs, id) && ctx.state.packs[id].status === 'COMMITTED'))
+  ))) {
+    throw new Error('The inserted pack may depend only on earlier or committed packs.');
+  }
+
+  const updatedDependencies = [];
+  const packs = ctx.manifest.packs.map((pack, packIndex) => {
+    const dependsOn = pack.depends_on || [];
+    const rewired = position === 'before' ? pack.id === anchorId : dependsOn.includes(anchorId);
+    if (!rewired || ctx.state.packs[pack.id].status === 'COMMITTED' || dependsOn.includes(newPack.id)) return pack;
+    if (ctx.state.packs[pack.id].status !== 'PENDING' || packIndex < index) {
+      throw new Error(`Cannot make ${pack.id} wait for the inserted pack. Use --after ${pack.id}.`);
+    }
+    updatedDependencies.push(pack.id);
+    return { ...pack, depends_on: [...dependsOn, newPack.id] };
+  });
+  packs.splice(index, 0, newPack);
+  const activeId = ctx.state.active_pack_id;
+  if (ctx.state.packs[activeId]?.status === 'PENDING' && index <= ctx.state.pack_order.indexOf(activeId)) {
+    ctx.state.active_pack_id = null;
+  }
+  const details = { pack_id: newPack.id, position, anchor_id: anchorId, index, updated_dependencies: updatedDependencies };
+  writeManifestWithReason(ctx, { ...ctx.manifest, packs }, reason, 'pack_insert', details);
+  outJson({ ok: true, ...details });
+}
+
+function cmdPackTier(ctx, flags, reason) {
+  const packDef = requireUncommittedPack(ctx, flags.id, 'id');
+  const tier = flags.tier;
+  if (!['tier1', 'tier2'].includes(tier)) throw new Error('Specify --tier tier1 or --tier tier2.');
+  const pack = ctx.state.packs[packDef.id];
+  const started = pack.status !== 'PENDING';
+  const details = { tier, previous_tier: started ? pack.current_tier : packDef.tier ?? null, effective: started ? 'next_dispatch' : 'preflight' };
+  if (started) {
+    const instance = resolveTierInstance(ctx.config, tier);
+    details.previous_instance = pack.active_instance;
+    details.active_instance = instance;
+    if (instance !== pack.active_instance) pack.last_session_id = null;
+    pack.current_tier = tier;
+    pack.active_instance = instance;
+    pack.escalated = true;
+    const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
+    pack.escalation_reason = redactor.redactString(`Manual tier change to ${tier}: ${reason}`);
+  }
+  updatePackDef(ctx, { ...packDef, tier }, reason, 'pack_tier', details);
+  outJson({ ok: true, pack_id: packDef.id, ...details });
+}
+
+function cmdPackScope(ctx, flags, reason) {
+  const packDef = requireUncommittedPack(ctx, flags.id, 'id');
+  const files = (flags.add || []).flatMap((value) => requireText(value, 'add').split(',').map((file) => file.trim()));
+  if (!files.length || files.some((file) => !file)) throw new Error('Specify --add with one or more non-empty file paths.');
+  const todo = flags.todo === undefined ? null : requireOpenTodo(ctx, flags.todo);
+  const scopeFiles = [...new Set([...(packDef.scope_files || []), ...files])];
+  const priorEstimate = Number(packDef.estimated_files);
+  const estimatedFiles = Math.max(Number.isFinite(priorEstimate) ? priorEstimate : 0, scopeFiles.length);
+  const details = { added_files: scopeFiles.filter((file) => !packDef.scope_files?.includes(file)), estimated_files: estimatedFiles };
+  if (todo) {
+    todo.status = 'expanded';
+    todo.target_pack_id = packDef.id;
+    details.todo_id = todo.id;
+    details.todo_status = todo.status;
+  }
+  updatePackDef(ctx, { ...packDef, scope_files: scopeFiles, estimated_files: estimatedFiles }, reason, 'pack_scope', details);
+  outJson({ ok: true, pack_id: packDef.id, ...details });
+}
+
+function cmdPack(sub, flags) {
+  const ctx = loadWorkspace(flags.repo, flags['state-dir']);
+  const reason = requireText(flags.reason, 'reason');
+  if (sub === 'insert') cmdPackInsert(ctx, flags, reason);
+  else if (sub === 'tier') cmdPackTier(ctx, flags, reason);
+  else if (sub === 'scope') cmdPackScope(ctx, flags, reason);
+  else throw new Error('Unknown pack subcommand. Use: insert | tier | scope.');
+}
+
+function cmdForward(flags) {
+  const ctx = loadWorkspace(flags.repo, flags['state-dir']);
+  const reason = requireText(flags.reason, 'reason');
+  const target = requireUncommittedPack(ctx, flags.to, 'to');
+  const input = chooseFlag(flags, 'text', 'todo');
+  const todo = input === 'todo' ? requireOpenTodo(ctx, flags.todo) : null;
+  const content = todo?.content ?? requireText(flags.text, 'text');
+  const sourceId = flags.from === undefined ? todo?.pack_id ?? ctx.state.active_pack_id : requireText(flags.from, 'from');
+  if (!Object.hasOwn(ctx.state.packs, sourceId)) throw new Error('Source pack not found. Specify --from <ID>.');
+  if (todo && sourceId !== todo.pack_id) throw new Error(`Todo ${todo.id} is from pack ${todo.pack_id}.`);
+
+  const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
+  const finding = { from_pack_id: sourceId, content: redactor.redactString(content), reason: redactor.redactString(reason), at: new Date().toISOString() };
+  const details = { from_pack_id: sourceId };
+  if (todo) {
+    todo.status = 'forwarded';
+    todo.target_pack_id = target.id;
+    details.todo_id = todo.id;
+    details.todo_status = todo.status;
+  }
+  updatePackDef(ctx, { ...target, forwarded_findings: [...(target.forwarded_findings || []), finding] }, reason, 'forward', details);
+  outJson({ ok: true, to_pack_id: target.id, ...details });
+}
+
+function cmdTodo(sub, flags) {
+  const ctx = loadWorkspace(flags.repo, flags['state-dir']);
+  if (sub === 'list') {
+    outJson({ todos: ctx.state.todos || [] });
+  } else if (sub === 'add') {
+    const reason = requireText(flags.reason, 'reason');
+    const packId = requireText(flags.pack, 'pack');
+    if (!Object.hasOwn(ctx.state.packs, packId)) throw new Error(`Pack "${packId}" not found.`);
+    const [todo] = addScopeTodos(ctx, { packId, texts: [requireText(flags.text, 'text')], reason });
+    outJson({ ok: true, todo });
+  } else if (sub === 'dismiss') {
+    const reason = requireText(flags.reason, 'reason');
+    const todo = requireOpenTodo(ctx, flags.todo);
+    todo.status = 'dismissed';
+    saveState(ctx.stateDir, ctx.state);
+    appendEvent(ctx.stateDir, ctx.config, { type: 'todo_dismissed', todo_id: todo.id, pack_id: todo.pack_id, reason });
+    outJson({ ok: true, todo });
+  } else {
+    throw new Error('Unknown todo subcommand. Use: add | list | dismiss.');
+  }
 }
 
 function cmdNext(flags) {
@@ -237,6 +435,7 @@ async function cmdDispatch(flags) {
   const pack = ctx.state.packs[packId];
   const packDef = getPackDef(ctx.manifest, packId);
   if (!pack || !packDef) throw new Error(`Pack "${packId}" not found`);
+  if (pack.status === 'COMMITTED') throw new Error(`Pack ${packId} is already committed.`);
 
   const stage = String(flags.stage || (pack.status === 'REVIEW' ? 'review' : 'implement')).toLowerCase();
   const readOnly = stage === 'review';
@@ -304,14 +503,26 @@ async function cmdDispatch(flags) {
 
   let transition = null;
   if (stage === 'implement' && result.status !== 'host_action_required') {
+    // An operator may have changed the route, scope, or todos while the adapter ran.
+    ctx.state = readJsonSafe(ctx.paths.statePath);
     transition = recordImplementOutcome(ctx, {
       packId: pack.id,
       passed: result.status === 'completed',
       infraError: result.infra_error || null,
       sessionId: result.session_id || null,
       runId,
+      dispatch: { tier: pack.current_tier || 'tier1', instance: instanceId },
       summary: result.infra_error ? `Adapter ${instanceId} hit ${result.infra_error}` : `Adapter ${instanceId} exited with code ${result.exit_code}`
     });
+    if (adapter.kind === 'codex' && result.final_md) {
+      let texts = [];
+      try {
+        texts = parseOutOfScopeItems(fs.readFileSync(result.final_md, 'utf8'));
+      } catch {
+        // The adapter outcome remains valid if its optional final message is unreadable.
+      }
+      addScopeTodos(ctx, { packId: pack.id, runId, texts, reason: 'Reported by the executor as out of scope.' });
+    }
   }
 
   outJson({ run_id: runId, run_dir: runDir, result, transition });
@@ -457,6 +668,9 @@ async function main() {
     else if (cmd === 'probe') await cmdProbe(flags);
     else if (cmd === 'status') cmdStatus(flags);
     else if (cmd === 'manifest-ack') cmdManifestAck(flags);
+    else if (cmd === 'pack') cmdPack(positionals[1], flags);
+    else if (cmd === 'forward') cmdForward(flags);
+    else if (cmd === 'todo') cmdTodo(positionals[1], flags);
     else if (cmd === 'next') cmdNext(flags);
     else if (cmd === 'dispatch') await cmdDispatch(flags);
     else if (cmd === 'verify') await cmdVerify(flags);

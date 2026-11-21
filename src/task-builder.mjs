@@ -5,6 +5,32 @@ import { selectLessonsForPack } from './lessons.mjs';
 import { buildRedactor } from './redact.mjs';
 import { getBudgets } from './router.mjs';
 
+export function parseOutOfScopeItems(markdown) {
+  const items = [];
+  let fence = null;
+  let inSection = false;
+  for (const line of markdown.replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (fence) {
+      if (marker?.[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = null;
+      continue;
+    }
+    if (marker) {
+      fence = marker[1];
+      continue;
+    }
+    if (/^ {0,3}#{1,6}(?:[ \t]|$)/.test(line)) {
+      inSection = line.trim() === '## 超范围没改';
+      continue;
+    }
+    if (inSection) {
+      const item = line.match(/^ {0,3}-[ \t]+(.+)$/)?.[1].trim();
+      if (item && /^[^：:]+[：:]\s*\S/.test(item)) items.push(item);
+    }
+  }
+  return items;
+}
+
 /**
  * Build a bounded, self-contained UTF-8 task prompt for an executor or reviewer run.
  * Executors do NOT inherit the coordinator's chat history, so this injects only:
@@ -57,7 +83,9 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
     lines.push('```');
   } else {
     const isRepair = pack.tier1_repairs > 0 || pack.tier2_repairs > 0;
-    const modeLabel = isRepair ? `REPAIR (${pack.current_tier} attempt ${pack.current_tier === 'tier2' ? pack.tier2_repairs : pack.tier1_repairs})` : `INITIAL (${pack.current_tier})`;
+    const repairs = pack.current_tier === 'tier2' ? pack.tier2_repairs : pack.tier1_repairs;
+    const attempt = repairs > 0 ? ` attempt ${repairs}` : '';
+    const modeLabel = isRepair ? `REPAIR (${pack.current_tier}${attempt})` : `INITIAL (${pack.current_tier})`;
     lines.push(`# Work Package ${pack.id} · ${modeLabel} — ${pack.title}`);
     lines.push('');
     lines.push('## Hard Constraints');
@@ -89,6 +117,15 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
     }
     lines.push('');
 
+    if (packDef.forwarded_findings?.length) {
+      lines.push('## 转来的发现');
+      for (const finding of packDef.forwarded_findings) {
+        lines.push(`- 来源包 ${finding.from_pack_id}。原因：${finding.reason}`);
+        lines.push(`  ${finding.content}`);
+      }
+      lines.push('');
+    }
+
     if (isRepair && pack.pending_blocking_findings?.length) {
       lines.push('## Blocking Findings to Fix');
       for (const bf of pack.pending_blocking_findings) {
@@ -119,6 +156,9 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
       }
       lines.push('');
     }
+
+    lines.push('## 超范围发现的报告方式');
+    lines.push('发现需要改动但超出授权范围时，不要动这些位置。在最终回复末尾加入标题 `## 超范围没改`，每项单独一行，格式为 `- 位置：说明`。没有这类发现时省略该节。');
   }
 
   ensureDir(runDir);

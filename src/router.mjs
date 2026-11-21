@@ -1,4 +1,4 @@
-import { appendEvent, saveState } from './state.mjs';
+import { appendEvent, readJsonSafe, saveState } from './state.mjs';
 import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
 import { addLesson, appendTechDebt, closeLessonsForPack, selectLessonsForPack } from './lessons.mjs';
 
@@ -55,6 +55,8 @@ export function evaluateBlastRadius(config, packDef, packState = null) {
     (blastRadius.escalateTier2CrossModule && crossModule);
 
   const reasons = [];
+  const manualTier = ['tier1', 'tier2'].includes(packDef.tier) ? packDef.tier : null;
+  if (manualTier) reasons.push(`manual tier=${manualTier}`);
   if (risk === 'high') reasons.push('risk=high');
   if (estimatedFiles >= blastRadius.escalateTier2Files) {
     reasons.push(`estimated_files=${estimatedFiles} >= ${blastRadius.escalateTier2Files}`);
@@ -68,7 +70,7 @@ export function evaluateBlastRadius(config, packDef, packState = null) {
     cross_module: crossModule,
     risk,
     should_pause_split: shouldPauseSplit,
-    initial_tier: shouldStartTier2 ? 'tier2' : 'tier1',
+    initial_tier: manualTier || (shouldStartTier2 ? 'tier2' : 'tier1'),
     reasons
   };
 }
@@ -296,7 +298,7 @@ export function buildNextDirective(ctx, pack, packDef) {
 /**
  * Core 2+2 Repair & Auto-Escalation Ladder:
  * - Tier 1 up to tier1_max_repairs (default 2)
- * - Tier 1 exhausted -> auto-escalate to Tier 2 (tier2_repairs = 1)
+ * - Tier 1 exhausted -> auto-escalate if a Tier 2 repair remains
  * - Tier 2 up to tier2_max_repairs (default 2)
  * - Tier 2 exhausted -> PAUSED_FOR_HUMAN (BUDGET_EXCEEDED)
  */
@@ -304,32 +306,31 @@ export function applyRepairLadder(ctx, pack, source, reasonSummary) {
   const { stateDir, config } = ctx;
   const budgets = getBudgets(config);
 
-  if (pack.current_tier === 'tier1') {
-    if (pack.tier1_repairs < budgets.tier1MaxRepairs) {
-      pack.tier1_repairs += 1;
-      pack.status = 'IMPLEMENT';
-      appendEvent(stateDir, config, {
-        type: 'repair_scheduled',
-        pack_id: pack.id,
-        source,
-        tier: 'tier1',
-        instance: pack.active_instance,
-        attempt: pack.tier1_repairs,
-        max_attempts: budgets.tier1MaxRepairs,
-        summary: reasonSummary
-      });
-      saveState(stateDir, stateFor(ctx));
-      return { outcome: 'repair_tier1', tier: 'tier1', attempt: pack.tier1_repairs };
-    }
+  if (pack.current_tier === 'tier1' && pack.tier1_repairs < budgets.tier1MaxRepairs) {
+    pack.tier1_repairs += 1;
+    pack.status = 'IMPLEMENT';
+    appendEvent(stateDir, config, {
+      type: 'repair_scheduled',
+      pack_id: pack.id,
+      source,
+      tier: 'tier1',
+      instance: pack.active_instance,
+      attempt: pack.tier1_repairs,
+      max_attempts: budgets.tier1MaxRepairs,
+      summary: reasonSummary
+    });
+    saveState(stateDir, stateFor(ctx));
+    return { outcome: 'repair_tier1', tier: 'tier1', attempt: pack.tier1_repairs };
+  }
 
-    // Tier 1 exhausted -> auto-escalate to Tier 2
+  if (pack.current_tier === 'tier1' && pack.tier2_repairs < budgets.tier2MaxRepairs) {
     const prevInstance = pack.active_instance;
     const nextInstance = resolveTierInstance(config, 'tier2');
     pack.current_tier = 'tier2';
     pack.active_instance = nextInstance;
     pack.escalated = true;
     pack.escalation_reason = `Tier 1 (${prevInstance}) failed after ${pack.tier1_repairs}/${budgets.tier1MaxRepairs} repairs (${source}): ${reasonSummary}`;
-    pack.tier2_repairs = 1;
+    pack.tier2_repairs += 1;
     pack.status = 'IMPLEMENT';
     // Reset native session ID when switching executor instance
     pack.last_session_id = null;
@@ -349,7 +350,7 @@ export function applyRepairLadder(ctx, pack, source, reasonSummary) {
   }
 
   // Currently on Tier 2
-  if (pack.tier2_repairs < budgets.tier2MaxRepairs) {
+  if (pack.current_tier !== 'tier1' && pack.tier2_repairs < budgets.tier2MaxRepairs) {
     pack.tier2_repairs += 1;
     pack.status = 'IMPLEMENT';
     appendEvent(stateDir, config, {
@@ -390,12 +391,21 @@ function stateFor(ctx) {
   return ctx.state;
 }
 
+function getWritablePack(state, packId) {
+  const pack = state.packs[packId || state.active_pack_id];
+  if (!pack) throw new Error('No active pack found');
+  if (pack.status === 'COMMITTED') throw new Error(`Pack ${pack.id} is already committed.`);
+  return pack;
+}
+
 export function recordImplementOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
-  const pack = state.packs[payload.packId || state.active_pack_id];
-  if (!pack) throw new Error('No active pack found');
+  const pack = getWritablePack(state, payload.packId);
+  const runTier = payload.dispatch?.tier ?? pack.current_tier;
+  const runInstance = payload.dispatch?.instance ?? pack.active_instance;
+  const canResume = !payload.dispatch || runInstance === pack.active_instance;
 
-  if (payload.sessionId) pack.last_session_id = payload.sessionId;
+  if (payload.sessionId && canResume) pack.last_session_id = payload.sessionId;
   if (payload.runId) pack.last_run_id = payload.runId;
 
   // Infrastructure failure immunity: NEVER consumes tier1/tier2 repair budgets
@@ -404,15 +414,15 @@ export function recordImplementOutcome(ctx, payload) {
     appendEvent(stateDir, config, {
       type: 'infra_failure',
       pack_id: pack.id,
-      instance: pack.active_instance,
+      instance: runInstance,
       error_class: payload.infraError,
       summary: payload.summary || payload.infraError,
       repair_budget_consumed: false
     });
 
-    const instanceCfg = config?.executors?.[pack.active_instance] || {};
+    const instanceCfg = config?.executors?.[runInstance] || {};
     const onInfra = config?.routing?.on_infra_failure || 'pause_for_human';
-    if (onInfra === 'fallback' && instanceCfg.fallback_instance && config?.executors?.[instanceCfg.fallback_instance]) {
+    if (canResume && onInfra === 'fallback' && instanceCfg.fallback_instance && config?.executors?.[instanceCfg.fallback_instance]) {
       const prev = pack.active_instance;
       pack.active_instance = instanceCfg.fallback_instance;
       pack.last_session_id = null;
@@ -431,7 +441,7 @@ export function recordImplementOutcome(ctx, payload) {
     pack.status = 'PAUSED_FOR_HUMAN';
     pack.gate = createGate(
       ALLOWED_GATE_REASONS.INFRA_BLOCKED,
-      `Executor "${pack.active_instance}" hit infrastructure failure (${payload.infraError}): ${payload.summary || ''}. Repair budget was NOT consumed.`,
+      `Executor "${runInstance}" hit infrastructure failure (${payload.infraError}): ${payload.summary || ''}. Repair budget was NOT consumed.`,
       {
         recommended_action: 'fix_cli_or_switch_instance',
         allowed_resume_actions: ['retry', 'switch_instance', 'abort']
@@ -446,9 +456,9 @@ export function recordImplementOutcome(ctx, payload) {
     appendEvent(stateDir, config, {
       type: 'implement_completed',
       pack_id: pack.id,
-      tier: pack.current_tier,
-      instance: pack.active_instance,
-      session_id: pack.last_session_id,
+      tier: runTier,
+      instance: runInstance,
+      session_id: payload.sessionId || (canResume ? pack.last_session_id : null),
       run_id: pack.last_run_id,
       summary: payload.summary || 'Implementation completed'
     });
@@ -468,9 +478,10 @@ export function recordImplementOutcome(ctx, payload) {
 }
 
 export function recordVerifyOutcome(ctx, payload) {
+  // CLI verification runs commands asynchronously and reports into the latest state.
+  if (payload.source === 'cli') ctx.state = readJsonSafe(ctx.paths.statePath);
   const { stateDir, config, state } = ctx;
-  const pack = state.packs[payload.packId || state.active_pack_id];
-  if (!pack) throw new Error('No active pack found');
+  const pack = getWritablePack(state, payload.packId);
   const budgets = getBudgets(config);
 
   // 'cli' = grow-loop ran the configured commands and checked exit codes itself;
@@ -545,8 +556,7 @@ export function recordVerifyOutcome(ctx, payload) {
 
 export function recordReviewOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
-  const pack = state.packs[payload.packId || state.active_pack_id];
-  if (!pack) throw new Error('No active pack found');
+  const pack = getWritablePack(state, payload.packId);
   const budgets = getBudgets(config);
 
   pack.review_rounds += 1;
@@ -633,15 +643,15 @@ export function recordReviewOutcome(ctx, payload) {
 
   // Review round cap reached (2/2)!
   if (pack.review_rounds >= budgets.maxReviewRounds) {
-    // If still on tier1 and never escalated, give Tier 2 one escalation repair pass (without a 3rd review)
-    if (pack.current_tier === 'tier1') {
+    // Allow a remaining tier2 repair after tier1 without scheduling a third review.
+    if (pack.current_tier === 'tier1' && pack.tier2_repairs < budgets.tier2MaxRepairs) {
       const prev = pack.active_instance;
       const next = resolveTierInstance(config, 'tier2');
       pack.current_tier = 'tier2';
       pack.active_instance = next;
       pack.escalated = true;
       pack.escalation_reason = `Review cap (${pack.review_rounds}/${budgets.maxReviewRounds}) hit on tier1 with ${blocking.length} blocking findings`;
-      pack.tier2_repairs = 1;
+      pack.tier2_repairs += 1;
       pack.last_session_id = null;
       pack.status = 'IMPLEMENT';
       appendEvent(stateDir, config, {
@@ -657,11 +667,10 @@ export function recordReviewOutcome(ctx, payload) {
       return { outcome: 'escalated_tier2_on_review_cap', blocking_count: blocking.length };
     }
 
-    // Already on tier2 and hit 2/2 review cap -> hard brake to human!
     pack.status = 'PAUSED_FOR_HUMAN';
     pack.gate = createGate(
       ALLOWED_GATE_REASONS.REVIEW_CAP_REACHED,
-      `Pack ${pack.id} hit closing review cap (${pack.review_rounds}/${budgets.maxReviewRounds}) on tier2 with ${blocking.length} blocking finding(s).`,
+      `Pack ${pack.id} hit closing review cap (${pack.review_rounds}/${budgets.maxReviewRounds}) on ${pack.current_tier} with ${blocking.length} blocking finding(s).`,
       {
         recommended_action: 'inspect_blocking_findings',
         allowed_resume_actions: ['repair', 'commit', 'abort']
@@ -689,8 +698,7 @@ export function recordReviewOutcome(ctx, payload) {
 
 export function recordCommitOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
-  const pack = state.packs[payload.packId || state.active_pack_id];
-  if (!pack) throw new Error('No active pack found');
+  const pack = getWritablePack(state, payload.packId);
 
   pack.commit = {
     sha: payload.sha,

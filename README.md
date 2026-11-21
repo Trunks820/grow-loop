@@ -101,7 +101,7 @@ node /path/to/grow-loop/bin/grow-loop.mjs init --repo /path/to/your-project --st
 
 在 `.loop/config.json` 配置本机的 `tier1`、`tier2`、`reviewer` 实例和 `verification` 命令。
 
-运行中可以手改状态目录里的 `manifest.json`。`grow-loop status` 会显示待确认的改动，其他工作区命令会暂停，显式替换整份清单的 `init --force --manifest` 除外。用 `grow-loop manifest-ack --reason "补充退款回执的验收条件"` 确认后继续。如果前面的命令用了 `--repo` 或 `--state-dir`，确认时沿用这些参数。确认会在 `events.jsonl` 记录 `manifest_changed` 事件，并更新状态目录里的 `manifest.snapshot.json`。包的运行状态由 CLI 命令维护。
+`grow-loop status` 会显示手改清单后待确认的差异。用 `grow-loop manifest-ack --reason "补充退款回执的验收条件"` 确认后继续。`init --force --manifest` 也可以替换有待确认改动的整份清单。
 
 ### 4. 探活并驱动闭环
 
@@ -127,6 +127,28 @@ grow-loop resume --decision "已确认走单选，批准继续" --action approve
 # 全部包完成后一键产出脱敏双层证据包（.loop/evidence.md）
 grow-loop evidence
 ```
+
+## 中途改动
+
+```bash
+grow-loop pack insert --file followup.json --after W01 --reason "先补迁移检查"
+grow-loop pack insert --file prerequisite.json --before W02 --reason "先补测试数据"
+grow-loop pack tier --id W02 --tier tier2 --reason "需要跨模块修改"
+grow-loop pack scope --id W02 --add src/a.mjs,src/b.mjs --reason "本包处理权限边界" --todo T001
+grow-loop forward --from W01 --to W03 --text "补查旧客户端兼容性" --reason "W03 负责客户端"
+grow-loop forward --to W03 --todo T002 --reason "在兼容性包处理"
+grow-loop todo add --pack W02 --text "src/c.mjs：缺少超时处理" --reason "实现时发现超范围问题"
+grow-loop todo list
+grow-loop todo dismiss --todo T003 --reason "已确认现有重试覆盖该场景"
+```
+
+- `pack insert` 从 UTF-8 JSON 文件读取单个包对象。`--after` 在新包未写 `depends_on` 时让它依赖锚点，并让原来依赖锚点的待开工包也依赖新包。`--before` 让锚点包依赖新包，只能用于 `PENDING` 包。遇到已开工或已完成的锚点请用 `--after`。输出和流水账会列出插入位置与依赖有变化的包。
+- `pack tier` 为待开工包指定开工时采用的档位，拆包等门禁照常生效。已开工包的改档从下次派活起生效。更换执行实例时会清除旧会话，已用的修复次数照计。
+- `pack scope` 去重后扩充 `scope_files`，并把 `estimated_files` 至少提高到范围文件数。可以用逗号分隔文件，也可以重复传 `--add`。修改后的范围会出现在下次生成的实现任务书里。附带 `--todo` 会把该待办标为 `expanded`。
+- `forward` 接受一段文字或一条 open 待办。文字默认来自当前包，可用 `--from` 指定来源包。转待办时沿用它的来源并标为 `forwarded`。目标包的初次实现和修复任务书会列出转来的发现、来源与原因。
+- Codex 实现派活结束后，最终回复中 `## 超范围没改` 下的 `- 位置：说明` 会转成 open 待办。自己执行时用 `todo add` 记录。`todo list` 显示全部待办，`status` 的 `open_todos` 显示待处理项。
+
+写入类命令都需要非空 `--reason`。改清单的命令更新快照，并在 `events.jsonl` 写入 `manifest_changed`，其 `source` 分别为 `pack_insert`、`pack_tier`、`pack_scope`、`forward`。自动及手动新增待办写入 `todo_added`，关闭写入 `todo_dismissed`。修改包目标或验收时，先手改状态目录的 `manifest.json`，再用 `grow-loop manifest-ack --reason "说明为什么改"` 确认，由 `manifest_changed` 记录差异和原因。各命令可沿用工作区的 `--repo` 和 `--state-dir`。
 
 ---
 

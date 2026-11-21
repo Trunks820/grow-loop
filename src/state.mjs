@@ -174,6 +174,7 @@ export function createInitialState(repoDir, stateDir, profileName, manifest) {
     active_pack_id: packOrder[0] || null,
     pack_order: packOrder,
     packs,
+    todos: [],
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString()
   };
@@ -209,6 +210,29 @@ export function saveState(stateDir, state) {
   const { statePath } = getStatePaths(stateDir);
   state.updated_at = new Date().toISOString();
   writeJsonAtomic(statePath, state);
+}
+
+export function addScopeTodos(ctx, { packId, runId = null, texts, reason }) {
+  if (!texts.length) return [];
+  const { stateDir, config, state } = ctx;
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  const todos = state.todos ??= [];
+  const added = [];
+  for (const text of texts) {
+    const todo = {
+      id: `T${String(todos.length + 1).padStart(3, '0')}`,
+      pack_id: packId,
+      run_id: runId,
+      content: redactor.redactString(text),
+      status: 'open',
+      created_at: new Date().toISOString()
+    };
+    todos.push(todo);
+    added.push(todo);
+  }
+  saveState(stateDir, state);
+  for (const todo of added) appendEvent(stateDir, config, { type: 'todo_added', ...todo, reason });
+  return added;
 }
 
 function describeManifestChanges(previous, manifest, config) {
@@ -279,7 +303,7 @@ export function checkManifest(paths, manifest, config, { allowPendingManifest = 
   return { snapshot, pending };
 }
 
-export function writeManifestWithReason(ctx, manifest, reason, source) {
+export function writeManifestWithReason(ctx, manifest, reason, source, details) {
   if (typeof reason !== 'string' || !reason.trim()) {
     throw new Error('Specify a non-empty --reason.');
   }
@@ -290,17 +314,20 @@ export function writeManifestWithReason(ctx, manifest, reason, source) {
   if (!current) throw new Error('Workspace manifest is missing.');
   const alreadyWritten = isDeepStrictEqual(current, manifest);
   // A manual edit made after loading the workspace must stay pending.
-  const { snapshot, pending } = checkManifest(paths, current, config, { allowPendingManifest: alreadyWritten });
+  const { snapshot, pending } = checkManifest(paths, current, config, {
+    allowPendingManifest: source === 'manifest_ack' && alreadyWritten
+  });
   const previous = snapshot || current;
-  if (isDeepStrictEqual(previous, manifest)) return null;
+  const changed = !isDeepStrictEqual(previous, manifest);
+  if (!changed && !details) return null;
 
   const changes = pending?.changes || describeManifestChanges(previous, manifest, config);
   if (!alreadyWritten) writeJsonAtomic(paths.manifestPath, manifest);
-  appendEvent(stateDir, config, { type: 'manifest_changed', source, reason: reason.trim(), changes });
+  appendEvent(stateDir, config, { type: 'manifest_changed', source, reason: reason.trim(), changes, ...(details && { details }) });
   syncManifestIntoState(state, manifest);
   saveState(stateDir, state);
   // A new snapshot marks the audited change as fully applied.
-  writeJsonAtomic(paths.manifestSnapshotPath, manifest);
+  if (changed) writeJsonAtomic(paths.manifestSnapshotPath, manifest);
   ctx.manifest = manifest;
   ctx.manifestChange = null;
   return changes;

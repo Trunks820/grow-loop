@@ -67,6 +67,8 @@ Follow this exact deterministic loop for every work package (`W01`, `W02`, ...):
 
 ### Step 1: Ask the State Machine What to Do Next
 
+Use the commands in [中途改动](README.md#中途改动) to insert a pack, change its tier, expand its scope, forward findings, or manage out-of-scope todos. Edit the manifest and run `manifest-ack` when changing a goal or acceptance criteria.
+
 After a manual edit to `manifest.json`, `status` shows the pending diff and commands such as `next` pause. Review the diff and run `grow-loop manifest-ack --reason "<one sentence>"` with the same workspace options. The CLI records the reason in `events.jsonl` and updates `manifest.snapshot.json` in the state directory. `init --force --manifest <file>` explicitly replaces the whole manifest and resets workspace configuration and state, even when edits are pending.
 
 ```bash

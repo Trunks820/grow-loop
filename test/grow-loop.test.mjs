@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 import {
   createInitialState,
@@ -398,6 +400,230 @@ test('legacy workspaces seed a snapshot and internal manifest writes are audited
     assert.equal(event.source, 'internal_test');
     assert.equal(event.reason, reason);
     assert.deepEqual(runCli(['status'], repoDir).packs.map(({ id }) => id), ['B', 'C']);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('mid-loop pack commands audit insertions, pending tier overrides, scope and forwarded findings', () => {
+  const { repoDir, ctx } = setupCtx([
+    { id: 'A', scope_files: ['src/a.mjs'], estimated_files: 1 },
+    { id: 'B', depends_on: ['A'], risk: 'high', estimated_files: 52, open_questions: ['保留旧入口？'] },
+    { id: 'C', depends_on: ['A', 'B'] }
+  ]);
+  const { paths } = ctx;
+  const cli = (...args) => runCli(args, repoDir);
+  const fail = (...args) => runCliFailure(args, repoDir);
+  const definition = path.join(repoDir, 'pack.json');
+  try {
+    fs.writeFileSync(definition, '\uFEFF' + JSON.stringify({ id: 'PRE', goal: '准备一份测试数据' }), 'utf8');
+    const before = cli('pack', 'insert', '--file', definition, '--before', 'A', '--reason', '补前置数据');
+    assert.deepEqual(before, { ok: true, pack_id: 'PRE', position: 'before', anchor_id: 'A', index: 0, updated_dependencies: ['A'] });
+    assert.equal(cli('next').pack_id, 'PRE');
+
+    writeJsonAtomic(definition, { id: 'MID', goal: '核对回执' });
+    assert.match(fail('pack', 'insert', '--file', definition, '--before', 'PRE', '--reason', '前插').stderr, /Use --after PRE/);
+    const after = cli('pack', 'insert', '--file', definition, '--after', 'A', '--reason', '先核对回执');
+    assert.deepEqual(after, { ok: true, pack_id: 'MID', position: 'after', anchor_id: 'A', index: 2, updated_dependencies: ['B', 'C'] });
+
+    cli('pack', 'tier', '--id', 'B', '--tier', 'tier1', '--reason', '人工确认采用一档');
+    assert.equal(readJsonSafe(paths.statePath).packs.B.current_tier, null);
+    cli('pack', 'scope', '--id', 'A', '--add', 'src/a.mjs,src/b.mjs', '--add', 'src/c.mjs', '--reason', '补齐授权文件');
+    cli('forward', '--from', 'A', '--to', 'B', '--text', '检查旧客户端', '--reason', 'B 负责兼容性');
+    const manifest = readJsonSafe(paths.manifestPath);
+    assert.deepEqual(manifest.packs.map(({ id, depends_on }) => [id, depends_on]), [
+      ['PRE', undefined], ['A', ['PRE']], ['MID', ['A']], ['B', ['A', 'MID']], ['C', ['A', 'B', 'MID']]
+    ]);
+    assert.deepEqual(manifest.packs[1].scope_files, ['src/a.mjs', 'src/b.mjs', 'src/c.mjs']);
+    assert.equal(manifest.packs[1].estimated_files, 3);
+    assert.equal(manifest.packs[3].tier, 'tier1');
+    assert.deepEqual(readJsonSafe(paths.manifestSnapshotPath), manifest);
+    assert.equal(cli('status').manifest_change_pending, undefined);
+    const audited = readEvents(paths.eventsPath).filter(({ type }) => type === 'manifest_changed');
+    assert.deepEqual(audited.map(({ source, reason }) => [source, reason]), [
+      ['pack_insert', '补前置数据'], ['pack_insert', '先核对回执'], ['pack_tier', '人工确认采用一档'],
+      ['pack_scope', '补齐授权文件'], ['forward', 'B 负责兼容性']
+    ]);
+    assert.deepEqual(audited[1].details.updated_dependencies, ['B', 'C']);
+    assert.equal(audited[1].details.anchor_id, 'A');
+
+    for (const id of ['PRE', 'A', 'MID']) {
+      assert.equal(cli('next').pack_id, id);
+      cli('record', 'commit', '--sha', '123456789');
+    }
+    assert.equal(cli('next').gate.reason, ALLOWED_GATE_REASONS.BLAST_RADIUS_SPLIT);
+    assert.equal(cli('resume', '--decision', '批准按现有范围继续').next.gate.reason, ALLOWED_GATE_REASONS.AMBIGUITY);
+    cli('resume', '--decision', '保留旧入口');
+    assert.equal(cli('next').tier, 'tier1');
+    assert.match(readJsonSafe(paths.statePath).packs.B.blast_radius.reasons.join(' '), /manual tier=tier1/);
+
+    manifest.packs[3].acceptance_criteria = ['旧客户端仍能打开'];
+    writeJsonAtomic(paths.manifestPath, manifest);
+    assert.equal(JSON.parse(fail('pack', 'tier', '--id', 'B', '--tier', 'tier2', '--reason', '待确认').stdout).error, 'manifest_changed');
+    cli('manifest-ack', '--reason', '验收覆盖旧入口');
+    const ack = readEvents(paths.eventsPath).at(-1);
+    assert.equal(ack.reason, '验收覆盖旧入口');
+    assert.equal(ack.changes.changed_packs[0].fields[0].field, 'acceptance_criteria');
+
+    const task = (...args) => fs.readFileSync(path.join(cli('dispatch', '--dry-run', ...args).run_dir, 'task.md'), 'utf8');
+    assert.match(task(), /## 转来的发现\n- 来源包 A。原因：B 负责兼容性\n  检查旧客户端/);
+    cli('record', 'implement', '--failed');
+    const repair = task();
+    assert.match(repair, /REPAIR/);
+    assert.match(repair, /## 转来的发现/);
+    assert.match(repair, /旧客户端仍能打开/);
+    assert.doesNotMatch(task('--stage', 'review'), /转来的发现|超范围没改/);
+
+    writeJsonAtomic(definition, { id: 'LATE', depends_on: [] });
+    assert.match(fail('pack', 'insert', '--file', definition, '--before', 'MID', '--reason', '前插').stderr, /Use --after MID/);
+    cli('pack', 'insert', '--file', definition, '--after', 'PRE', '--reason', '记录独立后续工作');
+    const updated = readJsonSafe(paths.manifestPath);
+    assert.deepEqual(updated.packs.find(({ id }) => id === 'LATE').depends_on, []);
+    assert.deepEqual(updated.packs.find(({ id }) => id === 'A').depends_on, ['PRE']);
+    assert.equal(cli('status').active_pack_id, 'B');
+    for (const args of [
+      ['pack', 'tier', '--id', 'A', '--tier', 'tier2'],
+      ['pack', 'scope', '--id', 'A', '--add', 'src/d.mjs'],
+      ['forward', '--to', 'A', '--text', '新发现']
+    ]) assert.match(fail(...args, '--reason', '尝试改已完成的包').stderr, /already committed/);
+    assert.deepEqual(readJsonSafe(paths.manifestPath), updated);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('out-of-scope todos can be added, expanded, forwarded and dismissed with an audit trail', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', estimated_files: 9 }, { id: 'B' }]);
+  const cli = (...args) => runCli(args, repoDir);
+  const fail = (...args) => runCliFailure(args, repoDir);
+  try {
+    delete ctx.state.todos;
+    saveState(ctx.stateDir, ctx.state);
+    assert.deepEqual(cli('todo', 'list').todos, []);
+    for (const args of [
+      ['pack', 'insert', '--file', 'pack.json', '--after', 'A'],
+      ['pack', 'tier', '--id', 'A', '--tier', 'tier2'],
+      ['pack', 'scope', '--id', 'A', '--add', 'lib.mjs'],
+      ['forward', '--to', 'B', '--text', '检查参数'],
+      ['todo', 'add', '--pack', 'A', '--text', '检查参数'],
+      ['todo', 'dismiss', '--todo', 'T001']
+    ]) assert.match(fail(...args, '--reason', '  ').stderr, /non-empty --reason/);
+
+    const add = (content) => cli('todo', 'add', '--pack', 'A', '--text', content, '--reason', '指挥手动记录').todo;
+    const expanded = add('src/lib.mjs：补参数检查');
+    const forwarded = add('src/client.mjs：补兼容性');
+    const dismissed = add('src/retry.mjs：检查超时');
+    assert.equal(expanded.run_id, null);
+    assert.equal(expanded.pack_id, 'A');
+    assert.deepEqual(cli('status').open_todos.map(({ id }) => id), [expanded.id, forwarded.id, dismissed.id]);
+    assert.deepEqual(readJsonSafe(ctx.paths.manifestPath), ctx.manifest);
+
+    assert.match(fail('forward', '--to', 'B', '--text', '检查参数', '--todo', forwarded.id, '--reason', '选一个').stderr, /exactly one/);
+    cli('pack', 'scope', '--id', 'A', '--add', 'src/lib.mjs', '--todo', expanded.id, '--reason', '归到本包');
+    cli('forward', '--to', 'B', '--todo', forwarded.id, '--reason', '交给 B');
+    cli('todo', 'dismiss', '--todo', dismissed.id, '--reason', '现有逻辑覆盖');
+    assert.match(fail('todo', 'dismiss', '--todo', expanded.id, '--reason', '重复关闭').stderr, /already expanded/);
+    assert.deepEqual(cli('todo', 'list').todos.map(({ status, target_pack_id }) => [status, target_pack_id]), [
+      ['expanded', 'A'], ['forwarded', 'B'], ['dismissed', undefined]
+    ]);
+    assert.deepEqual(cli('status').open_todos, []);
+    const [a, b] = readJsonSafe(ctx.paths.manifestPath).packs;
+    assert.equal(a.estimated_files, 9);
+    assert.deepEqual(b.forwarded_findings[0], {
+      from_pack_id: 'A', content: forwarded.content, reason: '交给 B', at: b.forwarded_findings[0].at
+    });
+    assert.ok(Number.isFinite(Date.parse(b.forwarded_findings[0].at)));
+    const events = readEvents(ctx.paths.eventsPath);
+    assert.equal(events.filter(({ type, reason }) => type === 'todo_added' && reason === '指挥手动记录').length, 3);
+    assert.equal(events.find(({ source }) => source === 'pack_scope').details.todo_id, expanded.id);
+    assert.equal(events.find(({ source }) => source === 'forward').details.todo_id, forwarded.id);
+    assert.equal(events.at(-1).type, 'todo_dismissed');
+    assert.equal(events.at(-1).reason, '现有逻辑覆盖');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('running Codex dispatch keeps its task and route while final markdown produces open todos', async () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['src/a.mjs'] }]);
+  const cli = (...args) => runCli(args, repoDir);
+  const ready = path.join(repoDir, 'executor-ready');
+  const release = path.join(repoDir, 'executor-release');
+  const mock = path.join(repoDir, 'mock-codex.cjs');
+  const final = [
+    '## Summary', '- Other: ignore this', '```md', '## 超范围没改', '- Fenced: ignore this', '```',
+    '## 超范围没改', '- src/out.mjs：抽取共享校验', '', '无效行', '- 未说明：', '- src/another.mjs: 补异常处理'
+  ].join('\r\n');
+  try {
+    fs.writeFileSync(mock, `
+      const fs = require('node:fs');
+      const args = process.argv.slice(2);
+      process.stdin.resume();
+      fs.writeFileSync(${JSON.stringify(ready)}, 'ready');
+      const timer = setInterval(() => {
+        if (!fs.existsSync(${JSON.stringify(release)})) return;
+        clearInterval(timer);
+        fs.writeFileSync(args[args.indexOf('--output-last-message') + 1], ${JSON.stringify(final)});
+        console.log(JSON.stringify({ thread_id: 'old-executor-session' }));
+      }, 25);
+    `);
+    ctx.config.executors['tier1-cli'] = { kind: 'codex', executable: process.execPath, prefix_args: [mock] };
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    cli('next');
+    cli('record', 'implement', '--failed', '--session-id', 'old-executor-session');
+    const running = promisify(execFile)(process.execPath, [CLI_PATH, 'dispatch', '--resume', '--timeout', '20'], {
+      cwd: repoDir, encoding: 'utf8', env: { ...process.env, GROW_LOOP_STATE_DIR: '' }
+    });
+    // Attach before polling so a failing mock cannot cause an unhandled rejection.
+    running.catch(() => {});
+    try {
+      for (let i = 0; i < 200 && !fs.existsSync(ready); i++) await delay(25);
+      assert.ok(fs.existsSync(ready), 'Codex fixture did not start');
+      cli('pack', 'tier', '--id', 'A', '--tier', 'tier2', '--reason', '切到二档接力');
+      cli('pack', 'scope', '--id', 'A', '--add', 'src/b.mjs', '--reason', '补齐下一次任务的范围');
+      cli('todo', 'add', '--pack', 'A', '--text', '独立待办', '--reason', '任务运行中补记');
+    } finally {
+      fs.writeFileSync(release, 'release');
+      await running;
+    }
+    const run = JSON.parse((await running).stdout);
+    assert.equal(run.transition.outcome, 'ready_for_verify');
+    const task = fs.readFileSync(path.join(run.run_dir, 'task.md'), 'utf8');
+    assert.match(task, /REPAIR \(tier1 attempt 1\)/);
+    assert.match(task, /`## 超范围没改`.*`- 位置：说明`/);
+    assert.doesNotMatch(task, /src\/b\.mjs/);
+    const persisted = readJsonSafe(ctx.paths.statePath).packs.A;
+    assert.equal(persisted.current_tier, 'tier2');
+    assert.equal(persisted.active_instance, 'tier2-cli');
+    assert.equal(persisted.last_session_id, null);
+    assert.equal(persisted.escalated, true);
+    assert.match(persisted.escalation_reason, /切到二档接力/);
+    assert.equal(persisted.tier1_repairs, 1);
+    assert.equal(persisted.tier2_repairs, 0);
+
+    const todos = cli('status').open_todos;
+    assert.deepEqual(todos.map(({ pack_id, run_id, content, status }) => [pack_id, run_id, content, status]), [
+      ['A', null, '独立待办', 'open'], ['A', run.run_id, 'src/out.mjs：抽取共享校验', 'open'],
+      ['A', run.run_id, 'src/another.mjs: 补异常处理', 'open']
+    ]);
+    const completed = readEvents(ctx.paths.eventsPath).find(({ type }) => type === 'implement_completed');
+    assert.equal(completed.instance, 'tier1-cli');
+    assert.equal(completed.tier, 'tier1');
+
+    cli('record', 'verify', '--failed', '--summary', '准备下一份修复任务');
+    const preview = cli('dispatch', '--dry-run', '--resume');
+    assert.equal(preview.dry_run.instance_id, 'tier2-cli');
+    assert.match(fs.readFileSync(path.join(preview.run_dir, 'task.md'), 'utf8'), /src\/b\.mjs/);
+    cli('dispatch', '--stage', 'review', '--instance', 'tier1-cli');
+    assert.deepEqual(cli('status').open_todos, todos);
+
+    cli('pack', 'tier', '--id', 'A', '--tier', 'tier1', '--reason', '一档再核对一次');
+    assert.equal(cli('record', 'implement', '--failed').outcome, 'repair_tier1');
+    assert.equal(cli('record', 'implement', '--failed').attempt, 2);
+    assert.equal(cli('status').packs[0].repairs, '2/2');
+    cli('pack', 'tier', '--id', 'A', '--tier', 'tier1', '--reason', '复核原档位');
+    assert.equal(cli('record', 'implement', '--failed').outcome, 'paused_budget_exceeded');
+    assert.equal(cli('status').packs[0].repairs, '2/2');
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
