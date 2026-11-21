@@ -83,12 +83,14 @@ node <GROW_LOOP_BIN> next --repo <repo>
 | Returned `action` | What Coordinator Must Do |
 |---|---|
 | `NEEDS_FILL` | Complete the listed handoff fields before dispatch. Add files with `pack scope` or edit `manifest.json` to fill `scope_files`, `risk`, or `tags`. Acknowledge manual edits with `manifest-ack`, then rerun `next`. |
-| `PAUSE_FOR_HUMAN` | **STOP the loop immediately.** Present `gate.reason`, `gate.summary`, `gate.questions` (if any), and the exact `resume_hint` options to the user. For `EXTERNAL_COMMIT`, include the listed commits and conflicting paths. Wait for human input, then call `grow-loop resume --decision "..." --action <...>`. |
+| `PAUSE_FOR_HUMAN` | **STOP the loop immediately.** Present the returned `question` with its options. Wait for human input, then submit the chosen option and the user's exact words via `grow-loop answer`. The existing `resume` command also accepts gate decisions. |
 | `IMPLEMENT` | Execute implementation on the assigned `tier` & `instance` (see Step 2). |
 | `VERIFY` | Run `grow-loop verify`. The CLI runs global `verification.commands` followed by the pack's `verify_commands` and records the outcome from exit codes. **Verify ALWAYS runs before Review.** |
 | `REVIEW` | Run a **read-only closing review**. External dispatch records the returned Markdown report automatically. For self-review, submit the Markdown with `grow-loop record review --report <report.md>`. |
 | `COMMIT` | Review `stray_files`, move flagged artifacts to the specified directory, stage explicit package files, commit locally, and call `grow-loop record commit --from-git`. |
 | `COMPLETED` | All packs are committed! Run `grow-loop evidence` to generate the redacted two-layer evidence pack and report to the user. |
+
+Shell integrations can read `grow-loop status --format shell` for the current phase, next command, and question. See [Shell API](docs/SHELL-API.md) for the versioned contract and answer arguments.
 
 ### Step 2: Executing `IMPLEMENT` (External Adapter vs `self`)
 - Before dispatch, the coordinator reads the relevant code and fills in the pack's `pitfalls`, `co_change_files`, and `preserve_behaviors`. Name the file or function for each pitfall. When following an existing rule, name the function that implements it. Copy the plan's `decisions` with the original question, wording, and time if known. Check `warnings` from `next` and `dispatch --dry-run`.

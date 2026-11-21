@@ -292,7 +292,17 @@ test('init --handoff preserves plan order and gates preflight until required fie
     assert.equal(fill.pack_id, 'W9');
     assert.deepEqual(fill.needs, needs);
     assert.ok(fill.next_steps.some((step) => step.includes('pack scope')));
-    assert.match(fail('dispatch', '--dry-run').stderr, /finish handoff preflight/);
+    const shell = cli('status', '--format', 'shell');
+    assert.deepEqual(shell.question, fill.question);
+    assert.equal(shell.now.waiting_for, 'human');
+    assert.equal(shell.now.reason, 'NEEDS_FILL');
+    assert.deepEqual(shell.question.options, []);
+    assert.equal(shell.question.answer_command, null);
+    for (const field of needs) assert.ok(shell.question.body.includes(field));
+    assert.match(shell.question.body, /manifest\.json/);
+    const blocked = fail('dispatch', '--dry-run');
+    assert.match(blocked.stderr, /finish handoff preflight/);
+    assert.deepEqual(JSON.parse(blocked.stdout).question, fill.question);
     assert.match(fail('record', 'implement', '--passed').stderr, /finish handoff preflight/);
     assert.deepEqual(readJsonSafe(paths.statePath), state);
     assert.ok(!readEvents(paths.eventsPath).some(({ type }) => type === 'preflight_evaluated'));
@@ -538,6 +548,79 @@ test('workspace commands block on manifest changes until a reason is recorded', 
   }
 });
 
+test('shell status and answer acknowledge a changed manifest, reject stale questions and resume with verbatim text', () => {
+  const { repoDir, ctx } = setupCtx([
+    { id: 'W1', title: '确认界面行为', open_questions: ['是否保留单选？'] },
+    { id: 'W2', title: '验证界面行为', depends_on: ['W1'] }
+  ]);
+  const cli = (...args) => runCli(args, repoDir);
+  const fail = (...args) => runCliFailure(args, repoDir);
+  const status = () => cli('status', '--format', 'shell');
+  const answer = (question, option) => ['answer', '--question', question.id, '--option', option];
+  try {
+    const { question: gate } = cli('next');
+    assert.equal(gate.kind, 'AMBIGUITY');
+    assert.match(gate.body, /是否保留单选/);
+    assert.deepEqual(status().question, gate);
+    ctx.manifest.packs[0].acceptance_criteria = ['保留单选'];
+    writeJsonAtomic(ctx.paths.manifestPath, ctx.manifest);
+    const pending = status();
+    assert.equal(pending.schema, 'grow-loop.status/1');
+    assert.equal(pending.loop_status, 'RUNNING');
+    assert.equal(pending.active_pack_id, 'W1');
+    assert.deepEqual(pending.now, {
+      pack_id: 'W1', phase: 'MANIFEST_CHANGED', waiting_for: 'human', reason: 'MANIFEST_CHANGED',
+      next_command: pending.question.answer_command
+    });
+    assert.deepEqual(pending.packs, [
+      { id: 'W1', title: '确认界面行为', status: 'PAUSED_FOR_HUMAN', tier: 'tier1', instance: 'tier1-cli',
+        tier1_repairs: 0, tier2_repairs: 0, review_rounds: 0, needs: [], inflight_run: null, commit: null, gate: 'AMBIGUITY' },
+      { id: 'W2', title: '验证界面行为', status: 'PENDING', tier: null, instance: null,
+        tier1_repairs: 0, tier2_repairs: 0, review_rounds: 0, needs: [], inflight_run: null, commit: null, gate: null }
+    ]);
+    assert.deepEqual(pending.pending, {
+      manifest_change: cli('status').manifest_change_pending, lesson_drafts: 0, open_todos: 0, in_round_tech_debt: 0
+    });
+    assert.deepEqual(JSON.parse(fail('next').stdout).question, pending.question);
+    assert.deepEqual(status().question, pending.question);
+    assert.equal(pending.question.options[0].label, '确认这些改动');
+    assert.match(fail(...answer(gate, 'approve'), '--text', '同意').stderr, /重新运行 grow-loop status --format shell/);
+    assert.match(fail(...answer(pending.question, 'confirm')).stderr, /非空的 --text/);
+
+    ctx.manifest.packs[0].acceptance_criteria.push('核对键盘操作');
+    writeJsonAtomic(ctx.paths.manifestPath, ctx.manifest);
+    assert.match(fail(...answer(pending.question, 'confirm'), '--text', '过期回答').stderr, /已经变化/);
+    const { question: latest } = status();
+    assert.notEqual(latest.id, pending.question.id);
+    const reason = '--补充验收\n确认键盘操作。  ';
+    assert.equal(cli(...answer(latest, 'confirm'), `--text=${reason}`).ok, true);
+    assert.equal(readEvents(ctx.paths.eventsPath).at(-1).details.answer_text, reason);
+    assert.equal(status().pending.manifest_change, null);
+    assert.match(fail(...answer(latest, 'confirm'), '--text', reason).stderr, /已经变化/);
+
+    const reopened = status();
+    assert.equal(reopened.now.reason, 'AMBIGUITY');
+    assert.deepEqual(reopened.question.options.map(({ id, needs_text }) => [id, needs_text]), [['approve', true], ['abort', false]]);
+    assert.match(fail(...answer(reopened.question, 'repair')).stderr, /没有该选项/);
+    assert.match(fail(...answer(reopened.question, 'approve'), '--text', '   ').stderr, /非空的 --text/);
+    const decision = '  按单选执行。\n键盘操作照旧。  ';
+    const approval = cli(...answer(reopened.question, 'approve'), '--text', decision);
+    assert.equal(approval.next.action, 'IMPLEMENT');
+    assert.equal(readEvents(ctx.paths.eventsPath).find(({ type }) => type === 'gate_resumed').decision, decision);
+    assert.equal(readJsonSafe(ctx.paths.statePath).packs.W1.resolved_gates.AMBIGUITY.decision, decision);
+    assert.deepEqual(status().now, {
+      pack_id: 'W1', phase: 'IMPLEMENT', waiting_for: 'coordinator', reason: null, next_command: 'grow-loop dispatch --dry-run'
+    });
+    const taskFile = path.join(cli('dispatch', '--dry-run').run_dir, 'task.md');
+    const task = fs.readFileSync(taskFile, 'utf8').split('## 已经定了的')[1];
+    assert.ok(task.includes(`\n${reason}\n`) && task.includes(`\n${decision}\n`));
+    assert.equal(status().now.next_command, 'grow-loop dispatch');
+    assert.equal(status().question, null);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('legacy workspaces seed a snapshot and internal manifest writes are audited immediately', () => {
   const { repoDir, ctx } = setupCtx([{ id: 'A' }]);
   try {
@@ -751,6 +834,10 @@ test('running Codex dispatch keeps its task and route while final markdown produ
       const pending = () => readJsonSafe(ctx.paths.statePath).packs.A.inflight_run?.session_id;
       for (let i = 0; i < 200 && pending() !== 'running-executor-session'; i++) await delay(25);
       assert.equal(cli('status').packs[0].inflight_run.session_id, 'running-executor-session');
+      const shell = cli('status', '--format', 'shell');
+      assert.equal(shell.now.waiting_for, 'executor');
+      assert.equal(shell.now.next_command, null);
+      assert.deepEqual(shell.packs[0].inflight_run, { stage: 'implement', started_at: readJsonSafe(ctx.paths.statePath).packs.A.inflight_run.started_at });
       cli('pack', 'tier', '--id', 'A', '--tier', 'tier2', '--reason', '切到二档接力');
       cli('pack', 'scope', '--id', 'A', '--add', 'src/b.mjs', '--reason', '补齐下一次任务的范围');
       cli('todo', 'add', '--pack', 'A', '--text', '独立待办', '--reason', '任务运行中补记');
@@ -944,6 +1031,7 @@ test('infra failures (429/auth/timeout) NEVER consume repair budget; fallback on
       summary: 'HTTP 429 rate limit exceeded'
     });
     assert.equal(out.outcome, 'paused_infra_blocked');
+    assert.equal(out.question.kind, 'INFRA_BLOCKED');
     assert.equal(ctx.state.packs.W01.gate.reason, ALLOWED_GATE_REASONS.INFRA_BLOCKED);
     assert.equal(ctx.state.packs.W01.tier1_repairs, 0);
     assert.equal(ctx.state.packs.W01.tier2_repairs, 0);
@@ -953,6 +1041,13 @@ test('infra failures (429/auth/timeout) NEVER consume repair budget; fallback on
     const resumed = resumeFromGate(ctx, { action: 'retry', decision: 'Quota restored' });
     assert.equal(resumed.outcome, 'resumed_implement');
     assert.equal(ctx.state.packs.W01.tier1_repairs, 0);
+
+    const { question } = runCli(['record', 'implement', '--infra-error', 'INFRA_AUTH'], repoDir);
+    const alternate = question.options.find(({ label }) => label.includes('tier2-cli'));
+    assert.ok(alternate.id.startsWith('switch_instance:'));
+    const switched = runCli(['answer', '--question', question.id, '--option', alternate.id], repoDir);
+    assert.equal(switched.outcome, 'switched_instance');
+    assert.equal(switched.active_instance, 'tier2-cli');
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
@@ -1136,6 +1231,10 @@ if (!fs.existsSync('service-ready')) {
       runCli(['record', 'implement', '--passed', '--session-id', 'original-session'], repoDir);
       const failure = runCli(['verify'], repoDir);
       assert.equal(failure.transition.outcome, exhausted ? 'paused_budget_exceeded' : 'escalated_tier2');
+      if (exhausted) {
+        assert.deepEqual(failure.question, failure.transition.question);
+        assert.deepEqual(failure.question.options.map(({ id }) => id), failure.transition.gate.allowed_resume_actions);
+      }
       assert.equal(failure.run_dirs.length, 1);
       const failedPack = readJsonSafe(ctx.paths.statePath).packs.W;
       assert.equal(failedPack.current_tier, exhausted ? 'tier1' : 'tier2');
@@ -1442,6 +1541,7 @@ test('dispatch records valid reviews, rejects invalid reports, and settles in-ro
     assert.equal(readPack().last_review.reviewer, 'reviewer-cli');
     assert.equal(readPack().last_review.reviewer_model, 'review-model');
     assert.deepEqual(readJsonSafe(ctx.paths.techDebtJsonPath).items.map(({ status }) => status), ['IN_ROUND', 'IN_ROUND']);
+    assert.deepEqual(cli('status', '--format', 'shell').pending, { manifest_change: null, lesson_drafts: 1, open_todos: 0, in_round_tech_debt: 2 });
     const repair = cli('dispatch', '--dry-run');
     const repairTask = fs.readFileSync(path.join(repair.run_dir, 'task.md'), 'utf8');
     assert.match(repairTask, /## Blocking Findings to Fix\r?\n- .*Retry skips verification/);
@@ -1538,6 +1638,7 @@ test('review severity floor overrides fail on MEDIUM/LOW only, and 2-round revie
     recordImplementOutcome(b.ctx, { passed: true });
     const vFinal = recordVerifyOutcome(b.ctx, { passed: true, summary: 'all checks green' });
     assert.equal(vFinal.outcome, 'paused_review_cap_verified');
+    assert.deepEqual(vFinal.question.options.map(({ id }) => id), ['commit', 'repair', 'abort']);
     assert.equal(b.ctx.state.packs.W01.gate.reason, ALLOWED_GATE_REASONS.REVIEW_CAP_REACHED);
     assert.equal(readJsonSafe(b.ctx.paths.techDebtJsonPath).items[0].status, 'IN_ROUND');
     runCli(['resume', '--action', 'commit', '--decision', 'Verification passed after the review cap'], b.repoDir);
@@ -2250,6 +2351,9 @@ test('self dispatch records implementation and review time and commit checks fla
     cli('manifest-ack', '--reason', '补录审查要核对的既有行为');
     const review = cli('dispatch', '--stage', 'review');
     assert.equal(review.run_id, reviewPreview.run_id);
+    const shellReview = cli('status', '--format', 'shell');
+    assert.equal(shellReview.now.waiting_for, 'coordinator');
+    assert.equal(shellReview.now.next_command, 'grow-loop record review --report <report.md>');
     assert.equal(review.result.task_file, reviewPreview.dry_run.task_file);
     assert.match(fs.readFileSync(review.result.task_file, 'utf8'), /保留原有输出/);
     const reportPath = path.join(paths.artifactsDir, 'self-pack', 'review.md');
@@ -2346,10 +2450,16 @@ test('Git checkpoints warn once for unrelated commits and gate current and compl
     assert.deepEqual(reviewGate.gate.conflicting_files, ['active.js']);
     assert.ok(reviewGate.gate.external_commits.some(({ sha }) => sha === scoped));
     assert.deepEqual(reviewGate.gate.allowed_resume_actions, ['approve', 'abort']);
+    assert.ok(reviewGate.question.body.includes(scoped) && reviewGate.question.body.includes('active.js'));
+    assert.deepEqual(reviewGate.question, cli('status', '--format', 'shell').question);
     assert.equal(runCliFailure(['resume', '--action', 'commit'], repoDir).status, 1);
-    assert.equal(cli('record', 'commit', '--sha', scoped).action, 'PAUSE_FOR_HUMAN');
+    const blockedRecord = cli('record', 'commit', '--sha', scoped);
+    assert.equal(blockedRecord.action, 'PAUSE_FOR_HUMAN');
+    assert.deepEqual(blockedRecord.question, reviewGate.question);
     const decision = '  对照过当前文件，允许从此处继续。\n已核对外部提交。  ';
-    assert.equal(cli('resume', '--action', 'approve', '--decision', decision).status, 'REVIEW');
+    const answer = ['answer', '--question', reviewGate.question.id, '--option', 'approve'];
+    assert.match(runCliFailure(answer, repoDir).stderr, /非空的 --text/);
+    assert.equal(cli(...answer, '--text', decision).status, 'REVIEW');
     assert.equal(saved().base_commit, scoped);
     assert.equal(saved().resolved_gates.EXTERNAL_COMMIT.decision, decision);
     cli('record', 'review', '--verdict', 'pass');
@@ -2374,6 +2484,10 @@ test('Git checkpoints warn once for unrelated commits and gate current and compl
     assert.equal(cli('resume', '--decision', '批准此 HEAD，保留本包提交').base_commit, own);
     assert.equal(cli('record', 'commit', '--from-git').outcome, 'committed');
     assert.equal(saved().commit.sha, own);
+    const shell = cli('status', '--format', 'shell');
+    assert.equal(shell.now.waiting_for, 'none');
+    assert.equal(shell.now.next_command, null);
+    assert.equal(shell.packs[1].commit, own);
     const notices = readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'external_commits_noticed');
     assert.deepEqual(notices.map(({ commits }) => commits), [[{ sha: unrelated, files: ['unrelated.js'] }]]);
   } finally {

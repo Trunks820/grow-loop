@@ -9,6 +9,7 @@ import { addLesson, closeLessonsForPack, deferInRoundTechDebt, recordReviewTechD
 import { getBlockingReviewSeverities } from './review-report.mjs';
 import { checkExternalCommits, readCommitFiles, readGitPosition, scanStrayFiles } from './git-watch.mjs';
 import { writeRunResult } from './adapters/base.mjs';
+import { buildQuestion, NEXT_COMMANDS } from './shell-api.mjs';
 
 const PREFLIGHT_GATE_REASONS = new Set([
   ALLOWED_GATE_REASONS.BLAST_RADIUS_SPLIT,
@@ -47,9 +48,11 @@ export function getPackDef(manifest, packId) {
   return (manifest.packs || []).find((p) => p.id === packId) || null;
 }
 
-export function requireHandoffPreflight(pack, packDef) {
+export function requireHandoffPreflight(pack, packDef, ctx) {
   if (packDef?.handoff && (pack.status === 'PENDING' || PREFLIGHT_GATE_REASONS.has(pack.gate?.reason))) {
-    throw new Error('Run "grow-loop next" and follow its directive to finish handoff preflight.');
+    const error = new Error('Run "grow-loop next" and follow its directive to finish handoff preflight.');
+    if (ctx) error.question = buildQuestion(ctx, pack);
+    throw error;
   }
 }
 
@@ -132,7 +135,8 @@ export function startOrAdvanceActivePack(ctx) {
         action: 'NEEDS_FILL',
         pack_id: activeId,
         needs,
-        next_steps: [...handoffFillSteps(needs), 'Run: grow-loop next'],
+        next_steps: [...handoffFillSteps(needs), `Run: ${NEXT_COMMANDS.next}`],
+        question: buildQuestion(ctx, pack),
         warnings: taskBriefWarnings(packDef, config)
       };
     }
@@ -148,6 +152,7 @@ export function startOrAdvanceActivePack(ctx) {
         action: 'BLOCKED_DEPENDENCY',
         pack_id: activeId,
         missing_dependencies: deps.missing,
+        question: buildQuestion(ctx, pack),
         warnings: taskBriefWarnings(packDef, config),
         message: `Pack ${activeId} waiting on uncommitted dependencies: ${deps.missing.join(', ')}`
       };
@@ -270,7 +275,8 @@ export function buildNextDirective(ctx, pack, packDef) {
       action: 'PAUSE_FOR_HUMAN',
       ...packInfo,
       gate: pack.gate,
-      resume_hint: `grow-loop resume --decision "<your decision>" --action <${(pack.gate?.allowed_resume_actions || ['approve']).join('|')}>`
+      resume_hint: `grow-loop resume --decision "<your decision>" --action <${(pack.gate?.allowed_resume_actions || ['approve']).join('|')}>`,
+      question: buildQuestion(ctx, pack)
     };
   }
 
@@ -291,7 +297,7 @@ export function buildNextDirective(ctx, pack, packDef) {
       new_tests_policy: config?.verification?.new_tests || 'optional',
       injected_lessons: injectedLessons(),
       pending_blocking_findings: pack.pending_blocking_findings || [],
-      next_command: `grow-loop dispatch --dry-run (then grow-loop dispatch)`
+      next_command: `${NEXT_COMMANDS.dryRun} (then ${NEXT_COMMANDS.dispatch})`
     };
   }
 
@@ -305,7 +311,7 @@ export function buildNextDirective(ctx, pack, packDef) {
         commands: getVerificationCommands(config, packDef),
         new_tests, timeout_sec, output_encoding, retry_once
       }),
-      next_command: 'grow-loop verify (runs global and pack commands and records exit codes); use "grow-loop record verify --failed ..." only for failures found outside those commands'
+      next_command: `${NEXT_COMMANDS.verify} (runs global and pack commands and records exit codes); use "grow-loop record verify --failed ..." only for failures found outside those commands`
     };
   }
 
@@ -323,7 +329,7 @@ export function buildNextDirective(ctx, pack, packDef) {
       reviewer_instance: reviewerInstance,
       read_only: true,
       previous_blocking_findings: pack.pending_blocking_findings || [],
-      next_command: 'grow-loop dispatch --stage review (self: grow-loop record review --report <report.md>)'
+      next_command: `${NEXT_COMMANDS.review} (self: ${NEXT_COMMANDS.report})`
     };
   }
 
@@ -336,7 +342,7 @@ export function buildNextDirective(ctx, pack, packDef) {
       ...scanStrayFiles(ctx, pack, packDef),
       ...(gitWatch && { git_watch: gitWatch }),
       approval_note: 'Local commit ONLY (git add explicit files + git commit). NEVER git push / merge / deploy without RELEASE gate.',
-      next_command: `Commit locally, then call: grow-loop record commit --from-git`
+      next_command: `Commit locally, then call: ${NEXT_COMMANDS.commit}`
     };
   }
 
@@ -456,19 +462,20 @@ export function applyRepairLadder(ctx, pack, source, reasonSummary) {
     summary: pack.gate.summary
   });
   saveState(stateDir, stateFor(ctx));
-  return { outcome: 'paused_budget_exceeded', gate: pack.gate };
+  return { outcome: 'paused_budget_exceeded', gate: pack.gate, question: buildQuestion(ctx, pack) };
 }
 
 function stateFor(ctx) {
   return ctx.state;
 }
 
-function getWritablePack({ state, manifest }, packId) {
+function getWritablePack(ctx, packId) {
+  const { state, manifest } = ctx;
   const pack = state.packs[packId || state.active_pack_id];
   if (!pack) throw new Error('No active pack found');
   if (pack.status === 'COMMITTED') throw new Error(`Pack ${pack.id} is already committed.`);
   if (state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
-  requireHandoffPreflight(pack, getPackDef(manifest, pack.id));
+  requireHandoffPreflight(pack, getPackDef(manifest, pack.id), ctx);
   return pack;
 }
 
@@ -562,7 +569,7 @@ export function recordImplementOutcome(ctx, payload) {
       }
     );
     saveState(stateDir, state);
-    return { outcome: 'paused_infra_blocked', gate: pack.gate };
+    return { outcome: 'paused_infra_blocked', gate: pack.gate, question: buildQuestion(ctx, pack) };
   }
 
   if (payload.passed) {
@@ -722,7 +729,7 @@ export function recordVerifyOutcome(ctx, payload) {
       summary: pack.gate.summary
     });
     saveState(stateDir, state);
-    return { outcome: 'paused_review_cap_verified', gate: pack.gate };
+    return { outcome: 'paused_review_cap_verified', gate: pack.gate, question: buildQuestion(ctx, pack) };
   }
 
   pack.status = 'REVIEW';
@@ -874,7 +881,7 @@ export function recordReviewOutcome(ctx, payload) {
       summary: pack.gate.summary
     });
     saveState(stateDir, state);
-    return { outcome: 'paused_review_cap_reached', blocking_count: blocking.length, gate: pack.gate };
+    return { outcome: 'paused_review_cap_reached', blocking_count: blocking.length, gate: pack.gate, question: buildQuestion(ctx, pack) };
   }
 
   // Review round 1 failed -> enter standard 2+2 repair ladder
@@ -1053,7 +1060,10 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
     pack.status = prevGate.resume_status;
     pack.gate = prevGate.prior_gate ?? null;
     saveState(stateDir, state);
-    return { outcome: 'approved', pack_id: pack.id, status: pack.status, base_commit: pack.base_commit };
+    return {
+      outcome: 'approved', pack_id: pack.id, status: pack.status, base_commit: pack.base_commit,
+      ...(pack.status === 'PAUSED_FOR_HUMAN' && { question: buildQuestion(ctx, pack) })
+    };
   }
 
   // If resuming a preflight gate, re-check any remaining preflight gates (AMBIGUITY / EXTERNAL_EFFECT)
@@ -1066,7 +1076,8 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
       pack_id: pack.id,
       tier: pack.current_tier,
       active_instance: pack.active_instance,
-      next: nextDirective
+      next: nextDirective,
+      ...(nextDirective.question && { question: nextDirective.question })
     };
   }
 

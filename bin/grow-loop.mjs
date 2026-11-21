@@ -48,6 +48,7 @@ import { parseReviewReport } from '../src/review-report.mjs';
 import { ALLOWED_GATE_REASONS } from '../src/gate.mjs';
 import { checkExternalCommits, readGitHeadCommit } from '../src/git-watch.mjs';
 import { handoffFillSteps, handoffNeeds, readHandoff } from '../src/handoff.mjs';
+import { acknowledgeManifest, answerQuestion, buildQuestion, buildShellStatus, dispatchStillRunning } from '../src/shell-api.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -92,7 +93,8 @@ Usage:
   grow-loop init      [--repo <dir>] [--state-dir <dir>] [--profile standard-test|live-smoke] [--manifest <file> | --handoff <file>] [--project <name>] [--no-gitignore] [--force]
   grow-loop import    --handoff <file> --reason "<text>" [--repo <dir>] [--state-dir <dir>]
   grow-loop probe     [--repo <dir>] [--state-dir <dir>] [--timeout <ms>]
-  grow-loop status    [--repo <dir>] [--state-dir <dir>]
+  grow-loop status    [--format shell] [--repo <dir>] [--state-dir <dir>]
+  grow-loop answer    --question <id> --option <id> [--text "<text>"] [--repo <dir>] [--state-dir <dir>]
   grow-loop manifest-ack --reason "<text>" [--repo <dir>] [--state-dir <dir>]
   grow-loop pack insert --file <pack.json> (--after <ID> | --before <ID>) --reason "<text>"
   grow-loop pack tier --id <ID> --tier tier1|tier2 --reason "<text>"
@@ -257,7 +259,12 @@ async function cmdProbe(flags) {
 }
 
 function cmdStatus(flags) {
+  if (flags.format !== undefined && flags.format !== 'shell') throw new Error('Use --format shell, or omit --format.');
   const ctx = loadWorkspace(flags.repo, flags['state-dir'], { allowPendingManifest: true });
+  if (flags.format === 'shell') {
+    outJson(buildShellStatus(ctx));
+    return;
+  }
   const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
   const packDefs = new Map(ctx.manifest.packs.map((pack) => [pack.id, pack]));
   const summary = ctx.state.pack_order.map((id) => {
@@ -292,10 +299,16 @@ function cmdStatus(flags) {
 
 function cmdManifestAck(flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir'], { allowPendingManifest: true });
-  const changes = writeManifestWithReason(ctx, ctx.manifest, flags.reason, 'manifest_ack');
-  outJson(changes
-    ? { ok: true, message: 'Manifest changes acknowledged.', changes }
-    : { ok: true, message: 'No manifest changes.' });
+  outJson(acknowledgeManifest(ctx, flags.reason));
+}
+
+function cmdAnswer(flags) {
+  const ctx = loadWorkspace(flags.repo, flags['state-dir'], { allowPendingManifest: true });
+  outJson(answerQuestion(ctx, {
+    id: requireText(flags.question, 'question'),
+    optionId: requireText(flags.option, 'option'),
+    text: flags.text
+  }));
 }
 
 function requireText(value, flag) {
@@ -629,16 +642,6 @@ function savedSession(pack, stage, instanceId) {
   return stage === 'implement' ? pack.last_session_id : null;
 }
 
-function dispatchStillRunning(run) {
-  if (!run?.pid || run.kind === 'self') return false;
-  try {
-    process.kill(run.pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === 'EPERM';
-  }
-}
-
 async function cmdDispatch(flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir']);
   const packId = flags.pack || ctx.state.active_pack_id;
@@ -647,7 +650,7 @@ async function cmdDispatch(flags) {
   if (!pack || !packDef) throw new Error(`Pack "${packId}" not found`);
   if (pack.status === 'COMMITTED') throw new Error(`Pack ${packId} is already committed.`);
   if (ctx.state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
-  requireHandoffPreflight(pack, packDef);
+  requireHandoffPreflight(pack, packDef, ctx);
 
   const stage = String(flags.stage || (pack.status === 'REVIEW' ? 'review' : 'implement')).toLowerCase();
   if (!['review', 'implement'].includes(stage)) throw new Error('Use --stage implement or review.');
@@ -775,7 +778,8 @@ async function cmdDispatch(flags) {
     }
   }
 
-  outJson({ run_id: runId, run_dir: runDir, result, transition, warnings, ...gitCheck });
+  outJson({ run_id: runId, run_dir: runDir, result, transition, warnings, ...gitCheck,
+    ...(transition?.question && { question: transition.question }) });
 }
 
 function recordOutOfScopeReport(ctx, packId, runId, finalMd, warnings) {
@@ -953,7 +957,7 @@ async function cmdVerify(flags) {
     timeoutSec: flags.timeout ? Number(flags.timeout) : undefined,
     markEnv: flags['mark-env']
   });
-  outJson({ ...res, ...gitCheck });
+  outJson({ ...res, ...gitCheck, ...(res.transition?.question && { question: res.transition.question }) });
 }
 
 function cmdResume(flags) {
@@ -988,6 +992,7 @@ async function main() {
     else if (cmd === 'import') cmdImport(flags);
     else if (cmd === 'probe') await cmdProbe(flags);
     else if (cmd === 'status') cmdStatus(flags);
+    else if (cmd === 'answer') cmdAnswer(flags);
     else if (cmd === 'manifest-ack') cmdManifestAck(flags);
     else if (cmd === 'pack') cmdPack(positionals[1], flags);
     else if (cmd === 'forward') cmdForward(flags);
@@ -1002,8 +1007,11 @@ async function main() {
     else throw new Error(`Unknown command "${cmd}". Run "grow-loop --help".`);
   } catch (err) {
     if (err instanceof ManifestChangedError) {
-      outJson({ ok: false, error: 'manifest_changed', message: err.message, ...err.pending });
+      const stateDir = resolveStateDir(flags.repo, flags['state-dir']);
+      const question = buildQuestion({ stateDir, paths: getStatePaths(stateDir), manifestChange: err.pending });
+      outJson({ ok: false, error: 'manifest_changed', message: err.message, ...err.pending, question });
     } else {
+      if (err.question) outJson({ ok: false, question: err.question });
       process.stderr.write(`[grow-loop error] ${err.message || err}\n`);
     }
     process.exitCode = 1;

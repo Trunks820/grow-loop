@@ -136,6 +136,8 @@ grow-loop evidence
 
 报告读不出或格式有误时，CLI 会退出并给出报告路径和错误位置，包继续等待审查。旧的 `record review --verdict`、`--findings-file` 和 `--findings` 参数仍可用。 [审查报告格式](docs/ADAPTER-SPEC.md#closing-review-reports)
 
+面向壳的 `grow-loop status --format shell` 提供固定格式的状态和中文问题。用 `grow-loop answer --question <问题ID> --option <选项ID>` 回填，选项需要文字时加 `--text "<原话>"`。[壳接口](docs/SHELL-API.md)
+
 ## 派发记录与续跑
 
 `dispatch --dry-run` 将运行号、运行目录、任务书、阶段、执行实例和任务书指纹存入 `prepared_run`。同阶段同实例正式派发时复用运行目录。同一指纹直接使用原任务书，包状态、修复次数、审查轮次、确认后的清单等输入变化时在原目录重写 `task.md`。本次指定 `--task-file <path>` 时使用该文件。正式派发会清掉预演记录。
