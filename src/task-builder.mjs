@@ -4,6 +4,7 @@ import { ensureDir, getStatePaths } from './state.mjs';
 import { selectLessonsForPack } from './lessons.mjs';
 import { buildRedactor } from './redact.mjs';
 import { getBudgets } from './router.mjs';
+import { getVerificationPlan } from './verify.mjs';
 import { namesCode, scanReferences } from './ref-scan.mjs';
 
 const briefFields = {
@@ -237,8 +238,24 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
 
     if (isRepair && pack.last_verify && !pack.last_verify.passed) {
       lines.push('## Last Machine Verification Failure');
-      lines.push(`- Command: \`${pack.last_verify.command || 'configured verify'}\``);
+      const failure = pack.last_verify.failure;
+      lines.push(`- Command: \`${failure?.command || pack.last_verify.command || 'configured verify'}\``);
       lines.push(`- Summary: ${pack.last_verify.summary}`);
+      if (failure) {
+        lines.push(`- Exit code: ${failure.exit_code}`);
+        lines.push(`- Timed out: ${failure.timed_out ? 'yes' : 'no'}`);
+        lines.push(`- stdout log: \`${failure.stdout_log}\``);
+        lines.push(`- stderr log: \`${failure.stderr_log}\``);
+        if (failure.test_names.length) {
+          lines.push('', '### Failed Tests', ...failure.test_names.map((name) => `- ${name}`));
+        }
+        if (failure.assertion_lines.length) {
+          lines.push('', '### Assertion Lines', ...failure.assertion_lines.map((line) => `    ${line}`));
+        }
+        if (failure.excerpt) {
+          lines.push('', '### Output Excerpt', ...failure.excerpt.split('\n').map((line) => `    ${line}`));
+        }
+      }
       lines.push('');
     }
 
@@ -250,10 +267,11 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
       lines.push('');
     }
 
-    if (Array.isArray(config?.verification?.commands) && config.verification.commands.length) {
+    const verificationPlan = getVerificationPlan(config, packDef);
+    if (verificationPlan.length) {
       lines.push('## Verification Commands');
-      for (const cmd of config.verification.commands) {
-        lines.push(`- \`${cmd}\``);
+      for (const { command, source } of verificationPlan) {
+        lines.push(`- \`${command}\` (${source})`);
       }
       lines.push('');
     }

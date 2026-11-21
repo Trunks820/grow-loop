@@ -37,6 +37,10 @@
   },
   "verification": {
     "new_tests": "forbidden",
+    "retry_once": true,
+    "env": {},
+    "path_prepend": [],
+    "output_encoding": "utf-8",
     "commands": [
       "# Replace with your build + existing regression tests + isolated live smoke script"
     ]

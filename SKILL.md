@@ -80,7 +80,7 @@ node <GROW_LOOP_BIN> next --repo <repo>
 |---|---|
 | `PAUSE_FOR_HUMAN` | **STOP the loop immediately.** Present `gate.reason`, `gate.summary`, `gate.questions` (if any), and the exact `resume_hint` options to the user. Wait for human input, then call `grow-loop resume --decision "..." --action <...>`. |
 | `IMPLEMENT` | Execute implementation on the assigned `tier` & `instance` (see Step 2). |
-| `VERIFY` | Run `grow-loop verify`: the CLI executes `config.verification.commands` (build + tests OR build + regression + live smoke script) and records the outcome from exit codes. **Verify ALWAYS runs before Review.** |
+| `VERIFY` | Run `grow-loop verify`. The CLI runs global `verification.commands` followed by the pack's `verify_commands` and records the outcome from exit codes. **Verify ALWAYS runs before Review.** |
 | `REVIEW` | Run a **read-only closing full review** (Round 1 or non-divergent Round 2), then call `grow-loop record review --verdict pass\|fail --findings-file <json> --summary "..."`. |
 | `COMMIT` | Stage explicit changed files (`git status`, no untracked junk/secrets), make a **local** commit only (never push!), then call `grow-loop record commit --from-git`. |
 | `COMPLETED` | All packs are committed! Run `grow-loop evidence` to generate the redacted two-layer evidence pack and report to the user. |
@@ -108,11 +108,12 @@ node <GROW_LOOP_BIN> next --repo <repo>
      (Or `--failed --summary "..."` if implementation hit a code blocker, or `--infra-error INFRA_QUOTA` if hit a rate limit.)
 
 ### Step 3: Executing `VERIFY` (Verify-First Rule)
-- Let the CLI run the configured commands (`config.verification.commands`: compile/typecheck, test suite, or isolated-port live smoke script). It stops at the first failing command, stores logs under the pack's `runs/` directory, and records pass/fail from real exit codes:
+- Run local checks through the CLI. Each attempt stops at the first failure and saves per-command logs under the pack's `runs/` directory.
   ```bash
   node <GROW_LOOP_BIN> verify --repo <repo>
   ```
-  A failure automatically logs a structured lesson in `lessons.json` + `lessons.md` and runs the `2 + 2` repair/escalation ladder.
+  On failure the CLI reruns the whole sequence once by default. If the second attempt passes, the CLI records `flaky`, keeps both runs, and advances without using repair budget or recording a lesson. If both attempts fail, the CLI records a lesson and applies the `2 + 2` repair/escalation ladder.
+- Read the failure logs before dispatching a repair. If the failure is environmental, run `grow-loop verify --mark-env "<reason>"` before dispatch. The CLI records the reason, undoes the repair charge and lesson, and reruns verification. If the rerun still fails, resolve the environment problem while the pack waits in `VERIFY`.
 - While commands are configured, `record verify --passed` is refused. Use `record verify --failed --summary "..." --root-cause "..." --rule "..." --locator "<file:symbol>"` only for failures found outside those commands. `--allow-self-report` records an unchecked pass and is labelled `自报` in the evidence pack; use it only when the human explicitly accepts a manual check.
 
 ### Step 4: Executing `REVIEW` (2-Round Cap + Severity Floor)

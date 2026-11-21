@@ -1,8 +1,9 @@
-import { appendEvent, readJsonSafe, saveState } from './state.mjs';
+import { appendEvent, readJsonSafe, saveState, writeJsonAtomic } from './state.mjs';
 import { buildRedactor } from './redact.mjs';
 import { taskBriefWarnings } from './task-builder.mjs';
+import { getVerificationCommands } from './verify.mjs';
 import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
-import { addLesson, appendTechDebt, closeLessonsForPack, selectLessonsForPack } from './lessons.mjs';
+import { addLesson, appendTechDebt, closeLessonsForPack, loadLessons, renderLessonsMarkdown, selectLessonsForPack } from './lessons.mjs';
 
 export function getBudgets(config) {
   return {
@@ -257,11 +258,16 @@ export function buildNextDirective(ctx, pack, packDef) {
   }
 
   if (pack.status === 'VERIFY') {
+    const { new_tests, timeout_sec, output_encoding, retry_once } = config?.verification ?? {};
+    const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
     return {
       action: 'VERIFY',
       ...packInfo,
-      verification: config?.verification || {},
-      next_command: 'grow-loop verify (runs verification.commands and records exit codes); use "grow-loop record verify --failed ..." only for failures found outside those commands'
+      verification: redactor.redactValue({
+        commands: getVerificationCommands(config, packDef),
+        new_tests, timeout_sec, output_encoding, retry_once
+      }),
+      next_command: 'grow-loop verify (runs global and pack commands and records exit codes); use "grow-loop record verify --failed ..." only for failures found outside those commands'
     };
   }
 
@@ -403,6 +409,7 @@ function getWritablePack(state, packId) {
 export function recordImplementOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
   const pack = getWritablePack(state, payload.packId);
+  if (pack.last_verify) delete pack.last_verify.repair_undo;
   const runTier = payload.dispatch?.tier ?? pack.current_tier;
   const runInstance = payload.dispatch?.instance ?? pack.active_instance;
   const canResume = !payload.dispatch || runInstance === pack.active_instance;
@@ -479,12 +486,55 @@ export function recordImplementOutcome(ctx, payload) {
   return applyRepairLadder(ctx, pack, 'IMPLEMENT', payload.summary || 'Implementation failed');
 }
 
+const verifyRepairFields = [
+  'tier1_repairs', 'tier2_repairs', 'current_tier', 'active_instance',
+  'last_session_id', 'escalated', 'escalation_reason', 'gate'
+];
+
+export function markVerificationEnvironment(ctx, packId, reason) {
+  const { stateDir, config, paths } = ctx;
+  const state = ctx.state = readJsonSafe(paths.statePath);
+  const pack = getWritablePack(state, packId);
+  const lastVerify = pack.last_verify;
+  const undo = lastVerify?.repair_undo;
+  const repairPending = pack.status === 'IMPLEMENT'
+    || (pack.status === 'PAUSED_FOR_HUMAN' && pack.gate?.reason === ALLOWED_GATE_REASONS.BUDGET_EXCEEDED);
+  if (!repairPending || !undo || lastVerify.passed || state.loop_status === 'ABORTED') {
+    throw new Error(`Pack ${pack.id} has no verification failure eligible for --mark-env. Use it before dispatching the repair.`);
+  }
+
+  const store = loadLessons(stateDir);
+  store.items = store.items.filter((item) => item.id !== undo.lesson_id);
+  writeJsonAtomic(paths.lessonsJsonPath, store);
+  renderLessonsMarkdown(paths.lessonsMdPath, store);
+
+  Object.assign(pack, undo.fields, { status: 'VERIFY' });
+  delete lastVerify.repair_undo;
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  lastVerify.environment_reason = redactor.redactString(reason.trim());
+  lastVerify.environment_retry_pending = true;
+  appendEvent(stateDir, config, {
+    type: 'verify_marked_environment',
+    pack_id: pack.id,
+    reason: lastVerify.environment_reason,
+    run_dirs: lastVerify.run_dirs ?? [],
+    removed_lesson_id: undo.lesson_id
+  });
+  saveState(stateDir, state);
+  return lastVerify;
+}
+
 export function recordVerifyOutcome(ctx, payload) {
   // CLI verification runs commands asynchronously and reports into the latest state.
   if (payload.source === 'cli') ctx.state = readJsonSafe(ctx.paths.statePath);
   const { stateDir, config, state } = ctx;
   const pack = getWritablePack(state, payload.packId);
   const budgets = getBudgets(config);
+  if (payload.source === 'cli' && 'previousVerifyAt' in payload
+      && (pack.status !== 'VERIFY' || state.loop_status === 'ABORTED'
+        || (pack.last_verify?.at ?? null) !== payload.previousVerifyAt)) {
+    throw new Error(`Pack ${pack.id} changed during verification. The logs were saved, but the result was not recorded.`);
+  }
 
   // 'cli' = grow-loop ran the configured commands and checked exit codes itself;
   // 'self_reported' = the coordinator asserted the outcome via `record verify`.
@@ -498,6 +548,14 @@ export function recordVerifyOutcome(ctx, payload) {
     run_dir: payload.runDir || null,
     at: new Date().toISOString()
   };
+  if (source === 'cli') {
+    Object.assign(pack.last_verify, {
+      run_dirs: payload.runDirs ?? [],
+      flaky: Boolean(payload.flaky),
+      failure: payload.failure ?? null,
+      environment_reason: payload.environmentReason ?? null
+    });
+  }
 
   appendEvent(stateDir, config, {
     type: 'verify_recorded',
@@ -505,11 +563,21 @@ export function recordVerifyOutcome(ctx, payload) {
     passed: Boolean(payload.passed),
     source,
     summary: payload.summary || '',
-    command: payload.command || null
+    command: payload.command || null,
+    ...(source === 'cli' && {
+      flaky: pack.last_verify.flaky,
+      run_dirs: pack.last_verify.run_dirs,
+      environment_reason: pack.last_verify.environment_reason
+    })
   });
 
   if (!payload.passed) {
-    addLesson(stateDir, config, {
+    if (payload.environmentReason) {
+      saveState(stateDir, state);
+      return { outcome: 'verify_environment_failed', status: pack.status };
+    }
+    const fields = Object.fromEntries(verifyRepairFields.map((field) => [field, pack[field]]));
+    const lesson = addLesson(stateDir, config, {
       pack_id: pack.id,
       stage: 'VERIFY',
       severity: 'HIGH',
@@ -519,6 +587,7 @@ export function recordVerifyOutcome(ctx, payload) {
       locator: payload.locator || '',
       discovered_by: 'machine_verify'
     });
+    pack.last_verify.repair_undo = { fields, lesson_id: lesson.id };
     return applyRepairLadder(ctx, pack, 'VERIFY', payload.summary || 'Verification failed');
   }
 

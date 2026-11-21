@@ -39,7 +39,7 @@
 - **爆炸半径预判（Blast-Radius Gate）**：
   - `estimated_files >= 25` 或 `cross_module: true` 或 `risk: "high"` → 自动直接上 `tier2` 起跑，不浪费低阶模型反复返工。
   - `estimated_files >= 50` → 触发 `PAUSED_FOR_HUMAN`（`BLAST_RADIUS_SPLIT`），建议拆包或由人显式批准直接上 `tier2`。
-- **Verify-First**：永远先过机器验证（编译 / 单测 / 隔离实测脚本），再进关包审查。`grow-loop verify` 由 CLI 亲自执行 `verification.commands` 并按退出码判定；配置了命令时不接受总控 AI 自报「通过」（`--allow-self-report` 显式放行的会在证据包标为「自报」）。
+- **Verify-First**：先过本机验证（编译 / 单测 / 隔离实测脚本），再进关包审查。`grow-loop verify` 依次执行全局和包级命令，按实际退出码判定。配置了可运行命令时，`record verify --passed` 需要显式加 `--allow-self-report`，证据包会标为「自报」。
 - **修复与自动升级阶梯（`2 + 2`）**：
   - `tier1` 最多修 **2 轮** → 第 3 次失败自动升级到 `tier2`（`tier2_repairs = 1`）。
   - `tier2` 最多修 **2 轮** → 仍未过硬刹车 `PAUSED_FOR_HUMAN`（`BUDGET_EXCEEDED`），交给人拍板，绝不无限死循环。
@@ -117,7 +117,7 @@ grow-loop dispatch --stage implement --dry-run
 
 # 正式派发执行（外部 CLI 自动记录结果；self 模式由当前宿主执行后 record）
 grow-loop dispatch --stage implement
-grow-loop verify   # CLI 自己跑 verification.commands，按退出码记结果
+grow-loop verify   # CLI 先跑全局命令，再跑本包命令
 grow-loop record review --verdict pass --findings-file findings.json --summary "0 blocking findings"
 grow-loop record commit --from-git
 
@@ -128,6 +128,17 @@ grow-loop resume --decision "已确认走单选，批准继续" --action approve
 grow-loop evidence
 ```
 
+## 验证命令与环境
+
+在状态目录的 `config.json` 用 `verification.commands` 配置各包共用的本机检查。在 `manifest.json` 的包定义里可用 `"verify_commands": ["npm run test:checkout"]` 添加本包检查。CLI 先跑全局命令，再跑本包命令，两处至少有一条可运行命令。空白和以 `#` 开头的占位项会跳过。
+
+- `verification.env` 是验证子进程的环境变量键值对，默认 `{}`。Windows 下默认设 `PYTHONUTF8=1` 和 `PYTHONIOENCODING=utf-8`，同名配置优先。
+- `verification.path_prepend` 是按顺序加到 `PATH` 前面的目录数组，默认 `[]`。
+- `verification.output_encoding` 是命令输出的解码方式，默认 `utf-8`，旧工具可按实际输出设置为 `gbk` 等编码。保存的日志使用 UTF-8。
+- `verification.retry_once` 默认 `true`。每轮遇到第一条失败就停。第一轮失败后从头重跑整套命令，两轮日志分目录保存。第二轮全过时记为 `flaky`，照常进入审查，不扣修复次数、不记教训。设为 `false` 时只跑一轮。
+
+验证失败后先查看日志。若确认是环境问题，在正式派活前运行 `grow-loop verify --mark-env "本机测试服务未启动"`。CLI 记录原因，撤销该次失败引起的预算、升档、暂停和教训，并立即重跑验证。若重跑仍失败，包留在 `VERIFY`，环境恢复后可再次运行 `grow-loop verify`。
+
 ## 任务书
 
 初次实现和修复任务书依次列出「避坑提示」「要一起改的文件」「要保住的旧行为」「已经定了的」「可能要一起改的文件」「转来的发现」「产物放哪」。前三栏由指挥的人读代码后填写。任一栏为空或避坑提示未点名代码时，`next` 和 `dispatch`（含 `--dry-run`）会给出提醒，派活照常。
@@ -135,6 +146,8 @@ grow-loop evidence
 「已经定了的」保留方案与门禁决定的原话，有冲突时以原话为准。两轮审查都会带上这一节和「要保住的旧行为」，复审沿用上一轮问题的收尾范围。引用候选由 `git grep` 扫出并附命中词，须由指挥的人确认。
 
 派活前会创建 `<状态目录>/artifacts/<包ID>/`，任务书会给出报告、截图和草稿的保存位置。产物需放在工作树之外时，初始化并派活时使用外置 `--state-dir`。
+
+实现与修复任务书列出本包实际配置的验证命令。修复任务书还会给出失败命令、退出码、超时状态、两份日志路径、输出摘录，以及识别到的测试名和断言。
 
 ## 中途改动
 

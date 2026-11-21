@@ -866,11 +866,16 @@ test('grow-loop verify runs configured commands itself; self-reported passes nee
     assert.equal(v1.commands[1].exit_code, 3);
     assert.match(v1.summary, /exited 3: assertion failed: fixed\.txt missing/);
     assert.equal(v1.transition.outcome, 'repair_tier1');
+    assert.equal(v1.run_dirs.length, 2);
     let state = JSON.parse(fs.readFileSync(path.join(repoDir, '.loop', 'state.json'), 'utf8'));
     assert.equal(state.packs.W01.last_verify.source, 'cli');
     assert.equal(state.packs.W01.last_verify.passed, false);
+    assert.equal(state.packs.W01.tier1_repairs, 1);
+    assert.deepEqual(state.packs.W01.last_verify.failure.test_names, []);
+    assert.match(state.packs.W01.last_verify.failure.excerpt, /fixed\.txt missing/);
     assert.ok(fs.existsSync(path.join(v1.run_dir, 'cmd-2', 'stderr.log')));
     const lessons = JSON.parse(fs.readFileSync(path.join(repoDir, '.loop', 'lessons.json'), 'utf8'));
+    assert.equal(lessons.items.length, 1);
     assert.match(lessons.items[0].root_cause, /fixed\.txt missing/);
 
     // Repair, then the CLI observes a clean pass
@@ -893,6 +898,265 @@ test('grow-loop verify runs configured commands itself; self-reported passes nee
     const md = fs.readFileSync(ev.path, 'utf8');
     assert.match(md, /\| CLI 实跑 \|/);
     assert.match(md, /\| 自报 \|/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('verification reruns the whole command sequence once and records a flaky pass without a repair or lesson', () => {
+  const node = shellQuote(process.execPath);
+  const { repoDir, ctx } = setupCtx([{ id: 'W' }], {
+    verification: { commands: [`${node} count.mjs`, `${node} flaky.mjs`, `${node} --version`] }
+  });
+  try {
+    fs.writeFileSync(path.join(repoDir, 'count.mjs'), "import fs from 'node:fs'; fs.appendFileSync('attempts.txt', '1');");
+    fs.writeFileSync(path.join(repoDir, 'flaky.mjs'), `
+import fs from 'node:fs';
+if (fs.readFileSync('attempts.txt', 'utf8') === '1') {
+  console.error('temporary failure');
+  process.exitCode = 7;
+}
+`);
+    runCli(['next'], repoDir);
+    runCli(['record', 'implement', '--passed'], repoDir);
+    const verify = runCli(['verify'], repoDir);
+    assert.equal(verify.transition.outcome, 'ready_for_review');
+    assert.equal(verify.passed, true);
+    assert.equal(verify.flaky, true);
+    const [first, second] = verify.run_dirs;
+    assert.notEqual(first, second);
+    assert.deepEqual(readJsonSafe(path.join(first, 'verify-result.json')).commands.map((c) => c.exit_code), [0, 7]);
+    assert.deepEqual(readJsonSafe(path.join(second, 'verify-result.json')).commands.map((c) => c.exit_code), [0, 0, 0]);
+    assert.equal(fs.existsSync(path.join(first, 'cmd-3')), false);
+    assert.match(fs.readFileSync(path.join(first, 'cmd-2', 'stderr.log'), 'utf8'), /temporary failure/);
+    assert.ok(fs.existsSync(path.join(second, 'cmd-2', 'stderr.log')));
+    const pack = readJsonSafe(ctx.paths.statePath).packs.W;
+    assert.equal(pack.status, 'REVIEW');
+    assert.deepEqual([pack.tier1_repairs, pack.tier2_repairs], [0, 0]);
+    assert.equal(pack.last_verify.passed, true);
+    assert.equal(pack.last_verify.flaky, true);
+    assert.deepEqual(pack.last_verify.run_dirs, verify.run_dirs);
+    assert.deepEqual(readJsonSafe(ctx.paths.lessonsJsonPath, { items: [] }).items, []);
+    const events = readEvents(ctx.paths.eventsPath).filter((event) => event.type === 'verify_recorded');
+    assert.equal(events.length, 1);
+    assert.equal(events[0].flaky, true);
+    assert.deepEqual(events[0].run_dirs, verify.run_dirs);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('mark-env undoes escalation or the budget gate, preserves unrelated lessons, and closes at dispatch', () => {
+  for (const exhausted of [false, true]) {
+    const { repoDir, stateDir, ctx } = setupCtx([{ id: 'W' }], {
+      verification: { commands: [`${shellQuote(process.execPath)} broken.mjs`], retry_once: false },
+      budgets: { tier1_max_repairs: 0, tier2_max_repairs: exhausted ? 0 : 2 }
+    });
+    try {
+      fs.writeFileSync(path.join(repoDir, 'broken.mjs'), `
+import fs from 'node:fs';
+if (!fs.existsSync('service-ready')) {
+  console.error('local service unavailable');
+  process.exitCode = 4;
+}
+`);
+      const earlier = addLesson(stateDir, ctx.config, { pack_id: 'W', stage: 'IMPLEMENT', summary: 'Earlier implementation lesson' });
+      runCli(['next'], repoDir);
+      runCli(['record', 'implement', '--passed', '--session-id', 'original-session'], repoDir);
+      const failure = runCli(['verify'], repoDir);
+      assert.equal(failure.transition.outcome, exhausted ? 'paused_budget_exceeded' : 'escalated_tier2');
+      assert.equal(failure.run_dirs.length, 1);
+      const failedPack = readJsonSafe(ctx.paths.statePath).packs.W;
+      assert.equal(failedPack.current_tier, exhausted ? 'tier1' : 'tier2');
+      assert.equal(failedPack.last_session_id, exhausted ? 'original-session' : null);
+      assert.match(runCliFailure(['verify', '--mark-env'], repoDir).stderr, /non-empty reason/);
+      assert.match(runCliFailure(['verify', '--mark-env', '   '], repoDir).stderr, /non-empty reason/);
+
+      const reason = '本机测试服务未启动';
+      if (exhausted) fs.writeFileSync(path.join(repoDir, 'service-ready'), '');
+      const rerun = runCli(['verify', '--mark-env', reason], repoDir);
+      assert.equal(rerun.passed, exhausted);
+      assert.equal(rerun.transition.outcome, exhausted ? 'ready_for_review' : 'verify_environment_failed');
+      assert.notEqual(rerun.run_dir, failure.run_dir);
+      const pack = readJsonSafe(ctx.paths.statePath).packs.W;
+      assert.equal(pack.status, exhausted ? 'REVIEW' : 'VERIFY');
+      assert.equal(pack.current_tier, 'tier1');
+      assert.equal(pack.active_instance, 'tier1-cli');
+      assert.equal(pack.last_session_id, 'original-session');
+      assert.equal(pack.escalated, false);
+      assert.equal(pack.escalation_reason, null);
+      assert.equal(pack.gate, null);
+      assert.deepEqual([pack.tier1_repairs, pack.tier2_repairs], [0, 0]);
+      assert.equal(pack.last_verify.environment_reason, reason);
+      assert.equal(pack.last_verify.repair_undo, undefined);
+      assert.deepEqual(readJsonSafe(ctx.paths.lessonsJsonPath).items, [earlier]);
+      assert.doesNotMatch(fs.readFileSync(ctx.paths.lessonsMdPath, 'utf8'), /local service unavailable/);
+      const marked = readEvents(ctx.paths.eventsPath).find((event) => event.type === 'verify_marked_environment');
+      assert.equal(marked.reason, reason);
+      assert.deepEqual(marked.run_dirs, failure.run_dirs);
+      assert.equal(marked.removed_lesson_id, failedPack.last_verify.repair_undo.lesson_id);
+
+      if (!exhausted) {
+        assert.match(runCliFailure(['verify', '--mark-env', reason], repoDir).stderr, /no verification failure eligible/);
+        runCli(['verify'], repoDir);
+        runCli(['pack', 'tier', '--id', 'W', '--tier', 'tier2', '--reason', 'Keep the specialist executor'], repoDir);
+        runCli(['verify', '--mark-env', reason], repoDir);
+        const manuallyRouted = readJsonSafe(ctx.paths.statePath).packs.W;
+        assert.equal(manuallyRouted.current_tier, 'tier2');
+        assert.equal(manuallyRouted.active_instance, 'tier2-cli');
+        assert.equal(manuallyRouted.tier2_repairs, 0);
+        assert.match(manuallyRouted.escalation_reason, /Keep the specialist executor/);
+        runCli(['verify'], repoDir);
+        runCli(['dispatch', '--dry-run'], repoDir);
+        assert.ok(readJsonSafe(ctx.paths.statePath).packs.W.last_verify.repair_undo);
+        const dispatched = runCli(['dispatch'], repoDir);
+        assert.equal(dispatched.result.status, 'host_action_required');
+        assert.equal(readJsonSafe(ctx.paths.statePath).packs.W.last_verify.repair_undo, undefined);
+        assert.match(runCliFailure(['verify', '--mark-env', reason], repoDir).stderr, /no verification failure eligible/);
+      }
+    } finally {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  }
+});
+
+test('verification supplies environment overrides and prepends PATH while decoding split UTF-8 and GBK output', () => {
+  const windows = process.platform === 'win32';
+  const command = `${shellQuote(process.execPath)} print.mjs`;
+  const { repoDir, ctx } = setupCtx([{ id: 'W' }], { verification: { commands: [command] } });
+  try {
+    const prefixes = ['first tool dir', 'second tool dir'].map((dir) => path.join(repoDir, dir));
+    Object.assign(ctx.config.verification, {
+      env: {
+        W4_TEST_VALUE: 'configured',
+        ...(windows && { pAtH: path.join(repoDir, 'configured-path'), pythonutf8: '0' })
+      },
+      path_prepend: prefixes
+    });
+    fs.writeFileSync(path.join(repoDir, 'print.mjs'), `
+import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+const pathKeys = Object.keys(process.env).filter((key) => key.toUpperCase() === 'PATH');
+console.log(JSON.stringify({
+  value: process.env.W4_TEST_VALUE,
+  path: process.env.PATH.split(path.delimiter),
+  pathKeyCount: pathKeys.length,
+  pythonUtf8: process.env.PYTHONUTF8,
+  pythonIOEncoding: process.env.PYTHONIOENCODING
+}));
+const bytes = process.env.W4_TEST_ENCODING === 'gbk' ? Buffer.from('d6d0cec4d1e9d6a4', 'hex') : Buffer.from('中文验证');
+process.stdout.write(bytes.subarray(0, 1));
+await delay(40);
+process.stdout.write(bytes.subarray(1));
+process.stderr.write(bytes.subarray(0, 1));
+await delay(40);
+process.stderr.write(bytes.subarray(1));
+`);
+    runCli(['next'], repoDir);
+    for (const encoding of [undefined, 'gbk']) {
+      ctx.config.verification.output_encoding = encoding;
+      ctx.config.verification.env.W4_TEST_ENCODING = encoding ?? 'utf-8';
+      writeJsonAtomic(ctx.paths.configPath, ctx.config);
+      runCli(['record', 'implement', '--passed'], repoDir);
+      const next = runCli(['next'], repoDir);
+      assert.deepEqual(next.verification.commands, [command]);
+      assert.equal(next.verification.env, undefined);
+      assert.equal(next.verification.path_prepend, undefined);
+      const result = runCli(['verify'], repoDir);
+      assert.equal(result.passed, true, result.summary);
+      const [metadata, output] = fs.readFileSync(result.commands[0].stdout_log, 'utf8').split(/\r?\n/);
+      const env = JSON.parse(metadata);
+      assert.equal(env.value, 'configured');
+      assert.deepEqual(env.path.slice(0, 2), prefixes);
+      if (windows) {
+        assert.equal(env.pathKeyCount, 1);
+        assert.equal(env.path[2], ctx.config.verification.env.pAtH);
+        assert.equal(env.pythonIOEncoding, 'utf-8');
+        assert.equal(env.pythonUtf8, '0');
+      }
+      assert.equal(output, '中文验证');
+      assert.equal(fs.readFileSync(result.commands[0].stderr_log, 'utf8'), '中文验证');
+    }
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('pack verification follows global checks, gates self-reports, and supplies repair diagnostics', () => {
+  const node = shellQuote(process.execPath);
+  const globalCommand = `${node} global.mjs`;
+  const packCommand = `${node} pack.mjs`;
+  const { repoDir, ctx } = setupCtx([{ id: 'W' }, { id: 'PACK', verify_commands: [packCommand] }], {
+    verification: { commands: [globalCommand], retry_once: false }
+  });
+  try {
+    fs.writeFileSync(path.join(repoDir, 'global.mjs'), "import fs from 'node:fs'; fs.writeFileSync('global-ran', 'ok'); console.log('global ran');");
+    fs.writeFileSync(path.join(repoDir, 'pack.mjs'), `
+import fs from 'node:fs';
+if (!fs.existsSync('global-ran')) throw new Error('Global check should run first');
+console.log('not ok 1 - tap checkout');
+console.log('  AssertionError: cart count mismatch');
+console.log('✖ spec checkout (2ms)');
+console.log('FAILED tests/test_refund.py::test_refund - AssertionError: refund rejected');
+console.error('E   assert total == 0');
+console.error('[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0 -- in CheckoutTest');
+console.error('[ERROR] CheckoutTest.refund:42 expected: <0> but was: <1>');
+for (let i = 0; i < 100; i++) console.log('verbose output line ' + i + ': ' + 'x'.repeat(90));
+process.exitCode = 5;
+`);
+    runCli(['next'], repoDir);
+    runCli(['record', 'implement', '--pack', 'W', '--passed'], repoDir);
+    const global = runCli(['verify', '--pack', 'W'], repoDir);
+    assert.equal(global.passed, true);
+    assert.deepEqual(global.commands.map((c) => [c.command, c.source]), [[globalCommand, 'global']]);
+    fs.unlinkSync(path.join(repoDir, 'global-ran'));
+
+    const initial = runCli(['dispatch', '--pack', 'PACK', '--dry-run'], repoDir);
+    const initialTask = fs.readFileSync(path.join(initial.run_dir, 'task.md'), 'utf8');
+    assert.ok(initialTask.includes('`' + globalCommand + '` (global)'));
+    assert.ok(initialTask.includes('`' + packCommand + '` (pack)'));
+    runCli(['record', 'implement', '--pack', 'PACK', '--passed'], repoDir);
+    const combined = runCli(['verify', '--pack', 'PACK'], repoDir);
+    assert.deepEqual(combined.commands.map((c) => [c.command, c.source, c.exit_code]), [
+      [globalCommand, 'global', 0], [packCommand, 'pack', 5]
+    ]);
+    const [globalResult, packResult] = combined.commands;
+    assert.match(fs.readFileSync(globalResult.stdout_log, 'utf8'), /global ran/);
+    assert.notEqual(path.dirname(globalResult.stdout_log), path.dirname(packResult.stdout_log));
+    const failure = readJsonSafe(ctx.paths.statePath).packs.PACK.last_verify.failure;
+    assert.deepEqual(failure.test_names, [
+      'tap checkout', 'spec checkout', 'tests/test_refund.py::test_refund', 'CheckoutTest', 'CheckoutTest.refund'
+    ]);
+    assert.match(failure.excerpt, /verbose output line 99/);
+    assert.doesNotMatch(failure.excerpt, /tap checkout/);
+    assert.ok(failure.excerpt.length <= 6000);
+    for (const line of [
+      'AssertionError: cart count mismatch',
+      'E   assert total == 0',
+      '[ERROR] CheckoutTest.refund:42 expected: <0> but was: <1>'
+    ]) {
+      assert.ok(failure.assertion_lines.includes(line), line);
+    }
+    const repair = runCli(['dispatch', '--pack', 'PACK', '--dry-run'], repoDir);
+    const task = fs.readFileSync(path.join(repair.run_dir, 'task.md'), 'utf8');
+    assert.match(task, /## Last Machine Verification Failure/);
+    assert.match(task, /Exit code: 5/);
+    assert.match(task, /Timed out: no/);
+    for (const detail of [
+      ...failure.test_names, ...failure.assertion_lines, packResult.stdout_log, packResult.stderr_log,
+      '`' + globalCommand + '` (global)', '`' + packCommand + '` (pack)'
+    ]) {
+      assert.ok(task.includes(detail), detail);
+    }
+
+    ctx.config.verification.commands = ['# disabled', ''];
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    runCli(['record', 'implement', '--pack', 'PACK', '--passed'], repoDir);
+    assert.match(runCliFailure(['record', 'verify', '--pack', 'PACK', '--passed'], repoDir).stderr, /run "grow-loop verify"/);
+    const packageOnly = runCli(['verify', '--pack', 'PACK'], repoDir);
+    assert.deepEqual(packageOnly.commands.map((c) => [c.command, c.source]), [[packCommand, 'pack']]);
+    runCli(['record', 'implement', '--pack', 'W', '--passed'], repoDir);
+    assert.match(runCliFailure(['verify', '--pack', 'W'], repoDir).stderr, /No runnable verification\.commands.*or verify_commands/);
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }

@@ -79,6 +79,7 @@
 | `decisions` | No | Array of objects with `question`, verbatim `decision`, and an optional `at` timestamp (ISO 8601 or `null`). Task briefs include these alongside package questions and recorded gate decisions. |
 | `forwarded_findings` | No | Findings added by `forward`. Each entry has `from_pack_id`, `content`, `reason`, and `at` (ISO 8601 timestamp). They appear in initial and repair implementation prompts. |
 | `acceptance_criteria` | No | Observable verification criteria injected into `task.md` and checked during `VERIFY`/`REVIEW`. |
+| `verify_commands` | No | Array of local verification commands. Runs after global `verification.commands` and appears in implementation and repair briefs. |
 | `open_questions` | No | Non-empty array triggers `PAUSED_FOR_HUMAN` (`AMBIGUITY`) before `IMPLEMENT`. |
 | `external_effects` | No | Non-empty array (e.g., `["prod-db-migration", "webhook-notify"]`) triggers `PAUSED_FOR_HUMAN` (`EXTERNAL_EFFECT`) before `IMPLEMENT`. |
 | `tags` | No | Used to match and prioritize relevant past lessons from `lessons.json` when generating `task.md`. |
@@ -98,6 +99,19 @@ When your upstream workflow produces a requirement spec, task breakdown (`开发
 Before dispatch, read the relevant code and fill in the three arrays. Copy settled decisions from the plan verbatim. `next` and `dispatch` (including dry-runs) report empty arrays and pitfalls that lack a named code reference in `warnings`. Dispatch can proceed with these warnings.
 
 The snapshot is created during initialization. A workspace from an older version takes its current manifest as the baseline on the first command. The comparison uses parsed JSON and reports changes to pack membership, the relative order of retained packs, and field values. Use the CLI to update loop state.
+
+### Verification settings
+
+Put shared checks in the state directory's `config.json` under `verification.commands`. Put package-specific checks in the pack's `verify_commands` array in `manifest.json`. The CLI runs global commands first and package commands second. At least one runnable command must be present across the two lists. The results label commands `global` or `pack`.
+
+| Setting in `config.json` | Default | Effect |
+|---|---|---|
+| `verification.env` | `{}` | Environment overrides for verification subprocesses. Windows supplies `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8` unless overridden. |
+| `verification.path_prepend` | `[]` | Directories prepended to the subprocess `PATH` in list order. |
+| `verification.output_encoding` | `utf-8` | Decodes command output using a `TextDecoder` encoding such as `gbk`. Log files are saved as UTF-8. |
+| `verification.retry_once` | `true` | Reruns the sequence from the beginning after the first failed attempt. Each attempt stops at the first failing command and writes its own logs. |
+
+A successful second attempt is recorded as `flaky` with both run directories and no repair charge or lesson. When a failure turns out to be environmental, run `grow-loop verify --mark-env "<reason>"` before dispatching the repair. The CLI records the reason, restores the pre-failure repair budget and routing, removes the failure's lesson, and immediately reruns verification. If verification still fails, the pack waits in `VERIFY` without a new repair charge or lesson.
 
 ---
 

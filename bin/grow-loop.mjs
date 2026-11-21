@@ -92,7 +92,7 @@ Usage:
   grow-loop todo dismiss --todo <ID> --reason "<text>"
   grow-loop next      [--repo <dir>] [--state-dir <dir>]
   grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume] [--task-file <path>]
-  grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--timeout <sec>]
+  grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--pack <id>] [--timeout <sec>] [--mark-env "<reason>"]
   grow-loop record    <implement|verify|review|commit|lesson> [flags]
   grow-loop resume    --decision "<text>" [--action approve|repair|retry|commit|switch_instance|abort] [--instance <id>]
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
@@ -344,6 +344,17 @@ function cmdPackTier(ctx, flags, reason) {
     pack.escalated = true;
     const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
     pack.escalation_reason = redactor.redactString(`Manual tier change to ${tier}: ${reason}`);
+    const undo = pack.last_verify?.repair_undo;
+    if (undo) {
+      // A later operator decision supersedes the route that verification can undo.
+      Object.assign(undo.fields, {
+        current_tier: pack.current_tier,
+        active_instance: pack.active_instance,
+        last_session_id: pack.last_session_id,
+        escalated: pack.escalated,
+        escalation_reason: pack.escalation_reason
+      });
+    }
   }
   updatePackDef(ctx, { ...packDef, tier }, reason, 'pack_tier', details);
   outJson({ ok: true, pack_id: packDef.id, ...details });
@@ -489,6 +500,10 @@ async function cmdDispatch(flags) {
     run_id: runId,
     resumed_session: resumeSessionId || null
   });
+  if (pack.last_verify?.repair_undo) {
+    delete pack.last_verify.repair_undo;
+    saveState(ctx.stateDir, ctx.state);
+  }
 
   const result = await adapter.run({
     instanceId,
@@ -564,8 +579,8 @@ function cmdRecord(sub, flags) {
 
   if (sub === 'verify') {
     const claimsPass = Boolean(flags.passed) && !flags.failed;
-    if (claimsPass && getVerificationCommands(ctx.config).length && !flags['allow-self-report']) {
-      throw new Error('verification.commands are configured: run "grow-loop verify" so the CLI checks real exit codes, or pass --allow-self-report to record an unchecked pass.');
+    if (claimsPass && getVerificationCommands(ctx.config, getPackDef(ctx.manifest, packId)).length && !flags['allow-self-report']) {
+      throw new Error('Verification commands are configured: run "grow-loop verify" so the CLI checks real exit codes, or pass --allow-self-report to record an unchecked pass.');
     }
     const res = recordVerifyOutcome(ctx, {
       packId,
@@ -637,7 +652,8 @@ async function cmdVerify(flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir']);
   const res = await runVerification(ctx, {
     packId: flags.pack || ctx.state.active_pack_id,
-    timeoutSec: flags.timeout ? Number(flags.timeout) : undefined
+    timeoutSec: flags.timeout ? Number(flags.timeout) : undefined,
+    markEnv: flags['mark-env']
   });
   outJson(res);
 }
