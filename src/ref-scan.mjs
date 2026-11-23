@@ -7,6 +7,27 @@ const namedIdentifier = /(?<![\w$])[A-Za-z_$][\w$]*(?:[a-z0-9][A-Z]|_[A-Za-z0-9]
 const call = /(?<![\w$])([A-Za-z_$][\w$]*)\(/;
 const qualifiedName = /(?<![\w$])[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+/;
 const commonNames = new Set(['main', 'init', 'test', 'setup']);
+// Callers in these languages name the file without its extension.
+const stemExtensions = new Set([
+  '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs',
+  '.py', '.java', '.kt', '.kts', '.cs', '.rs'
+]);
+// File names too common to point at one caller; shorter names are skipped by length.
+const genericStems = new Set([
+  'index', 'types', 'model', 'models', 'schema', 'utils', 'helper', 'helpers', 'common', 'shared',
+  'config', 'const', 'constants', 'tests', 'setup', 'style', 'styles', 'router', 'routes', 'store',
+  'state', 'client', 'server', 'views', 'settings', 'conftest', '__init__', '__main__'
+]);
+
+function fileStem(file) {
+  const basename = path.posix.basename(file);
+  const extension = path.posix.extname(basename);
+  if (!stemExtensions.has(extension)) return null;
+  const stem = basename.slice(0, -extension.length);
+  // Skip test and declaration names such as orderService.test.ts and global.d.ts.
+  if (stem.includes('.') || stem.length < 5 || genericStems.has(stem.toLowerCase())) return null;
+  return stem;
+}
 
 export function namesCode(hint) {
   return [...hint.matchAll(inlineCode)].some((match) => match[1].trim()) ||
@@ -58,6 +79,11 @@ export function scanReferences(repoDir, stateDir, { scope_files = [], co_change_
     for (const name of functionNames(hint)) {
       if (!terms.has(name)) terms.set(name, true);
     }
+  }
+  // Stems come last so their matches cannot crowd out the names a pitfall cites before the cap.
+  for (const file of scope) {
+    const stem = globChars.test(file) ? null : fileStem(file);
+    if (stem && !terms.has(stem)) terms.set(stem, true);
   }
 
   const statePath = repoPath(repoDir, path.resolve(stateDir));

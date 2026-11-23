@@ -37,6 +37,7 @@ import { classifyInfraError } from '../src/adapters/base.mjs';
 import { codexAdapter } from '../src/adapters/codex.mjs';
 import { getVerificationCommands } from '../src/verify.mjs';
 import { parseReviewReport } from '../src/review-report.mjs';
+import { scanReferences } from '../src/ref-scan.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1894,6 +1895,51 @@ test('dispatch previews warn about incomplete briefs, scan references and create
     assert.deepEqual(live.warnings, second.warnings);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('reference scan finds extensionless imports after pitfall names and skips generic or compound stems', () => {
+  const repoDir = makeTempDir('grow-loop-ref-scan-');
+  const write = (file, content) => {
+    fs.mkdirSync(path.dirname(path.join(repoDir, file)), { recursive: true });
+    fs.writeFileSync(path.join(repoDir, file), content);
+  };
+  const scope_files = [
+    'src/services/orderService.ts', 'src/order.ts', 'src/index.ts', 'src/utils.ts',
+    'src/orderService.test.ts', 'src/global.d.ts', 'pkg/route_planning.py', 'src/main/java/com/foo/OrderRepo.java'
+  ];
+  const pitfalls = ['调用 planRoute() 前先核对出发时间'];
+  try {
+    execFileSync('git', ['init'], { cwd: repoDir, stdio: 'ignore' });
+    for (const file of scope_files) write(file, '');
+    const callers = {
+      'pages/extensionless.ts': "import { place } from '../src/services/orderService';",
+      'pages/esm.ts': "import { place } from '../src/services/orderService.js';",
+      'pages/order-user.ts': "import { total } from '../src/order';",
+      'app/Main.java': 'import com.foo.OrderRepo;',
+      'app/module.py': 'from pkg import route_planning',
+      'pkg/relative.py': 'from .route_planning import plan'
+    };
+    for (const [file, content] of Object.entries(callers)) write(file, content);
+    write('pages/generic.ts', "import a from '../src/index'; import b from '../src/utils'; import '../src/global';");
+    write('pages/border.css', '.cell { border: 0; }');
+    const scan = () => scanReferences(repoDir, path.join(repoDir, '.loop'), { scope_files, pitfalls });
+    assert.deepEqual(Object.fromEntries(scan().matches), {
+      'pages/extensionless.ts': 'orderService',
+      'pages/esm.ts': 'orderService',
+      'pages/order-user.ts': 'order',
+      'app/Main.java': 'OrderRepo',
+      'app/module.py': 'route_planning',
+      'pkg/relative.py': 'route_planning'
+    });
+
+    write('calls/planner.ts', 'planRoute(start);');
+    for (let index = 0; index < 30; index += 1) write(`more/caller${index}.py`, 'import route_planning');
+    const capped = scan().matches;
+    assert.equal(capped.size, 30);
+    assert.equal(capped.get('calls/planner.ts'), 'planRoute');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
 
