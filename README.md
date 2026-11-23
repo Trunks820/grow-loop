@@ -100,6 +100,10 @@ grow-loop/
 └── test/grow-loop.test.mjs   # Node 原生单元与端到端测试
 ```
 
+## 致谢
+
+感谢 [LINUX DO](https://linux.do) 社区对开源项目的支持与技术交流氛围，欢迎前往社区分享使用经验与改进建议。
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
