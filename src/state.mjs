@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { buildRedactor } from './redact.mjs';
+import { buildRedactor, defaultRedactor } from './redact.mjs';
 
 export const DEFAULT_STATE_DIR_NAME = '.loop';
 
@@ -69,6 +69,34 @@ export function validateManifest(manifest) {
       throw new Error('Each manifest pack must have a unique non-empty string id.');
     }
     ids.add(pack.id);
+  }
+}
+
+/**
+ * Check plan decisions on manifests entering the workspace. Stored snapshots skip this check
+ * so an older entry cannot block the command that repairs it.
+ */
+export function validateDecisions(manifest) {
+  for (const pack of manifest.packs) {
+    if (pack.decisions === undefined) continue;
+    const label = `Pack ${defaultRedactor.redactString(pack.id)} decisions`;
+    if (!Array.isArray(pack.decisions)) throw new Error(`${label} must be an array.`);
+    pack.decisions.forEach((entry, index) => {
+      const item = `${label}[${index}]`;
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new Error(`${item} must be an object with question and decision.`);
+      }
+      if (typeof entry.question !== 'string' || !entry.question.trim()) {
+        throw new Error(`${item}.question must be a non-empty string.`);
+      }
+      if (typeof entry.decision !== 'string' || !entry.decision.trim()) {
+        const hint = Object.hasOwn(entry, 'answer') ? ' Rename answer to decision.' : '';
+        throw new Error(`${item}.decision must be a non-empty string with the verbatim answer.${hint}`);
+      }
+      if (entry.at != null && typeof entry.at !== 'string') {
+        throw new Error(`${item}.at must be a string or null.`);
+      }
+    });
   }
 }
 
@@ -325,6 +353,7 @@ export function writeManifestWithReason(ctx, manifest, reason, source, details) 
     throw new Error('Specify a non-empty --reason.');
   }
   validateManifest(manifest);
+  validateDecisions(manifest);
 
   const { paths, config, stateDir, state } = ctx;
   const current = readManifest(paths.manifestPath);

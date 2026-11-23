@@ -72,7 +72,7 @@ Read the code affected by the current package and fill these three manifest fiel
 | 要一起改的文件 | `co_change_files` | Files that need to change together. Keep the authorized paths in `scope_files`. |
 | 要保住的旧行为 | `preserve_behaviors` | Existing behavior the implementer and both review rounds must check. |
 
-Copy approved decisions verbatim into `decisions` with their original question and time when known. The task brief carries them under “已经定了的”. Apply those decisions if a suggestion conflicts with them. Check “可能要一起改的文件” before approving any scope expansion. These are reference search results with the matching term. Save reports, screenshots, and drafts in the artifact directory printed in the brief.
+A grow-me handoff already carries the confirmed interview answers each package relies on in `decisions`. Copy any other approved decisions verbatim into `decisions` with their original question and time when known. The task brief carries them under “已经定了的”. Apply those decisions if a suggestion conflicts with them. Check “可能要一起改的文件” before approving any scope expansion. These are reference search results with the matching term. Save reports, screenshots, and drafts in the artifact directory printed in the brief.
 
 For an imported package, `NEEDS_FILL` blocks dispatch until `scope_files`, `risk`, and `tags` are complete. After editing `manifest.json`, check the pending diff with `grow-loop status` and run `grow-loop manifest-ack --reason "Complete the package scope, risk, and brief"`. The CLI records the reason and applies the confirmed manifest. Warnings about the three brief sections are advisory. [Manifest fields and acknowledgment](docs/UPSTREAM-BRIDGE.md#fill-the-required-fields)
 

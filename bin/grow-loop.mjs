@@ -20,6 +20,7 @@ import {
   rememberSession,
   resolveStateDir,
   saveState,
+  validateDecisions,
   writeJsonAtomic,
   writeManifestWithReason
 } from '../src/state.mjs';
@@ -169,6 +170,7 @@ function cmdInit(flags) {
     } else if (sourceFile) {
       manifest = readManifest(path.resolve(sourceFile));
       if (!manifest) throw new Error('--manifest must point to a grow-loop JSON manifest.');
+      validateDecisions(manifest);
     } else {
       manifest = { project: flags.project || path.basename(repoDir), upstream_source: flags.upstream || null, packs: [] };
     }

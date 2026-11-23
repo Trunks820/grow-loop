@@ -76,7 +76,7 @@ Use a loop manifest for a hand-authored package list, or import a JSON handoff f
 | `pitfalls` | No | Array of string warnings that name specific code using backticks, file paths, or identifiers such as `itemRepo.findById` or `findById()`. |
 | `co_change_files` | No | Array of repo-relative file paths that the coordinator expects to change together. Keep authorized files in `scope_files`. |
 | `preserve_behaviors` | No | Array of strings describing existing behavior. Included in implementation, repair, and both review rounds. |
-| `decisions` | No | Array of objects with `question`, verbatim `decision`, and an optional `at` timestamp (ISO 8601 or `null`). Task briefs include these alongside package questions and recorded gate decisions. |
+| `decisions` | No | Array of objects with `question`, verbatim `decision`, and an optional `at` timestamp (ISO 8601 or `null`). Task briefs include these alongside package questions and recorded gate decisions. `init`, `import`, `manifest-ack` and other manifest writes reject an entry without a non-empty `question` and `decision`. |
 | `forwarded_findings` | No | Findings added by `forward`. Each entry has `from_pack_id`, `content`, `reason`, and `at` (ISO 8601 timestamp). They appear in initial and repair implementation prompts. |
 | `acceptance_criteria` | No | Observable verification criteria injected into `task.md` and checked during `VERIFY`/`REVIEW`. |
 | `verify_commands` | No | Array of local verification commands. Runs after global `verification.commands` and appears in implementation and repair briefs. |
@@ -113,7 +113,7 @@ Run commands from the target repository or keep using the same `--repo` and `--s
 ### Conversion
 
 - The new manifest copies `project` and `upstream_source` when supplied. Validator output without those fields uses the filename stem for `project` and the filename with `revision` for `upstream_source`. On append, the workspace keeps its top-level metadata and each new package records its own source.
-- Packages keep their exported order. Each keeps `id`, `title`, `goal`, `depends_on`, `acceptance_criteria`, `open_questions`, and `external_effects`. Dependencies must refer to another package in the handoff or to an existing workspace package when appending.
+- Packages keep their exported order. Each keeps `id`, `title`, `goal`, `depends_on`, `acceptance_criteria`, `open_questions`, and `external_effects`. Supplied `decisions` keep their question and verbatim text; a missing `at` becomes `null`. Dependencies must refer to another package in the handoff or to an existing workspace package when appending.
 - The import keeps supplied `scope_files` and `tags`; absent values become empty arrays. Fill in `risk` in the workspace. Set `estimated_files` or `cross_module` there when needed for routing.
 - `upstream_ref` records the source and package ID. `handoff.needs` records the required fields missing at import.
 

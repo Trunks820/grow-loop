@@ -469,6 +469,56 @@ test('import --handoff audits appends and init --force --handoff shares the repl
   }
 });
 
+test('handoff decisions reach the brief verbatim and malformed decisions stop at every manifest entry', () => {
+  const repoDir = makeTempDir('grow-loop-handoff-decisions-');
+  const cli = (...args) => runCli(args, repoDir);
+  const fail = (...args) => runCliFailure(args, repoDir);
+  const decision = '你选：邮件 通知；短信\n你的原话：  都要 `notify()`\r ';
+  const pack = {
+    id: 'W1', title: 'Notify', goal: 'Send the notice', depends_on: [],
+    acceptance_criteria: [], open_questions: [], external_effects: [],
+    decisions: [{ question: '用哪种通知？', decision }],
+    scope_files: ['src/notify.mjs'], tags: ['notify']
+  };
+  const plan = (packs) => ({ project: 'notify', upstream_source: 'plan', packs });
+  try {
+    writeJsonAtomic(path.join(repoDir, 'renamed.json'), plan([{ ...pack, decisions: [{ question: '用哪种通知？', answer: decision }] }]));
+    for (const flag of ['--handoff', '--manifest']) {
+      assert.match(fail('init', flag, 'renamed.json').stderr, /Pack W1 decisions\[0\]\.decision must be a non-empty string with the verbatim answer\. Rename answer to decision\./);
+    }
+    writeJsonAtomic(path.join(repoDir, 'task.manifest.json'), plan([pack]));
+    const init = cli('init', '--handoff', 'task.manifest.json');
+    const paths = getStatePaths(init.state_dir);
+    const manifest = readJsonSafe(paths.manifestPath);
+    assert.deepEqual(manifest.packs[0].decisions, [{ question: '用哪种通知？', decision, at: null }]);
+
+    manifest.packs[0].risk = 'low';
+    manifest.packs[0].decisions.push({ question: ' ', decision: '另起一条' });
+    writeJsonAtomic(paths.manifestPath, manifest);
+    assert.ok(cli('status').manifest_change_pending);
+    assert.match(fail('manifest-ack', '--reason', 'Fill risk').stderr, /Pack W1 decisions\[1\]\.question must be a non-empty string\./);
+    manifest.packs[0].decisions.pop();
+    writeJsonAtomic(paths.manifestPath, manifest);
+    cli('manifest-ack', '--reason', 'Fill risk');
+    assert.equal(cli('next').action, 'IMPLEMENT');
+    const task = fs.readFileSync(path.join(cli('dispatch', '--dry-run').run_dir, 'task.md'), 'utf8');
+    assert.ok(task.includes('- 方案问题：用哪种通知？（时间：未记录）'));
+    assert.ok(task.includes('\n' + decision + '\n'));
+
+    // An older workspace whose accepted snapshot holds a malformed entry still reads and can be repaired.
+    manifest.packs[0].decisions = [{ question: '用哪种通知？', answer: '旧字段' }];
+    writeJsonAtomic(paths.manifestPath, manifest);
+    writeJsonAtomic(paths.manifestSnapshotPath, manifest);
+    assert.equal(cli('status').manifest_change_pending, undefined);
+    manifest.packs[0].decisions = [{ question: '用哪种通知？', decision: '旧字段' }];
+    writeJsonAtomic(paths.manifestPath, manifest);
+    cli('manifest-ack', '--reason', 'Rename the old field');
+    assert.deepEqual(readJsonSafe(paths.manifestSnapshotPath).packs[0].decisions, manifest.packs[0].decisions);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('the confirmed manifest replaces a removed active pack, preserves history, and reopens a completed loop', () => {
   const repoDir = makeTempDir('grow-loop-manifest-sync-');
   try {

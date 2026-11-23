@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { defaultRedactor } from './redact.mjs';
-import { validateManifest } from './state.mjs';
+import { validateDecisions, validateManifest } from './state.mjs';
 
 const REPORT_FIELDS = ['valid', 'errors', 'requirements', 'criteria', 'work_entries', 'revision', 'limits'];
 const PACK_ARRAYS = ['depends_on', 'acceptance_criteria', 'open_questions', 'external_effects', 'scope_files', 'tags'];
@@ -30,6 +30,7 @@ export function readHandoff(filePath, existingIds = []) {
     throw new Error('--handoff requires a grow-me task.manifest.json or validate-task.mjs --handoff output.');
   }
   validateManifest(input);
+  validateDecisions(input);
 
   const knownIds = new Set([...existingIds, ...input.packs.map(({ id }) => id)]);
 
@@ -50,7 +51,12 @@ export function readHandoff(filePath, existingIds = []) {
       if (typeof dep !== 'string') throw new Error(`${label} must list pack IDs in depends_on.`);
       if (!knownIds.has(dep)) throw new Error(`${label} depends on unknown pack ${defaultRedactor.redactString(dep)}.`);
     }
-    const pack = { id, title, goal, ...fields, upstream_ref: `${sourceRef}#${id}`, handoff: { source } };
+    // Confirmed plan answers keep their exact wording for the task brief.
+    const decisions = (entry.decisions ?? []).map(({ question, decision, at = null }) => ({ question, decision, at }));
+    const pack = {
+      id, title, goal, ...fields, ...(decisions.length && { decisions }),
+      upstream_ref: `${sourceRef}#${id}`, handoff: { source }
+    };
     pack.handoff.needs = handoffNeeds(pack);
     return pack;
   });
