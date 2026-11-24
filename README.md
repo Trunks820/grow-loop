@@ -41,6 +41,7 @@ node /path/to/grow-loop/bin/grow-loop.mjs next
 | 准备工作区 | `grow-loop init`、`grow-loop import`、`grow-loop manifest-ack` | [清单与交接](docs/UPSTREAM-BRIDGE.md) |
 | 查看和推进 | `grow-loop probe`、`grow-loop status`、`grow-loop next`、`grow-loop dispatch`、`grow-loop verify` | [运行工作包](SKILL.md#coordinator-execution-protocol-mode-a) |
 | 登记结果 | `grow-loop record implement`、`grow-loop record verify`、`grow-loop record review`、`grow-loop record commit` | [总控执行协议](SKILL.md#coordinator-execution-protocol-mode-a) |
+| 外部收口 | `grow-loop record external --pack <ID> --note "<在外面做了什么>"` | 登记已在 loop 外完成的包，解锁依赖它的后续包。 |
 | 中途改动 | `grow-loop pack insert`、`grow-loop pack tier`、`grow-loop pack scope`、`grow-loop forward`、`grow-loop todo add`、`grow-loop todo list`、`grow-loop todo dismiss` | [中途改动示例](#中途改动) |
 | 沉淀教训 | `grow-loop lesson list`、`grow-loop lesson confirm`、`grow-loop lesson disable`、`grow-loop record lesson` | [确认草稿与选择适用范围](SKILL.md#step-5--confirm-and-scope-lesson-drafts) |
 | 回填决定 | `grow-loop status --format shell`、`grow-loop answer`、`grow-loop resume` | [壳接口](docs/SHELL-API.md) |

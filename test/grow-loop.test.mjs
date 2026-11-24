@@ -684,9 +684,11 @@ test('shell status and answer acknowledge a changed manifest, reject stale quest
     });
     assert.deepEqual(pending.packs, [
       { id: 'W1', title: '确认界面行为', status: 'PAUSED_FOR_HUMAN', tier: 'tier1', instance: 'tier1-cli',
-        tier1_repairs: 0, tier2_repairs: 0, review_rounds: 0, needs: [], inflight_run: null, commit: null, gate: 'AMBIGUITY' },
+        tier1_repairs: 0, tier2_repairs: 0, review_rounds: 0, needs: [], inflight_run: null, commit: null,
+        completed_externally: null, gate: 'AMBIGUITY' },
       { id: 'W2', title: '验证界面行为', status: 'PENDING', tier: null, instance: null,
-        tier1_repairs: 0, tier2_repairs: 0, review_rounds: 0, needs: [], inflight_run: null, commit: null, gate: null }
+        tier1_repairs: 0, tier2_repairs: 0, review_rounds: 0, needs: [], inflight_run: null, commit: null,
+        completed_externally: null, gate: null }
     ]);
     assert.deepEqual(pending.pending, {
       manifest_change: cli('status').manifest_change_pending, lesson_drafts: 0, open_todos: 0, in_round_tech_debt: 0
@@ -1046,6 +1048,11 @@ test('unfinished report ignores explicit empty replies and keeps empty or substa
     assert.equal(parseImplementBlockedReason(`## 没做完\n\n${word}\n`), null);
     assert.equal(parseImplementBlockedReason(`## 没做完：${word} ##\n`), null);
   }
+  const emptyItems = '- 无\n* 没有。\n1. 暂无\n+ [x] **没有**。\n  - [ ] __暂无。__';
+  assert.equal(parseImplementBlockedReason(`## 没做完\n${emptyItems}\n`), null);
+  assert.equal(parseImplementBlockedReason('## 没做完：缺少验收数据\n\n## 进度\n已检查'), '缺少验收数据');
+  const mixedItems = '- 无\n- [ ] **仍需验证回放**';
+  assert.equal(parseImplementBlockedReason(`## 没做完\n${mixedItems}`), mixedItems);
   assert.equal(parseImplementBlockedReason('没做完: 无\n===\n'), null);
   assert.equal(parseImplementBlockedReason('## 没做完\n\n## 进度\n已检查'), '执行者没写原因');
   assert.equal(parseImplementBlockedReason('## 没做完\n暂无可用的数据文件。'), '暂无可用的数据文件。');
@@ -2284,7 +2291,8 @@ test('dispatch warns about scope directories and unscoped tests named by package
     pack.verify_commands.push(`pytest ${shellQuote(path.join(repoDir, 'tests', 'absolute.py').replaceAll('\\', '/'))}`);
     writeJsonAtomic(ctx.paths.manifestPath, { ...ctx.manifest, packs: [pack, ctx.manifest.packs[1]] });
     cli('manifest-ack', '--reason', '确认验证命令');
-    assert.equal(cli('next').action, 'IMPLEMENT');
+    const initial = cli('next');
+    assert.equal(initial.action, 'IMPLEMENT');
 
     const oldWarnings = ['「要保住的旧行为」未填写。', '第 1 条避坑提示未点名代码：跟现有规则一致'];
     const directoryWarning = (file) => `范围里的「${file}」是目录，请列出具体文件。`;
@@ -2298,6 +2306,7 @@ test('dispatch warns about scope directories and unscoped tests named by package
         'lib/sample.spec.ts', 'test/sample_test.go', '__tests__/smoke', 'tests/absolute.py'
       ].map(testWarning)
     ]);
+    assert.deepEqual(initial.warnings, preview.warnings);
     assert.deepEqual(cli('dispatch', '--dry-run', '--pack', 'GLOB').warnings, [...oldWarnings, directoryWarning('later\\')]);
     assert.deepEqual(taskBriefWarnings({ co_change_files: ['fixtures\\existing', 'later\\'] }, {}), [
       '「避坑提示」未填写。', '「要保住的旧行为」未填写。', directoryWarning('later\\')
@@ -2981,10 +2990,123 @@ test('self dispatch records implementation and review time and commit checks fla
   }
 });
 
+test('record external clears a pending handoff stop and lets a dependent package start', () => {
+  const { repoDir, ctx } = setupCtx([
+    { id: 'W10', risk: 'low', tags: ['ops'], handoff: { source: 'fixture', needs: ['scope_files'] }, co_change_files: ['src'] },
+    { id: 'W11', depends_on: ['W10'], scope_files: ['src/replay.mjs'] }
+  ], { redaction: { extra_patterns: ['fixture-private-marker'] } });
+  const cli = (...args) => runCli(args, repoDir);
+  const fail = (...args) => runCliFailure(args, repoDir);
+  const record = ['record', 'external', '--pack', 'W10'];
+  try {
+    fs.mkdirSync(path.join(repoDir, 'src'));
+    delete ctx.state.packs.W11.completed_externally; // State created before this field was added.
+    saveState(ctx.stateDir, ctx.state);
+    const stop = cli('next');
+    assert.equal(stop.action, 'NEEDS_FILL');
+    assert.deepEqual(stop.needs, ['scope_files']);
+    assert.ok(stop.warnings.includes('范围里的「src」是目录，请列出具体文件。'));
+
+    assert.match(fail('record', 'external', '--note', '已完成').stderr, /non-empty --pack/);
+    assert.match(fail(...record).stderr, /non-empty --note/);
+    assert.match(fail(...record, '--note', '  ').stderr, /non-empty --note/);
+    assert.equal(cli('status', '--format', 'shell').question.kind, 'NEEDS_FILL');
+
+    const result = cli(...record, '--note', '  回放已完成 | fixture-private-marker  ');
+    const { at } = result.completed_externally;
+    const completion = { at, note: '回放已完成 | [REDACTED:INTERNAL]' };
+    assert.deepEqual(result, {
+      outcome: 'completed_externally', pack_id: 'W10', completed_externally: completion,
+      next_pack_id: 'W11', loop_status: 'RUNNING'
+    });
+    assert.equal(new Date(at).toISOString(), at);
+    const saved = readJsonSafe(ctx.paths.statePath).packs.W10;
+    assert.equal(saved.completed_at, at);
+    assert.deepEqual(saved.completed_externally, completion);
+    assert.deepEqual(readEvents(ctx.paths.eventsPath), [
+      { type: 'pack_completed_externally', pack_id: 'W10', ts: at, note: completion.note }
+    ]);
+
+    const shell = cli('status', '--format', 'shell');
+    assert.equal(shell.schema, 'grow-loop.status/1');
+    assert.equal(shell.active_pack_id, 'W11');
+    assert.equal(shell.question, null);
+    for (const status of [shell, cli('status')]) {
+      assert.equal(status.packs[0].status, 'COMMITTED');
+      assert.equal(status.packs[0].commit, null);
+      assert.deepEqual(status.packs[0].completed_externally, completion);
+      assert.equal(status.packs[1].completed_externally, null);
+    }
+    const next = cli('next');
+    assert.equal(next.action, 'IMPLEMENT');
+    assert.equal(next.pack_id, 'W11');
+
+    const evidence = cli('evidence');
+    const markdown = fs.readFileSync(evidence.path, 'utf8');
+    assert.ok(markdown.includes('在 loop 外完成（回放已完成 \\| [REDACTED:INTERNAL]）'));
+    assert.deepEqual(evidence.scanHits, []);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('record external clears an external-effect gate and completes the final package after dispatch stops', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'W12', external_effects: ['Publish the fixture'] }]);
+  const cli = (...args) => runCli(args, repoDir);
+  const record = ['record', 'external', '--pack', 'W12', '--note', '上线已完成'];
+  try {
+    assert.equal(cli('next').gate.reason, ALLOWED_GATE_REASONS.EXTERNAL_EFFECT);
+    const state = readJsonSafe(ctx.paths.statePath);
+    const pack = state.packs.W12;
+    pack.inflight_run = { kind: 'custom-cmd', pid: process.pid, stage: 'implement' };
+    saveState(ctx.stateDir, state);
+    assert.match(runCliFailure(record, repoDir).stderr, /active dispatch/);
+    pack.inflight_run = { kind: 'self', stage: 'implement' };
+    saveState(ctx.stateDir, state);
+    assert.match(runCliFailure(record, repoDir).stderr, /active dispatch/);
+    assert.equal(cli('status', '--format', 'shell').question.kind, 'EXTERNAL_EFFECT');
+
+    pack.inflight_run = null;
+    saveState(ctx.stateDir, state);
+    const result = cli(...record);
+    assert.equal(result.next_pack_id, null);
+    assert.equal(result.loop_status, 'COMPLETED');
+    const status = cli('status', '--format', 'shell');
+    assert.equal(status.now.phase, 'COMPLETED');
+    assert.equal(status.active_pack_id, null);
+    assert.equal(status.question, null);
+    assert.equal(status.packs[0].gate, null);
+    assert.equal(status.packs[0].completed_externally.note, '上线已完成');
+    assert.match(runCliFailure(record, repoDir).stderr, /already committed/);
+    assert.equal(readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'pack_completed_externally').length, 1);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('record external rejects packages already in an implementation, verification, review or commit phase', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A' }]);
+  try {
+    for (const status of ['IMPLEMENT', 'VERIFY', 'REVIEW', 'READY_TO_COMMIT']) {
+      ctx.state.packs.A.status = status;
+      saveState(ctx.stateDir, ctx.state);
+      const result = runCliFailure(['record', 'external', '--pack', 'A', '--note', '已完成'], repoDir);
+      assert.equal(result.status, 1);
+      assert.ok(result.stderr.includes(`Pack A is in ${status}.`));
+      assert.match(result.stderr, /grow-loop record commit --from-git/);
+      assert.match(result.stderr, /grow-loop resume/);
+      assert.equal(readJsonSafe(ctx.paths.statePath).packs.A.status, status);
+    }
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('Git checkpoints warn once for unrelated commits and gate current and completed pack changes', () => {
   const { repoDir, ctx } = setupCtx([
     { id: 'A', scope_files: ['done.js'] },
-    { id: 'B', scope_files: ['active.js'], co_change_files: ['companion.js'] }
+    { id: 'B', scope_files: ['active.js'], co_change_files: ['companion.js'] },
+    { id: 'EXTERNAL', scope_files: ['unrelated.js'] }
   ], { verification: { commands: [shellQuote(process.execPath) + ' --check active.js'] } });
   const cli = (...args) => runCli(args, repoDir);
   const write = (file, content) => fs.writeFileSync(path.join(repoDir, file), content);
@@ -2993,10 +3115,12 @@ test('Git checkpoints warn once for unrelated commits and gate current and compl
     fixtureGit(repoDir, 'init', '-b', 'fixture-branch');
     for (const file of ['done.js', 'active.js', 'companion.js']) write(file, 'let value = 1;\n');
     fixtureCommit(repoDir, 'fixture baseline', 'done.js', 'active.js', 'companion.js');
+    cli('record', 'external', '--pack', 'EXTERNAL', '--note', 'Completed outside the test loop');
     cli('next');
     write('done.js', 'let value = 2;\n');
     const completed = fixtureCommit(repoDir, 'fixture pack A implementation', 'done.js');
     cli('record', 'commit', '--from-git');
+    assert.match(runCliFailure(['record', 'external', '--pack', 'A', '--note', 'Already recorded'], repoDir).stderr, /already committed/);
     cli('next');
     assert.equal(saved().base_commit, completed);
     assert.equal(saved().base_branch, 'fixture-branch');
@@ -3055,6 +3179,7 @@ test('Git checkpoints warn once for unrelated commits and gate current and compl
     assert.equal(shell.now.waiting_for, 'none');
     assert.equal(shell.now.next_command, null);
     assert.equal(shell.packs[1].commit, own);
+    assert.equal(shell.packs[2].commit, null);
     const notices = readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'external_commits_noticed');
     assert.deepEqual(notices.map(({ commits }) => commits), [[{ sha: unrelated, files: ['unrelated.js'] }]]);
   } finally {

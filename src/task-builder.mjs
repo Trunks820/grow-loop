@@ -106,31 +106,42 @@ function reportSection(markdown, matchesHeading) {
     if (atxHeading || setextHeading) {
       const heading = line.trim().replace(/^#{1,6}[ \t]+|[ \t]+#+$/g, '');
       inSection = matchesHeading(heading);
-      if (inSection) section ??= [];
+      if (inSection) {
+        section ??= { headings: [], entries: [] };
+        section.headings.push(heading);
+      }
       if (!atxHeading) index++;
       continue;
     }
-    if (inSection) section.push({ line, item });
+    if (inSection) section.entries.push({ line, item });
   }
   return section;
+}
+
+function reportItemText(text) {
+  return text.trim().replace(/^\[[ xX]\]\s*/, '').replace(/^(\*{1,2}|_{1,2})(.+?)\1(?=[。.!！]?$)/, '$2').trim();
 }
 
 export function parseOutOfScopeItems(markdown, { includeSection = false } = {}) {
   const section = reportSection(markdown, (heading) => heading.includes('超范围没改'));
   const items = [];
-  for (const { item } of section ?? []) {
-    const text = item?.replace(/^\[[ xX]\]\s*/, '').trim().replace(/^(\*{1,2}|_{1,2})(.+)\1$/, '$2').trim();
+  for (const { item } of section?.entries ?? []) {
+    const text = item && reportItemText(item);
     if (text && !emptyReport.test(text)) items.push(item);
   }
   return includeSection ? { items, hasSection: section !== null } : items;
 }
 
 export function parseImplementBlockedReason(markdown) {
-  const section = reportSection(markdown, (heading) => heading.includes('没做完') &&
-    !emptyReport.test(heading.match(/没做完\s*[:：]\s*(.*)$/)?.[1] ?? ''));
+  const section = reportSection(markdown, (heading) => heading.includes('没做完'));
   if (!section) return null;
-  const reason = section.map(({ line }) => line).join('\n').trim();
-  return emptyReport.test(reason) ? null : reason || '执行者没写原因';
+  const lines = section.entries.map(({ line }) => line);
+  const body = lines.map((line) => reportItemText(line.trim().replace(/^(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)/, ''))).filter(Boolean);
+  if (body.some((text) => !emptyReport.test(text))) return lines.join('\n').trim();
+
+  const notes = section.headings.map((heading) => heading.match(/没做完\s*[:：]\s*(.*)$/)?.[1].trim()).filter(Boolean);
+  const reason = notes.filter((text) => !emptyReport.test(reportItemText(text))).join('\n');
+  return reason || (body.length || notes.length ? null : '执行者没写原因');
 }
 
 function addBriefField(lines, packDef, field, guidance) {

@@ -48,6 +48,8 @@ Run each command in the target repo, or pass the same workspace options througho
 
 Keep production runs, paid replays, and deployment outside this local code delivery loop.
 
+After completing a package with `external_effects` or a release package outside the loop, record the result with `grow-loop record external --pack <ID> --note "<what was completed outside the loop>"`. The package must be `PENDING` or `PAUSED_FOR_HUMAN` with no active dispatch. The CLI records the redacted note, marks the package `COMMITTED`, and selects the next unfinished package. Run `grow-loop next` to continue.
+
 ### Step 0 — Prepare the workspace
 
 Initialize with the loop's own JSON manifest or an upstream JSON handoff. To append packages to an existing workspace, use the import command and record why.

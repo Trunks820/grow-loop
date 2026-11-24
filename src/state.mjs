@@ -189,6 +189,7 @@ export function createInitialPackState(packDef) {
     gate: null,
     blast_radius: null,
     commit: null,
+    completed_externally: null,
     base_commit: null,
     base_branch: null,
     started_at: null,

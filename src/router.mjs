@@ -9,7 +9,7 @@ import { addLesson, closeLessonsForPack, deferInRoundTechDebt, recordReviewTechD
 import { getBlockingReviewSeverities } from './review-report.mjs';
 import { checkExternalCommits, readCommitFiles, readGitPosition, scanStrayFiles } from './git-watch.mjs';
 import { writeRunResult } from './adapters/base.mjs';
-import { buildQuestion, NEXT_COMMANDS } from './shell-api.mjs';
+import { buildQuestion, dispatchStillRunning, NEXT_COMMANDS } from './shell-api.mjs';
 
 const PREFLIGHT_GATE_REASONS = new Set([
   ALLOWED_GATE_REASONS.BLAST_RADIUS_SPLIT,
@@ -137,7 +137,7 @@ export function startOrAdvanceActivePack(ctx) {
         needs,
         next_steps: [...handoffFillSteps(needs), `Run: ${NEXT_COMMANDS.next}`],
         question: buildQuestion(ctx, pack),
-        warnings: taskBriefWarnings(packDef, config)
+        warnings: taskBriefWarnings(packDef, config, state.repo_dir)
       };
     }
     if (packDef.handoff?.needs?.length) {
@@ -153,7 +153,7 @@ export function startOrAdvanceActivePack(ctx) {
         pack_id: activeId,
         missing_dependencies: deps.missing,
         question: buildQuestion(ctx, pack),
-        warnings: taskBriefWarnings(packDef, config),
+        warnings: taskBriefWarnings(packDef, config, state.repo_dir),
         message: `Pack ${activeId} waiting on uncommitted dependencies: ${deps.missing.join(', ')}`
       };
     }
@@ -265,7 +265,7 @@ export function buildNextDirective(ctx, pack, packDef) {
   const packInfo = {
     pack_id: pack.id,
     title: pack.title,
-    warnings: taskBriefWarnings(packDef, config)
+    warnings: taskBriefWarnings(packDef, config, ctx.state.repo_dir)
   };
   const injectedLessons = () => selectLessonsForPack(stateDir, packDef)
     .map(({ id, summary, rule, scope, scope_tags }) => ({ id, summary, rule, scope, scope_tags }));
@@ -919,6 +919,14 @@ export function recordReviewOutcome(ctx, payload) {
   );
 }
 
+function advanceAfterCompletion({ state, stateDir }) {
+  const nextId = state.pack_order.find((id) => state.packs[id]?.status !== 'COMMITTED') || null;
+  state.active_pack_id = nextId;
+  state.loop_status = nextId ? 'RUNNING' : 'COMPLETED';
+  saveState(stateDir, state);
+  return nextId;
+}
+
 export function recordCommitOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
   const pack = getWritablePack(ctx, payload.packId);
@@ -958,11 +966,7 @@ export function recordCommitOutcome(ctx, payload) {
     commit: pack.commit
   });
 
-  // Advance to next unfinished pack
-  const nextId = state.pack_order.find((id) => state.packs[id]?.status !== 'COMMITTED') || null;
-  state.active_pack_id = nextId;
-  state.loop_status = nextId ? 'RUNNING' : 'COMPLETED';
-  saveState(stateDir, state);
+  const nextId = advanceAfterCompletion(ctx);
 
   return {
     outcome: 'committed',
@@ -971,6 +975,44 @@ export function recordCommitOutcome(ctx, payload) {
     loop_status: state.loop_status,
     ...(gitWatch && { git_watch: gitWatch }),
     ...(payload.fromGit && scanStrayFiles(ctx, pack, packDef, changedFiles))
+  };
+}
+
+export function recordExternalCompletion(ctx, { packId, note }) {
+  const { stateDir, config, state } = ctx;
+  if (typeof packId !== 'string' || !packId.trim()) throw new Error('Specify a non-empty --pack.');
+  const reason = typeof note === 'string' ? note.trim() : '';
+  if (!reason) throw new Error('Specify a non-empty --note.');
+  if (!state.pack_order.includes(packId)) throw new Error('Work package not found. Check --pack.');
+  const pack = state.packs[packId];
+  if (pack.status === 'COMMITTED') throw new Error(`Pack ${pack.id} is already committed.`);
+  if (state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
+  if (!['PENDING', 'PAUSED_FOR_HUMAN'].includes(pack.status)) {
+    throw new Error(`Pack ${pack.id} is in ${pack.status}. Continue the normal workflow to "grow-loop record commit --from-git", or use "grow-loop resume" if the pack pauses.`);
+  }
+  const run = pack.inflight_run;
+  if (dispatchStillRunning(run) || (run?.kind === 'self' && !run.route_changed)) {
+    throw new Error(`Pack ${pack.id} has an active dispatch. Finish the dispatch before recording external completion.`);
+  }
+
+  const at = new Date().toISOString();
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  pack.completed_externally = { note: redactor.redactString(reason), at };
+  pack.status = 'COMMITTED';
+  pack.completed_at = at;
+  pack.commit = null;
+  pack.gate = null;
+  pack.inflight_run = null;
+  pack.prepared_run = null;
+  appendEvent(stateDir, config, { type: 'pack_completed_externally', pack_id: pack.id, note: reason, ts: at });
+
+  const nextId = advanceAfterCompletion(ctx);
+  return {
+    outcome: 'completed_externally',
+    pack_id: pack.id,
+    completed_externally: pack.completed_externally,
+    next_pack_id: nextId,
+    loop_status: state.loop_status
   };
 }
 

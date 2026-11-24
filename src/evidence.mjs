@@ -64,8 +64,9 @@ export function generateEvidencePack(ctx, outputPath) {
     const sha = p.commit?.sha ? `\`${p.commit.sha.slice(0, 9)}\`` : '未提交';
     const diffStat = p.commit ? `${p.commit.files} files (\`+${p.commit.insertions}/-${p.commit.deletions}\`)` : '无记录';
     const repairs = `${p.tier1_repairs} / ${p.tier2_repairs}${p.escalated ? ' (已升级T2)' : ''}`;
+    const completion = p.completed_externally ? ` · 在 loop 外完成（${esc(p.completed_externally.note)}）` : '';
     lines.push(
-      `| **${esc(p.id)}** | ${esc(p.title)} | ${esc(instance)} · ${esc(tool)} / ${esc(model)} | ${sha} | ${diffStat} | ${repairs} | ${p.review_rounds} | **${esc(p.status)}** |`
+      `| **${esc(p.id)}** | ${esc(p.title)} | ${esc(instance)} · ${esc(tool)} / ${esc(model)} | ${sha} | ${diffStat} | ${repairs} | ${p.review_rounds} | **${esc(p.status)}**${completion} |`
     );
   }
   lines.push('');

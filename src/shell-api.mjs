@@ -242,6 +242,7 @@ export function buildShellStatus(ctx) {
       needs: handoffNeeds(packDefs.get(id)),
       inflight_run: run ? { stage: run.stage ?? null, started_at: run.started_at ?? null } : null,
       commit: pack.commit?.sha ?? null,
+      completed_externally: pack.completed_externally ?? null,
       gate: pack.gate?.reason ?? null
     };
   });

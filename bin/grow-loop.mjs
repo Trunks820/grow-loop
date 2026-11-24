@@ -30,6 +30,7 @@ import {
   getPackDef,
   getRepairRounds,
   recordCommitOutcome,
+  recordExternalCompletion,
   recordImplementOutcome,
   recordReviewOutcome,
   recordVerifyOutcome,
@@ -110,9 +111,10 @@ Usage:
   grow-loop next      [--repo <dir>] [--state-dir <dir>]
   grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume [<session-id>]] [--task-file <path>]
   grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--pack <id>] [--timeout <sec>] [--mark-env "<reason>"]
-  grow-loop record    <implement|verify|review|commit|lesson> [flags]
+  grow-loop record    <implement|verify|review|commit|external|lesson> [flags]
   grow-loop record implement (--passed | --blocked "<reason>") [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
   grow-loop record review --report <report.md> [--reviewer <instance>] [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
+  grow-loop record external --pack <ID> --note "<what was completed outside the loop>"
   grow-loop record lesson --summary "<text>" [--pack <ID>] [--rule "<text>"] [--scope global|tags] [--tags a,b]
   grow-loop resume    --decision "<text>" [--action approve|repair|retry|commit|switch_instance|abort] [--instance <id>]
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
@@ -283,6 +285,7 @@ function cmdStatus(flags) {
       infra_failures: p.infra_failures,
       inflight_run: redactor.redactValue(p.inflight_run ?? null),
       commit: p.commit?.sha?.slice(0, 9) || null,
+      completed_externally: p.completed_externally ?? null,
       gate: p.gate?.reason || null,
       ...(needs.length && { needs })
     };
@@ -843,6 +846,11 @@ function executorFlags(flags) {
 
 function cmdRecord(sub, flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir']);
+  if (sub === 'external') {
+    outJson(recordExternalCompletion(ctx, { packId: flags.pack, note: flags.note }));
+    return;
+  }
+
   const packId = flags.pack || ctx.state.active_pack_id;
   const pack = ctx.state.packs[packId];
   const packDef = getPackDef(ctx.manifest, packId);
@@ -972,7 +980,7 @@ function cmdRecord(sub, flags) {
     return;
   }
 
-  throw new Error(`Unknown record subcommand "${sub}". Use: implement | verify | review | commit | lesson`);
+  throw new Error(`Unknown record subcommand "${sub}". Use: implement | verify | review | commit | external | lesson`);
 }
 
 async function cmdVerify(flags) {

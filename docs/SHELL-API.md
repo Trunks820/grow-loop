@@ -48,6 +48,7 @@
 | `needs` | 字符串数组 | 当前 `manifest.json` 里尚未补齐的交接字段，可含 `scope_files`、`risk`、`tags`。齐全时为 `[]`。 |
 | `inflight_run` | 对象或 `null` | 已登记且尚未清掉的派发，`stage` 是 `implement` 或 `review`，`started_at` 是 ISO 8601 时间。旧记录缺少 `stage` 或 `started_at` 时，对应字段为 `null`。当前是否在等待外部执行器由 `now.waiting_for` 表示。 |
 | `commit` | 字符串或 `null` | 登记时保存的提交号，保留完整值。 |
+| `completed_externally` | 对象或 `null` | 在 loop 外完成的包包含 `note`（脱敏后的登记说明）和 `at`（ISO 8601 登记时间）。此类包的 `status` 为 `COMMITTED`，`commit` 为 `null`。 |
 | `gate` | 字符串或 `null` | 已登记的门禁原因。 |
 
 ### `pending`

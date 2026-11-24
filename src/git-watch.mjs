@@ -114,8 +114,10 @@ export function checkExternalCommits(ctx, pack, packDef, recordingSha) {
 
   const range = git(repoDir, ['rev-list', '--reverse', pack.base_commit + '..' + head, '--']);
   if (range === null) return skipped('Git 无法读取包的基线到 HEAD 之间的提交。已跳过本次检查。');
-  const completed = Object.values(state.packs).filter((item) => item.status === 'COMMITTED' && item.commit?.sha);
-  const known = new Set([...completed.map((item) => item.commit.sha), recordingSha].filter(Boolean)
+  const completedCommits = Object.values(state.packs)
+    .filter((item) => item.status === 'COMMITTED' && item.commit?.sha)
+    .map(({ commit }) => commit);
+  const known = new Set([...completedCommits.map(({ sha }) => sha), recordingSha].filter(Boolean)
     .map((sha) => /^[a-f0-9]{40,64}$/i.test(sha) ? sha.toLowerCase() : resolveCommit(repoDir, sha)));
   const external = range.trim().split(/\s+/).filter((sha) => sha && !known.has(sha));
   const branchChanged = pack.base_branch !== undefined && pack.base_branch !== branch;
@@ -130,8 +132,8 @@ export function checkExternalCommits(ctx, pack, packDef, recordingSha) {
   }
 
   const protectedFiles = scopeFiles(repoDir, packDef);
-  for (const item of completed) {
-    const files = item.commit.changed_files ?? readCommitFiles(repoDir, item.commit.sha);
+  for (const commit of completedCommits) {
+    const files = commit.changed_files ?? readCommitFiles(repoDir, commit.sha);
     for (const file of files ?? []) protectedFiles.add(file);
   }
   const conflictingFiles = [...new Set(commits.flatMap(({ files }) => files.filter((file) => protectedFiles.has(file))))];
