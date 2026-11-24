@@ -675,6 +675,13 @@ async function cmdDispatch(flags) {
     throw new Error('This pack has a self run awaiting grow-loop record ' + inflight.stage + '.');
   }
   const warnings = taskBriefWarnings(packDef, ctx.config);
+  if (adapter.kind === 'custom-cmd') {
+    if (!instanceCfg.model) warnings.push('custom-cmd 未配置 model，执行记录里的模型会是空的。');
+    if (!instanceCfg.session_id_pattern && Array.isArray(instanceCfg.resume_args) &&
+        instanceCfg.resume_args.some((arg) => String(arg).includes('{{session_id}}'))) {
+      warnings.push('custom-cmd 的 resume_args 使用了 {{session_id}}，但未配置 session_id_pattern，拿不到会话号，--resume 会开新会话。');
+    }
+  }
   const suppliedTask = flags['task-file'] === undefined ? null : path.resolve(requireText(flags['task-file'], 'task-file'));
   if (suppliedTask && !fs.statSync(suppliedTask, { throwIfNoEntry: false })?.isFile()) {
     throw new Error('Specify a readable task file with --task-file <path>.');
@@ -740,6 +747,9 @@ async function cmdDispatch(flags) {
         saveState(ctx.stateDir, latest);
       }
     });
+    if (adapter.kind === 'custom-cmd' && instanceCfg.session_id_pattern && !result.session_id) {
+      warnings.push('custom-cmd 的 session_id_pattern 本次未匹配到会话号。');
+    }
     if (result.status !== 'host_action_required') {
       // An operator may have changed the route, scope, or todos while the adapter ran.
       ctx.state = readJsonSafe(ctx.paths.statePath);
@@ -760,7 +770,7 @@ async function cmdDispatch(flags) {
             sessionId: startedSessionId || result.session_id || resumeSessionId, runId, dispatch, executor,
             summary: result.infra_error ? `Adapter ${instanceId} hit ${result.infra_error}` : `Adapter ${instanceId} exited with code ${result.exit_code}`
           });
-          if (adapter.kind === 'codex') recordOutOfScopeReport(ctx, packId, runId, result.final_md, warnings);
+          recordOutOfScopeReport(ctx, packId, runId, result.final_md, warnings);
         } else if (readOnly && result.status === 'completed' && !result.infra_error && result.final_md) {
           transition = recordReviewReport(ctx, {
             packId, reportPath: result.final_md, reviewer: instanceId, reviewerModel: instanceCfg.model || null,

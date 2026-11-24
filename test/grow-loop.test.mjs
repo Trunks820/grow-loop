@@ -1010,6 +1010,176 @@ test('running Codex dispatch keeps its task and route while final markdown produ
   }
 });
 
+test('custom-cmd dispatch renders the model, captures full-log session IDs, and resumes with them', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['src/a.mjs'] }], {
+    redaction: { extra_patterns: ['fixture-private-marker'] }
+  });
+  const cli = (...args) => runCli(args, repoDir);
+  const mock = path.join(repoDir, 'mock-custom.cjs');
+  const stdoutSession = 'from-stdout$&';
+  const reply = '# Reply\nfixture-private-marker\n\n## 超范围没改\n- src/shared.mjs：补共享校验\n';
+  const padding = 'x'.repeat(17 * 1024);
+  const fallback = `stdout begins here\nfixture-private-marker\n${padding}\n`;
+  try {
+    fs.writeFileSync(mock, `
+      const assert = require('node:assert/strict');
+      const fs = require('node:fs');
+      const [model, finalFile, ...args] = process.argv.slice(2);
+      fs.readFileSync(0, 'utf8');
+      assert.equal(model, 'fixture-model');
+      if (args.length === 0) {
+        console.log(${JSON.stringify(`Session ID: ${stdoutSession}\nSession ID: later-stdout\n${padding}`)});
+        console.error('Session ID: ignored-stderr');
+        fs.writeFileSync(finalFile, ${JSON.stringify(reply)});
+      } else {
+        assert.deepEqual(args, ['--resume', ${JSON.stringify(stdoutSession)}, '--resume-model=fixture-model']);
+        process.stdout.write(${JSON.stringify(fallback)});
+        console.error('Session ID: from-stderr\\n' + ${JSON.stringify(padding)});
+      }
+    `);
+    ctx.config.executors['tier1-cli'] = {
+      kind: 'custom-cmd', executable: process.execPath, model: 'fixture-model',
+      args: [mock, '{{model}}', '{{run_dir}}/reply.md'],
+      read_only_args: ['--review-model={{model}}'],
+      resume_args: ['--resume', '{{session_id}}', '--resume-model={{model}}'],
+      session_id_pattern: 'Session ID: ([a-z$&-]+)',
+      final_file: '{{run_dir}}/reply.md'
+    };
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    cli('next');
+
+    const review = cli('dispatch', '--dry-run', '--stage', 'review', '--instance', 'tier1-cli', '--resume', 'review-session');
+    assert.deepEqual(review.dry_run.args.slice(3), ['--review-model=fixture-model', '--resume', 'review-session', '--resume-model=fixture-model']);
+    const preview = cli('dispatch', '--dry-run');
+    assert.equal(preview.dry_run.args[1], 'fixture-model');
+    assert.ok(preview.dry_run.args[2].endsWith('/reply.md'));
+
+    const first = cli('dispatch');
+    assert.equal(first.run_id, preview.run_id);
+    assert.equal(first.transition.outcome, 'ready_for_verify');
+    assert.equal(first.result.session_id, stdoutSession);
+    assert.equal(first.result.final_md, path.join(first.run_dir, 'final.md'));
+    assert.equal(fs.readFileSync(first.result.final_md, 'utf8'), reply.replace('fixture-private-marker', '[REDACTED:INTERNAL]'));
+    assert.deepEqual(cli('status').open_todos.map(({ run_id, content, status }) => [run_id, content, status]), [
+      [first.run_id, 'src/shared.mjs：补共享校验', 'open']
+    ]);
+
+    const resumed = cli('dispatch', '--resume');
+    assert.equal(resumed.transition.outcome, 'ready_for_verify');
+    assert.equal(resumed.result.session_id, 'from-stderr');
+    assert.equal(resumed.result.final_md, path.join(resumed.run_dir, 'final.md'));
+    assert.equal(fs.readFileSync(resumed.result.final_md, 'utf8'), fallback.replace('fixture-private-marker', '[REDACTED:INTERNAL]'));
+    assert.equal(readJsonSafe(ctx.paths.statePath).packs.A.last_session_id, 'from-stderr');
+    const events = readEvents(ctx.paths.eventsPath);
+    assert.deepEqual(events.filter(({ type }) => type === 'implement_completed')
+      .map(({ executor_model, session_id }) => [executor_model, session_id]), [
+      ['fixture-model', stdoutSession], ['fixture-model', 'from-stderr']
+    ]);
+    assert.ok(events.some(({ type, run_id, resumed_session }) =>
+      type === 'dispatch_started' && run_id === resumed.run_id && resumed_session === stdoutSession));
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('custom-cmd dispatch warns about model and session configuration and rejects invalid patterns', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['src/a.mjs'] }]);
+  const cli = (...args) => runCli(args, repoDir);
+  const mock = path.join(repoDir, 'mock-custom.cjs');
+  const cfg = {
+    kind: 'custom-cmd', executable: process.execPath, args: [mock, '{{model}}'],
+    resume_args: ['--resume={{session_id}}']
+  };
+  try {
+    fs.writeFileSync(mock, `
+      require('node:assert/strict').deepEqual(process.argv.slice(2), ['']);
+      require('node:fs').readFileSync(0, 'utf8');
+      console.log('Legacy stdout');
+    `);
+    ctx.config.executors['tier1-cli'] = cfg;
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    cli('next');
+    const preview = cli('dispatch', '--dry-run');
+    assert.equal(preview.dry_run.args[1], '');
+    const legacy = cli('dispatch');
+    for (const { warnings } of [preview, legacy]) {
+      assert.ok(warnings.some((warning) => warning.includes('执行记录里的模型会是空的')));
+      assert.ok(warnings.some((warning) => warning.includes('拿不到会话号，--resume 会开新会话')));
+    }
+    assert.equal(legacy.result.status, 'completed');
+    assert.equal(legacy.result.session_id, null);
+    assert.equal(fs.readFileSync(legacy.result.final_md, 'utf8'), 'Legacy stdout\n');
+
+    cfg.session_id_pattern = 'Session ID: ([a-z-]+)';
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    const missing = cli('dispatch');
+    assert.equal(missing.result.session_id, null);
+    assert.ok(missing.warnings.some((warning) => warning.includes('本次未匹配到会话号')));
+    assert.ok(missing.warnings.every((warning) => !warning.includes('未配置 session_id_pattern')));
+
+    for (const [pattern, flags, expected] of [
+      ['(', [], /session_id_pattern.*valid regular expression/],
+      ['Session ID: [a-z-]+', ['--dry-run'], /session_id_pattern.*capture group/]
+    ]) {
+      cfg.session_id_pattern = pattern;
+      writeJsonAtomic(ctx.paths.configPath, ctx.config);
+      const failure = runCliFailure(['dispatch', ...flags], repoDir);
+      assert.equal(failure.status, 1);
+      assert.match(failure.stderr, expected);
+      assert.equal(readJsonSafe(ctx.paths.statePath).packs.A.inflight_run, null);
+    }
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('Claude dispatch saves the last string result as redacted Markdown and records open todos', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['src/a.mjs'] }], {
+    redaction: { extra_patterns: ['fixture-private-marker'] }
+  });
+  const cli = (...args) => runCli(args, repoDir);
+  const mock = path.join(repoDir, 'mock-claude.cjs');
+  const reply = '# Last reply\nfixture-private-marker\n\n## 超范围没改\n- src/other.mjs：补测试\n';
+  try {
+    fs.writeFileSync(mock, `
+      require('node:fs').readFileSync(0, 'utf8');
+      const emit = (event) => console.log(JSON.stringify(event));
+      emit({ type: 'system', session_id: 'claude-session' });
+      if (!process.argv.includes('--mock-no-final')) {
+        emit({ type: 'result', result: 'First reply' });
+        console.log('Not JSON');
+        console.log('{malformed');
+        emit({ type: 'result', result: ${JSON.stringify(reply)}, usage: { output_tokens: 42 } });
+      }
+      emit({ type: 'assistant', result: 'Ignore this string' });
+      emit({ type: 'result', result: { text: 'Ignore this object' } });
+    `);
+    const cfg = { kind: 'claude', executable: process.execPath, prefix_args: [mock], model: 'fixture-sonnet' };
+    ctx.config.executors['tier1-cli'] = cfg;
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    cli('next');
+    const run = cli('dispatch');
+    assert.equal(run.transition.outcome, 'ready_for_verify');
+    assert.equal(run.result.session_id, 'claude-session');
+    assert.deepEqual(run.result.usage, { output_tokens: 42 });
+    assert.equal(run.result.final_md, path.join(run.run_dir, 'final.md'));
+    assert.equal(fs.readFileSync(run.result.final_md, 'utf8'), reply.replace('fixture-private-marker', '[REDACTED:INTERNAL]'));
+    const todos = cli('status').open_todos;
+    assert.deepEqual(todos.map(({ run_id, content, status }) => [run_id, content, status]), [
+      [run.run_id, 'src/other.mjs：补测试', 'open']
+    ]);
+
+    cfg.prefix_args = [mock, '--mock-no-final'];
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    const noFinal = cli('dispatch');
+    assert.equal(noFinal.result.final_md, null);
+    assert.equal(fs.existsSync(path.join(noFinal.run_dir, 'final.md')), false);
+    assert.deepEqual(cli('status').open_todos, todos);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('blast-radius gate auto-routes >=25 files / cross_module to tier2 and pauses >=50 files + chained preflight gates', () => {
   const { repoDir, ctx } = setupCtx([
     {

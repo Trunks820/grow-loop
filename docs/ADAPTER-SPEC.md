@@ -34,14 +34,23 @@ In `.loop/config.json`, `executors` maps **instance IDs** rather than vendor nam
     "custom-local": {
       "kind": "custom-cmd",
       "executable": "my-agent-cli",
+      "model": "my-agent-model",
       "probe_args": ["--version"],
-      "args": ["run", "--repo", "{{repo}}", "--prompt-file", "{{task_file}}"],
+      "args": ["run", "--repo", "{{repo}}", "--prompt-file", "{{task_file}}", "--model", "{{model}}", "--output", "{{run_dir}}/reply.md"],
       "read_only_args": ["--read-only"],
-      "resume_args": ["--resume", "{{session_id}}"]
+      "resume_args": ["--resume", "{{session_id}}"],
+      "session_id_pattern": "Session ID: ([a-zA-Z0-9_-]+)",
+      "final_file": "{{run_dir}}/reply.md"
     }
   }
 }
 ```
+
+For `custom-cmd`, `{{model}}` expands to the configured `model` in `args`, `read_only_args`, and `resume_args`. If `model` is omitted, it expands to an empty string. The same `model` value identifies the executor model in the implementation record.
+
+`session_id_pattern` is an optional JavaScript regular expression string with exactly one capture group. The adapter takes the first capture from the complete stdout log and falls back to the complete stderr log if stdout yields no session ID. `dispatch --resume` can substitute the saved ID into `{{session_id}}`.
+
+`final_file` is an optional path to the CLI's last reply. It supports `{{run_dir}}`, and relative paths resolve from the repository root. The adapter writes a redacted copy to `final.md` in the run directory. If the configured file is missing or omitted, it uses the complete stdout log.
 
 ---
 
@@ -197,10 +206,10 @@ Any normalized `infra_error` guarantees the pack's `tier1_repairs` and `tier2_re
 
 ## 5. Built-In Adapters
 
-| `kind` | Target CLI | Read-Only Review Mode | Session Resume |
-|---|---|---|---|
-| `self` | Current host harness (Codex / Antigravity / Claude / Cursor) | Coordinated by host | Host session |
-| `codex` | OpenAI Codex CLI (`codex exec`) | `--sandbox read-only` | `resume <id>` |
-| `claude` | Claude Code CLI (`claude -p`) | `--permission-mode plan` | `--resume <id>` |
-| `dsh` | DeepSeek Harness (`dsh` or custom wrapper) | Prompt + wrapper enforced | `--resume <id>` |
-| `custom-cmd` | Any custom CLI via `args` / `read_only_args` / `resume_args` | `read_only_args` | `{{session_id}}` |
+| `kind` | Target CLI | Read-Only Review Mode | Session Resume | Final Markdown |
+|---|---|---|---|---|
+| `self` | Current host harness (Codex / Antigravity / Claude / Cursor) | Coordinated by host | Host session | Submitted by the host |
+| `codex` | OpenAI Codex CLI (`codex exec`) | `--sandbox read-only` | `resume <id>` | `final_md` from `--output-last-message` |
+| `claude` | Claude Code CLI (`claude -p`) | `--permission-mode plan` | `--resume <id>` | `final_md` from the last `result` event with a string reply |
+| `dsh` | DeepSeek Harness (`dsh` or custom wrapper) | Prompt + wrapper enforced | `--resume <id>` | — |
+| `custom-cmd` | Any custom CLI via `args` / `read_only_args` / `resume_args`, with `{{model}}` substitution | `read_only_args` | `{{session_id}}` from `session_id_pattern` | `final_md` from `final_file` or stdout |

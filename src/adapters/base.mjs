@@ -326,6 +326,12 @@ export function writeDryRunReceipt(runDir, payload, redactor) {
   return safe;
 }
 
+export function writeFinalMarkdown(runDir, markdown, redactor) {
+  const finalMd = path.join(runDir, 'final.md');
+  fs.writeFileSync(finalMd, (redactor || buildRedactor()).redactString(markdown), 'utf8');
+  return finalMd;
+}
+
 export function writeRunResult(runDir, payload, redactor) {
   ensureDir(runDir);
   const safe = (redactor || buildRedactor()).redactValue({

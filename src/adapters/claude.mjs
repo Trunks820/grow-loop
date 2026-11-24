@@ -4,6 +4,7 @@ import {
   runAdapterProcess,
   runBoundedCommand,
   writeDryRunReceipt,
+  writeFinalMarkdown,
   writeRunResult
 } from './base.mjs';
 
@@ -13,21 +14,23 @@ function resolveClaudeCommand(cfg) {
 }
 
 function parseClaudeJson(stdoutPath) {
-  if (!fs.existsSync(stdoutPath)) return { sessionId: null, usage: null };
+  if (!fs.existsSync(stdoutPath)) return { sessionId: null, usage: null, finalText: null };
   const raw = fs.readFileSync(stdoutPath, 'utf8').trim();
   let sessionId = null;
   let usage = null;
+  let finalText = null;
   for (const line of raw.split(/\r?\n/)) {
     if (!line.trim().startsWith('{')) continue;
     try {
       const obj = JSON.parse(line);
       if (obj.session_id) sessionId = obj.session_id;
       if (obj.usage) usage = obj.usage;
+      if (obj.type === 'result' && typeof obj.result === 'string') finalText = obj.result;
     } catch {
       // ignore non-JSON
     }
   }
-  return { sessionId, usage };
+  return { sessionId, usage, finalText };
 }
 
 /**
@@ -120,6 +123,7 @@ export const claudeAdapter = {
 
     const parsed = parseClaudeJson(proc.stdoutPath);
     const infraError = classifyInfraError(proc.exitCode, proc.stdoutTail, proc.stderrTail, proc.timedOut);
+    const finalMd = parsed.finalText === null ? null : writeFinalMarkdown(runDir, parsed.finalText, redactor);
 
     return writeRunResult(
       runDir,
@@ -133,6 +137,7 @@ export const claudeAdapter = {
         elapsed_seconds: proc.elapsedSeconds,
         session_id: parsed.sessionId,
         usage: parsed.usage,
+        final_md: finalMd,
         infra_error: infraError
       },
       redactor
