@@ -40,7 +40,7 @@ import {
 } from '../src/router.mjs';
 import { getAdapter } from '../src/adapters/index.mjs';
 import { probeAllInstances } from '../src/probe.mjs';
-import { buildTaskPrompt, parseImplementBlockedReason, parseOutOfScopeItems, taskBriefWarnings } from '../src/task-builder.mjs';
+import { buildTaskPrompt, isScopeDirectory, parseImplementBlockedReason, parseOutOfScopeItems, taskBriefWarnings } from '../src/task-builder.mjs';
 import { addLesson, loadLessons, updateLesson } from '../src/lessons.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
 import { buildRedactor } from '../src/redact.mjs';
@@ -437,6 +437,11 @@ function cmdPackScope(ctx, flags, reason) {
   const packDef = requireUncommittedPack(ctx, flags.id, 'id');
   const files = (flags.add || []).flatMap((value) => requireText(value, 'add').split(',').map((file) => file.trim()));
   if (!files.length || files.some((file) => !file)) throw new Error('Specify --add with one or more non-empty file paths.');
+  const directory = files.find((file) => isScopeDirectory(file, ctx.state.repo_dir));
+  if (directory) {
+    const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
+    throw new Error(redactor.redactString(`范围里的「${directory}」是目录，请列出具体文件。`));
+  }
   const todo = flags.todo === undefined ? null : requireOpenTodo(ctx, flags.todo);
   const scopeFiles = [...new Set([...(packDef.scope_files || []), ...files])];
   const priorEstimate = Number(packDef.estimated_files);
@@ -674,7 +679,7 @@ async function cmdDispatch(flags) {
   if (!flags['dry-run'] && inflight?.kind === 'self' && !inflight.route_changed) {
     throw new Error('This pack has a self run awaiting grow-loop record ' + inflight.stage + '.');
   }
-  const warnings = taskBriefWarnings(packDef, ctx.config);
+  const warnings = taskBriefWarnings(packDef, ctx.config, ctx.state.repo_dir);
   if (adapter.kind === 'custom-cmd') {
     if (!instanceCfg.model) warnings.push('custom-cmd 未配置 model，执行记录里的模型会是空的。');
     if (!instanceCfg.session_id_pattern && Array.isArray(instanceCfg.resume_args) &&

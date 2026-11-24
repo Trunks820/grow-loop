@@ -13,11 +13,51 @@ const briefFields = {
   preserve_behaviors: '要保住的旧行为'
 };
 
+const globChars = /[*?\[\]{}]/;
+const emptyReport = /^(?:无|没有|暂无)[。.!！]?$/;
+
 function textItems(value) {
   return Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item.trim()) : [];
 }
 
-export function taskBriefWarnings(packDef, config) {
+function repoRelativePath(file, repoDir) {
+  const slashes = file.replace(/\\/g, '/');
+  const relative = repoDir && path.isAbsolute(slashes) ? path.relative(repoDir, slashes) : slashes;
+  const normalized = path.posix.normalize(relative.replace(/\\/g, '/'));
+  return normalized === '..' || normalized.startsWith('../') || path.win32.isAbsolute(normalized) ? null : normalized;
+}
+
+export function isScopeDirectory(file, repoDir) {
+  if (/[\\/]$/.test(file)) return true;
+  if (!repoDir) return false;
+  const relative = repoRelativePath(file, repoDir);
+  if (!relative) return false;
+  try {
+    return fs.statSync(path.join(repoDir, relative), { throwIfNoEntry: false })?.isDirectory() ?? false;
+  } catch {
+    return false;
+  }
+}
+
+function verificationTestFiles(packDef, repoDir) {
+  const files = new Set();
+  for (const { command } of getVerificationPlan(undefined, packDef)) {
+    // Keep quoted arguments together, including quotes after an option's '='.
+    const args = command.match(/(?:[^\s"';&|<>()]+|"[^"]*"|'[^']*')+/g) ?? [];
+    for (const arg of args) {
+      const file = arg.replace(/"([^"]*)"|'([^']*)'/g, '$1$2').replace(/^--[\w-]+=/, '').split('::', 1)[0];
+      if (!file || file.startsWith('-') || file.includes('://') || globChars.test(file)) continue;
+      const relative = repoRelativePath(file, repoDir);
+      if (!relative) continue;
+      const isTest = /(?:^|\/)(?:test|tests|__tests__)\/.+/.test(relative) ||
+        /^(?:test_.+)|(?:_test|\.test|\.spec)\..+$/.test(path.posix.basename(relative));
+      if (isTest && !isScopeDirectory(relative, repoDir)) files.add(relative);
+    }
+  }
+  return files;
+}
+
+export function taskBriefWarnings(packDef, config, repoDir) {
   const warnings = [];
   for (const [field, heading] of Object.entries(briefFields)) {
     if (!textItems(packDef[field]).length) warnings.push(`「${heading}」未填写。`);
@@ -27,11 +67,23 @@ export function taskBriefWarnings(packDef, config) {
       warnings.push(`第 ${index + 1} 条避坑提示未点名代码：${hint}`);
     }
   }
+  const scope = new Set([...textItems(packDef.scope_files), ...textItems(packDef.co_change_files)].map((file) => file.trim()));
+  for (const file of scope) {
+    if (isScopeDirectory(file, repoDir)) warnings.push(`范围里的「${file}」是目录，请列出具体文件。`);
+  }
+  if (![...scope].some((file) => globChars.test(file))) {
+    const scopedPaths = new Set([...scope].map((file) => repoRelativePath(file, repoDir)));
+    for (const file of verificationTestFiles(packDef, repoDir)) {
+      if (!scopedPaths.has(file)) {
+        warnings.push(`验证命令点名的「${file}」不在本包范围，执行者改不了它；要改请用 pack scope 扩范围。`);
+      }
+    }
+  }
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
   return warnings.map(redactor.redactString);
 }
 
-function reportSection(markdown, title) {
+function reportSection(markdown, matchesHeading) {
   let fence = null;
   let inSection = false;
   let section = null;
@@ -52,7 +104,8 @@ function reportSection(markdown, title) {
     const atxHeading = /^ {0,3}#{1,6}(?:[ \t]|$)/.test(line);
     const setextHeading = !item && /^ {0,3}\S/.test(line) && /^ {0,3}(?:=+|-+)[ \t]*$/.test(lines[index + 1] || '');
     if (atxHeading || setextHeading) {
-      inSection = line.includes(title);
+      const heading = line.trim().replace(/^#{1,6}[ \t]+|[ \t]+#+$/g, '');
+      inSection = matchesHeading(heading);
       if (inSection) section ??= [];
       if (!atxHeading) index++;
       continue;
@@ -63,19 +116,21 @@ function reportSection(markdown, title) {
 }
 
 export function parseOutOfScopeItems(markdown, { includeSection = false } = {}) {
-  const section = reportSection(markdown, '超范围没改');
+  const section = reportSection(markdown, (heading) => heading.includes('超范围没改'));
   const items = [];
   for (const { item } of section ?? []) {
     const text = item?.replace(/^\[[ xX]\]\s*/, '').trim().replace(/^(\*{1,2}|_{1,2})(.+)\1$/, '$2').trim();
-    if (text && !/^(?:无|没有|暂无)[。.!！]?$/.test(text)) items.push(item);
+    if (text && !emptyReport.test(text)) items.push(item);
   }
   return includeSection ? { items, hasSection: section !== null } : items;
 }
 
 export function parseImplementBlockedReason(markdown) {
-  const section = reportSection(markdown, '没做完');
+  const section = reportSection(markdown, (heading) => heading.includes('没做完') &&
+    !emptyReport.test(heading.match(/没做完\s*[:：]\s*(.*)$/)?.[1] ?? ''));
   if (!section) return null;
-  return section.map(({ line }) => line).join('\n').trim() || '执行者没写原因';
+  const reason = section.map(({ line }) => line).join('\n').trim();
+  return emptyReport.test(reason) ? null : reason || '执行者没写原因';
 }
 
 function addBriefField(lines, packDef, field, guidance) {

@@ -30,7 +30,7 @@ import {
 } from '../src/router.mjs';
 import { ALLOWED_GATE_REASONS, checkApprovalEnvelope } from '../src/gate.mjs';
 import { addLesson } from '../src/lessons.mjs';
-import { buildTaskPrompt } from '../src/task-builder.mjs';
+import { buildTaskPrompt, parseImplementBlockedReason, taskBriefWarnings } from '../src/task-builder.mjs';
 import { buildRedactor } from '../src/redact.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
 import { classifyInfraError } from '../src/adapters/base.mjs';
@@ -900,6 +900,36 @@ test('out-of-scope todos can be added, expanded, forwarded and dismissed with an
   }
 });
 
+test('pack scope rejects directories before changing scope, state or a todo', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['src/a.mjs'] }]);
+  try {
+    fs.mkdirSync(path.join(repoDir, 'fixtures', 'nested'), { recursive: true });
+    const { todo } = runCli(['todo', 'add', '--pack', 'A', '--text', '补测试', '--reason', '待确认范围'], repoDir);
+    const { manifestPath, manifestSnapshotPath, statePath, eventsPath } = ctx.paths;
+    const tracked = [manifestPath, manifestSnapshotPath, statePath, eventsPath];
+    const snapshot = () => tracked.map((file) => fs.readFileSync(file, 'utf8'));
+    const before = snapshot();
+
+    for (const [directory, additions] of [
+      ['tests/', ['--add', 'tests/']],
+      ['missing\\', ['--add=missing\\']],
+      ['fixtures\\nested', ['--add', 'fixtures\\nested']],
+      ['fixtures', ['--add', 'src/good.mjs,fixtures']],
+      ['fixtures', ['--add', 'src/good.mjs', '--add', 'fixtures']]
+    ]) {
+      const failure = runCliFailure([
+        'pack', 'scope', '--id', 'A', ...additions, '--todo', todo.id, '--reason', '补具体文件'
+      ], repoDir);
+      assert.equal(failure.status, 1);
+      assert.ok(failure.stderr.includes(`「${directory}」是目录，请列出具体文件。`), failure.stderr);
+      assert.deepEqual(snapshot(), before);
+    }
+    assert.deepEqual(runCli(['todo', 'list'], repoDir).todos.map(({ id, status }) => [id, status]), [[todo.id, 'open']]);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('running Codex dispatch keeps its task and route while final markdown produces open todos', async () => {
   const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['src/a.mjs'] }]);
   const cli = (...args) => runCli(args, repoDir);
@@ -1001,7 +1031,7 @@ test('running Codex dispatch keeps its task and route while final markdown produ
     assert.equal(cli('status').packs[0].repairs, '2/2');
 
     cli('resume', '--action', 'retry');
-    fs.writeFileSync(finalPath, '### 超范围没改（0 项）\n- 无\n- 没有\n- 暂无。', 'utf8');
+    fs.writeFileSync(finalPath, '## 没做完：无\n### 超范围没改（0 项）\n- 无\n- 没有\n- 暂无。', 'utf8');
     const emptyReport = cli('dispatch');
     assert.equal(emptyReport.transition.outcome, 'ready_for_verify');
     assert.ok(emptyReport.warnings.some((warning) => warning.includes('未解析出待办')));
@@ -1009,6 +1039,17 @@ test('running Codex dispatch keeps its task and route while final markdown produ
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
+});
+
+test('unfinished report ignores explicit empty replies and keeps empty or substantive sections blocking', () => {
+  for (const word of ['无', '没有。', '暂无！']) {
+    assert.equal(parseImplementBlockedReason(`## 没做完\n\n${word}\n`), null);
+    assert.equal(parseImplementBlockedReason(`## 没做完：${word} ##\n`), null);
+  }
+  assert.equal(parseImplementBlockedReason('没做完: 无\n===\n'), null);
+  assert.equal(parseImplementBlockedReason('## 没做完\n\n## 进度\n已检查'), '执行者没写原因');
+  assert.equal(parseImplementBlockedReason('## 没做完\n暂无可用的数据文件。'), '暂无可用的数据文件。');
+  assert.equal(parseImplementBlockedReason('## 没做完：无\n## 没做完\n还差测试'), '还差测试');
 });
 
 test('a Codex reply reporting unfinished implementation pauses with options and preserves scope todos', () => {
@@ -2212,6 +2253,60 @@ test('dispatch previews warn about incomplete briefs, scan references and create
     assert.deepEqual(live.warnings, second.warnings);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('dispatch warns about scope directories and unscoped tests named by package checks', () => {
+  const pack = {
+    id: 'A',
+    scope_files: ['src/core.mjs', 'tests/', './checks\\allowed.test.mjs'],
+    co_change_files: ['fixtures\\existing', 'later\\', 'test/test_allowed.py'],
+    pitfalls: ['跟现有规则一致'],
+    verify_commands: [
+      'pytest test_core.py "tests/cases.py::test_create" --target="tests/test with spaces.py"::test_one',
+      "node --test lib/fixture-private-marker.test.mjs lib/sample.spec.ts 'test/sample_test.go' __tests__/smoke",
+      'node --test checks/allowed.test.mjs src/helper.mjs',
+      'pytest .\\test\\test_allowed.py tests/cases.py::test_delete tests/generated ../tests/outside.py',
+      '# pytest tests/comment.py'
+    ]
+  };
+  const { repoDir, ctx } = setupCtx([pack, {
+    ...pack, id: 'GLOB', scope_files: ['src/core.mjs'], co_change_files: ['tests/**', 'later\\']
+  }], {
+    verification: { commands: ['pytest tests/global.py'] },
+    redaction: { extra_patterns: ['fixture-private-marker'] }
+  });
+  const cli = (...args) => runCli(args, repoDir);
+  try {
+    fs.mkdirSync(path.join(repoDir, 'fixtures', 'existing'), { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'tests', 'generated'), { recursive: true });
+    pack.verify_commands.push(`pytest ${shellQuote(path.join(repoDir, 'test', 'test_allowed.py').replaceAll('\\', '/'))}`);
+    pack.verify_commands.push(`pytest ${shellQuote(path.join(repoDir, 'tests', 'absolute.py').replaceAll('\\', '/'))}`);
+    writeJsonAtomic(ctx.paths.manifestPath, { ...ctx.manifest, packs: [pack, ctx.manifest.packs[1]] });
+    cli('manifest-ack', '--reason', '确认验证命令');
+    assert.equal(cli('next').action, 'IMPLEMENT');
+
+    const oldWarnings = ['「要保住的旧行为」未填写。', '第 1 条避坑提示未点名代码：跟现有规则一致'];
+    const directoryWarning = (file) => `范围里的「${file}」是目录，请列出具体文件。`;
+    const testWarning = (file) => `验证命令点名的「${file}」不在本包范围，执行者改不了它；要改请用 pack scope 扩范围。`;
+    const preview = cli('dispatch', '--dry-run');
+    assert.deepEqual(preview.warnings, [
+      ...oldWarnings,
+      ...['tests/', 'fixtures\\existing', 'later\\'].map(directoryWarning),
+      ...[
+        'test_core.py', 'tests/cases.py', 'tests/test with spaces.py', 'lib/[REDACTED:INTERNAL].test.mjs',
+        'lib/sample.spec.ts', 'test/sample_test.go', '__tests__/smoke', 'tests/absolute.py'
+      ].map(testWarning)
+    ]);
+    assert.deepEqual(cli('dispatch', '--dry-run', '--pack', 'GLOB').warnings, [...oldWarnings, directoryWarning('later\\')]);
+    assert.deepEqual(taskBriefWarnings({ co_change_files: ['fixtures\\existing', 'later\\'] }, {}), [
+      '「避坑提示」未填写。', '「要保住的旧行为」未填写。', directoryWarning('later\\')
+    ]);
+    const live = cli('dispatch');
+    assert.equal(live.result.status, 'host_action_required');
+    assert.deepEqual(live.warnings, preview.warnings);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
 
