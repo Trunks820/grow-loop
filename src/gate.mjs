@@ -13,6 +13,7 @@ export const ALLOWED_GATE_REASONS = Object.freeze({
   BUDGET_EXCEEDED: 'BUDGET_EXCEEDED',   // Tier 1 (2) + Tier 2 (2) repairs exhausted
   REVIEW_CAP_REACHED: 'REVIEW_CAP_REACHED', // 2 closing review rounds failed with BLOCKER/HIGH
   INFRA_BLOCKED: 'INFRA_BLOCKED',       // Quota exhausted (429), auth expired, missing CLI
+  EXECUTOR_BLOCKED: 'EXECUTOR_BLOCKED', // Executor reported that the package goal is unfinished
   RELEASE: 'RELEASE'                    // Push, merge to main branch, deploy
 });
 

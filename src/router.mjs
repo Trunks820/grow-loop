@@ -475,6 +475,11 @@ function getWritablePack(ctx, packId) {
   if (!pack) throw new Error('No active pack found');
   if (pack.status === 'COMMITTED') throw new Error(`Pack ${pack.id} is already committed.`);
   if (state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED) {
+    const error = new Error('Answer the EXECUTOR_BLOCKED question before advancing this package.');
+    error.question = buildQuestion(ctx, pack);
+    throw error;
+  }
   requireHandoffPreflight(pack, getPackDef(manifest, pack.id), ctx);
   return pack;
 }
@@ -522,12 +527,14 @@ export function recordImplementOutcome(ctx, payload) {
     ? pack.inflight_run : null;
   const runInstance = payload.dispatch?.instance ?? selfRun?.instance ?? pack.active_instance;
   const canResume = runInstance === pack.active_instance && !payload.dispatch?.routeChanged && !selfRun?.route_changed;
-  const { executor, selfRunId } = completeSelfRun(ctx, pack, 'implement', payload,
-    payload.infraError ? 'infra_error' : (payload.passed ? 'completed' : 'failed'), runInstance);
+  const runStatus = payload.infraError ? 'infra_error'
+    : payload.blockedReason ? 'blocked' : (payload.passed ? 'completed' : 'failed');
+  const { executor, selfRunId } = completeSelfRun(ctx, pack, 'implement', payload, runStatus, runInstance);
   if (pack.last_verify) delete pack.last_verify.repair_undo;
 
   if (payload.sessionId && canResume) rememberSession(pack, payload.sessionId, 'implement', runInstance);
-  if (payload.runId || selfRunId) pack.last_run_id = payload.runId || selfRunId;
+  const runId = payload.runId || selfRunId || null;
+  if (runId) pack.last_run_id = runId;
 
   // Infrastructure failure immunity: NEVER consumes tier1/tier2 repair budgets
   if (payload.infraError) {
@@ -570,6 +577,25 @@ export function recordImplementOutcome(ctx, payload) {
     );
     saveState(stateDir, state);
     return { outcome: 'paused_infra_blocked', gate: pack.gate, question: buildQuestion(ctx, pack) };
+  }
+
+  if (payload.blockedReason) {
+    const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+    const reason = redactor.redactString(payload.blockedReason);
+    const characters = [...reason];
+    const summary = characters.length > 800
+      ? `${characters.slice(0, 800).join('').trimEnd()}…（原因已截断）`
+      : reason;
+    pack.status = 'PAUSED_FOR_HUMAN';
+    pack.gate = createGate(ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED, summary, {
+      allowed_resume_actions: ['retry', 'approve', 'switch_instance', 'abort']
+    });
+    appendEvent(stateDir, config, {
+      type: 'implement_blocked', pack_id: pack.id, run_id: runId,
+      tier: runTier, instance: runInstance, ...executor, summary
+    });
+    saveState(stateDir, state);
+    return { outcome: 'paused_executor_blocked', gate: pack.gate, question: buildQuestion(ctx, pack) };
   }
 
   if (payload.passed) {
@@ -964,6 +990,14 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   const at = new Date().toISOString();
   const questions = prevGate?.questions?.length ? { questions: redactor.redactValue(prevGate.questions) } : {};
   let approvedPosition = null;
+  if (gateReason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED) {
+    if (!prevGate.allowed_resume_actions.includes(act)) {
+      throw new Error('Use --action retry, approve, switch_instance or abort for an EXECUTOR_BLOCKED gate.');
+    }
+    if (act === 'switch_instance' && (instance === pack.active_instance || !Object.hasOwn(config?.executors ?? {}, instance))) {
+      throw new Error('Choose a different configured executor with --instance.');
+    }
+  }
   if (gateReason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
     if (!prevGate.allowed_resume_actions.includes(act)) {
       throw new Error('Use --action approve or abort for an EXTERNAL_COMMIT gate.');
@@ -1053,6 +1087,12 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
     pack.active_instance = resolveTierInstance(config, 'tier2');
   }
   pack.gate = null;
+
+  if (gateReason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED) {
+    pack.status = 'VERIFY';
+    saveState(stateDir, state);
+    return { outcome: 'approved', pack_id: pack.id, status: pack.status };
+  }
 
   if (approvedPosition) {
     pack.base_commit = approvedPosition.head;

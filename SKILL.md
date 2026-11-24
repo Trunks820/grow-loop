@@ -82,6 +82,8 @@ Run `grow-loop next` at each transition. Follow the returned action and package.
 
 At `PAUSE_FOR_HUMAN` or a pending manifest change, use `grow-loop status --format shell` to read the current `question`. Present the options and wait for the human's decision. Submit the chosen option with `grow-loop answer --question <id> --option <id> --text "<verbatim answer>"`, including text when requested. If the question has no options, follow its instructions to complete the manifest or resolve the dependency, then run `grow-loop next`. The existing `grow-loop resume --action <action> --decision "<verbatim decision>"` also accepts gate decisions. [Question and answer contract](docs/SHELL-API.md#中文问题)
 
+At `EXECUTOR_BLOCKED`, present the executor's reason and wait for the human to choose whether to retry after resolving the blocker, verify the existing changes, switch executors, or abort.
+
 ```sh
 grow-loop dispatch --stage implement --dry-run
 grow-loop dispatch --stage implement
@@ -89,7 +91,7 @@ grow-loop dispatch --stage implement
 
 Inspect the dry-run task for scope, warnings, confirmed lessons, and the test policy. Live dispatch for the same stage and instance reuses the dry-run directory and refreshes a stale generated task in place. External dispatch records the outcome. If interrupted, check `grow-loop status` and run `grow-loop dispatch --stage implement --resume` for the same stage and instance. For a resumed review, use the review stage. [Run records and session selection](docs/ADAPTER-SPEC.md#dispatch-state-and-resume)
 
-For `self`, live dispatch starts the execution record. Perform the work within the task brief and record the result with `grow-loop record implement --passed --summary "<summary>"`, or use `grow-loop record implement --failed --summary "<reason>"` for an implementation failure. For infrastructure failures use `grow-loop record implement --infra-error <code>`.
+For `self`, live dispatch starts the execution record. Perform the work within the task brief and record the result with `grow-loop record implement --passed --summary "<summary>"`, or use `grow-loop record implement --failed --summary "<reason>"` for an implementation failure. If the goal is unfinished and needs a human decision, use `grow-loop record implement --blocked "<reason>"`. For infrastructure failures use `grow-loop record implement --infra-error <code>`.
 
 The CLI applies the configured brakes. By default a package estimated at 25 files or more, marked cross-module, or rated high risk starts at tier 2 unless an explicit tier applies. At 50 files or more, the split gate requires a human decision. Each tier allows two repair rounds. After tier 1 runs out the CLI escalates, and after tier 2 runs out it pauses. Infrastructure failures such as quota, authentication, timeout, and CLI crash preserve repair budgets.
 

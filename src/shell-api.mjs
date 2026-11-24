@@ -45,6 +45,11 @@ const GATE_COPY = {
     title: '执行工具遇到环境问题',
     body: '可以排除环境问题后用当前实例重试，也可以换一个执行实例。'
   },
+  EXECUTOR_BLOCKED: {
+    title: '执行者报告没做完',
+    body: '请根据执行者的说明，决定补齐条件后重试、接受现有改动进入验证、换实例或终止。',
+    approve: ['接受现有改动，进入验证']
+  },
   EXTERNAL_COMMIT: {
     title: '外部提交改到了需要保护的文件',
     body: '请核对以下提交和冲突文件。放行后会以当前 Git HEAD 为基线，从原来的阶段继续。',
@@ -131,6 +136,7 @@ function gateQuestion(ctx, pack) {
     body.push(`一档已修复 ${pack.tier1_repairs ?? 0} 次，二档已修复 ${pack.tier2_repairs ?? 0} 次。`);
   }
   if (gate.reason === 'REVIEW_CAP_REACHED') body.push(`已审查 ${pack.review_rounds ?? 0} 轮。`);
+  if (gate.reason === 'EXECUTOR_BLOCKED') body.push('', gate.summary);
   if (gate.questions?.length) body.push(bullets(gate.questions));
   if (gate.reason === 'EXTERNAL_COMMIT') {
     body.push('外部提交', bullets((gate.external_commits ?? []).map(({ sha, files }) => `${sha}（${files.join('、')}）`)),

@@ -31,14 +31,14 @@ export function taskBriefWarnings(packDef, config) {
   return warnings.map(redactor.redactString);
 }
 
-export function parseOutOfScopeItems(markdown, { includeSection = false } = {}) {
-  const items = [];
+function reportSection(markdown, title) {
   let fence = null;
   let inSection = false;
-  let hasSection = false;
+  let section = null;
   const lines = markdown.replace(/^\uFEFF/, '').split(/\r?\n/);
   const listItem = /^ {0,3}(?:[-+*]|\d{1,9}[.)])[ \t]+(.+)$/;
-  for (const [index, line] of lines.entries()) {
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
     const marker = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
     if (fence) {
       if (marker?.[1][0] === fence[0] && marker[1].length >= fence.length && !marker[2].trim()) fence = null;
@@ -52,16 +52,30 @@ export function parseOutOfScopeItems(markdown, { includeSection = false } = {}) 
     const atxHeading = /^ {0,3}#{1,6}(?:[ \t]|$)/.test(line);
     const setextHeading = !item && /^ {0,3}\S/.test(line) && /^ {0,3}(?:=+|-+)[ \t]*$/.test(lines[index + 1] || '');
     if (atxHeading || setextHeading) {
-      inSection = line.includes('超范围没改');
-      hasSection ||= inSection;
+      inSection = line.includes(title);
+      if (inSection) section ??= [];
+      if (!atxHeading) index++;
       continue;
     }
-    if (inSection) {
-      const text = item?.replace(/^\[[ xX]\]\s*/, '').trim().replace(/^(\*{1,2}|_{1,2})(.+)\1$/, '$2').trim();
-      if (text && !/^(?:无|没有|暂无)[。.!！]?$/.test(text)) items.push(item);
-    }
+    if (inSection) section.push({ line, item });
   }
-  return includeSection ? { items, hasSection } : items;
+  return section;
+}
+
+export function parseOutOfScopeItems(markdown, { includeSection = false } = {}) {
+  const section = reportSection(markdown, '超范围没改');
+  const items = [];
+  for (const { item } of section ?? []) {
+    const text = item?.replace(/^\[[ xX]\]\s*/, '').trim().replace(/^(\*{1,2}|_{1,2})(.+)\1$/, '$2').trim();
+    if (text && !/^(?:无|没有|暂无)[。.!！]?$/.test(text)) items.push(item);
+  }
+  return includeSection ? { items, hasSection: section !== null } : items;
+}
+
+export function parseImplementBlockedReason(markdown) {
+  const section = reportSection(markdown, '没做完');
+  if (!section) return null;
+  return section.map(({ line }) => line).join('\n').trim() || '执行者没写原因';
 }
 
 function addBriefField(lines, packDef, field, guidance) {
@@ -283,8 +297,9 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
       lines.push('');
     }
 
-    lines.push('## 超范围发现的报告方式');
+    lines.push('## 最终回复的报告方式');
     lines.push('发现需要改动但超出授权范围时，不要动这些位置。在最终回复末尾加入标题 `## 超范围没改`，每项单独一行，格式为 `- 位置：说明`。没有这类发现时省略该节。');
+    lines.push('', '因范围限制、信息不足或环境问题等原因无法完成目标时，请在最终回复末尾加入标题 `## 没做完`，如实写明原因和还差什么。完成目标时省略该节。');
   }
 
   const lessons = selectLessonsForPack(stateDir, packDef);

@@ -40,7 +40,7 @@ import {
 } from '../src/router.mjs';
 import { getAdapter } from '../src/adapters/index.mjs';
 import { probeAllInstances } from '../src/probe.mjs';
-import { buildTaskPrompt, parseOutOfScopeItems, taskBriefWarnings } from '../src/task-builder.mjs';
+import { buildTaskPrompt, parseImplementBlockedReason, parseOutOfScopeItems, taskBriefWarnings } from '../src/task-builder.mjs';
 import { addLesson, loadLessons, updateLesson } from '../src/lessons.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
 import { buildRedactor } from '../src/redact.mjs';
@@ -111,7 +111,7 @@ Usage:
   grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume [<session-id>]] [--task-file <path>]
   grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--pack <id>] [--timeout <sec>] [--mark-env "<reason>"]
   grow-loop record    <implement|verify|review|commit|lesson> [flags]
-  grow-loop record implement --passed [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
+  grow-loop record implement (--passed | --blocked "<reason>") [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
   grow-loop record review --report <report.md> [--reviewer <instance>] [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
   grow-loop record lesson --summary "<text>" [--pack <ID>] [--rule "<text>"] [--scope global|tags] [--tags a,b]
   grow-loop resume    --decision "<text>" [--action approve|repair|retry|commit|switch_instance|abort] [--instance <id>]
@@ -762,15 +762,20 @@ async function cmdDispatch(flags) {
           executor_effort: instanceCfg.reasoning_effort ?? null
         };
         dispatch.routeChanged = run.route_changed;
-        if (current.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
-          transition = buildNextDirective(ctx, current, getPackDef(ctx.manifest, packId));
+        const pendingGate = checkPackGit(ctx, current, getPackDef(ctx.manifest, packId), false);
+        if (pendingGate.action === 'PAUSE_FOR_HUMAN') {
+          transition = pendingGate;
         } else if (stage === 'implement' && result.status !== 'interrupted') {
+          const markdown = readFinalReply(result.final_md);
+          const passed = result.status === 'completed';
+          const blockedReason = passed && result.exit_code === 0 && !result.infra_error && markdown !== null
+            ? parseImplementBlockedReason(markdown) : null;
           transition = recordImplementOutcome(ctx, {
-            packId, passed: result.status === 'completed', infraError: result.infra_error || null,
+            packId, passed: passed && !blockedReason, blockedReason, infraError: result.infra_error || null,
             sessionId: startedSessionId || result.session_id || resumeSessionId, runId, dispatch, executor,
             summary: result.infra_error ? `Adapter ${instanceId} hit ${result.infra_error}` : `Adapter ${instanceId} exited with code ${result.exit_code}`
           });
-          recordOutOfScopeReport(ctx, packId, runId, result.final_md, warnings);
+          recordOutOfScopeReport(ctx, packId, runId, markdown, warnings);
         } else if (readOnly && result.status === 'completed' && !result.infra_error && result.final_md) {
           transition = recordReviewReport(ctx, {
             packId, reportPath: result.final_md, reviewer: instanceId, reviewerModel: instanceCfg.model || null,
@@ -794,14 +799,18 @@ async function cmdDispatch(flags) {
     ...(transition?.question && { question: transition.question }) });
 }
 
-function recordOutOfScopeReport(ctx, packId, runId, finalMd, warnings) {
-  if (!finalMd) return;
-  let report;
+function readFinalReply(finalMd) {
+  if (!finalMd) return null;
   try {
-    report = parseOutOfScopeItems(fs.readFileSync(finalMd, 'utf8'), { includeSection: true });
+    return fs.readFileSync(finalMd, 'utf8');
   } catch {
-    return;
+    return null;
   }
+}
+
+function recordOutOfScopeReport(ctx, packId, runId, markdown, warnings) {
+  if (markdown === null) return;
+  const report = parseOutOfScopeItems(markdown, { includeSection: true });
   if (report.items.length) {
     addScopeTodos(ctx, { packId, runId, texts: report.items, reason: 'Reported by the executor as out of scope.' });
   } else if (report.hasSection) {
@@ -811,7 +820,10 @@ function recordOutOfScopeReport(ctx, packId, runId, finalMd, warnings) {
 
 function checkPackGit(ctx, pack, packDef, shouldCheck) {
   if (!pack) return {};
-  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) return buildNextDirective(ctx, pack, packDef);
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT ||
+      pack.gate?.reason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED) {
+    return buildNextDirective(ctx, pack, packDef);
+  }
   if (!shouldCheck || pack.status === 'COMMITTED') return {};
   const gitWatch = checkExternalCommits(ctx, pack, packDef);
   if (gitWatch?.status === 'blocked') return buildNextDirective(ctx, pack, packDef);
@@ -831,9 +843,13 @@ function cmdRecord(sub, flags) {
   const packDef = getPackDef(ctx.manifest, packId);
 
   if (sub === 'implement') {
+    if ('blocked' in flags && 'passed' in flags) {
+      throw new Error('Use either --blocked "<reason>" or --passed.');
+    }
     const res = recordImplementOutcome(ctx, {
       packId,
       passed: Boolean(flags.passed) && !flags.failed && !flags['infra-error'],
+      blockedReason: flags.blocked === undefined ? null : requireText(flags.blocked, 'blocked'),
       infraError: flags['infra-error'] || null,
       sessionId: flags['session-id'] || null,
       runId: flags['run-id'] || null,

@@ -908,7 +908,7 @@ test('running Codex dispatch keeps its task and route while final markdown produ
   const mock = path.join(repoDir, 'mock-codex.cjs');
   const finalPath = path.join(repoDir, 'mock-response.md');
   const final = [
-    '## Summary', '- Other: ignore this', '```md', '## 超范围没改', '- Fenced: ignore this', '```',
+    '## Summary', '- Other: ignore this', '```md', '## 超范围没改', '- Fenced: ignore this', '## 没做完', '示例', '```',
     '### 超范围没改', '- src/out.mjs：抽取共享校验', '', '无效行', '- 未说明：',
     '## 超范围没改（2 项）', '1. 补异常处理', '* src/another.mjs: 补异常处理', '- [ ] 暂无。',
     '## Other', '- Outside: ignore this',
@@ -961,6 +961,7 @@ test('running Codex dispatch keeps its task and route while final markdown produ
     const task = fs.readFileSync(path.join(run.run_dir, 'task.md'), 'utf8');
     assert.match(task, /REPAIR \(tier1 attempt 1\)/);
     assert.match(task, /`## 超范围没改`.*`- 位置：说明`/);
+    assert.match(task, /`## 没做完`.*原因和还差什么/);
     assert.doesNotMatch(task, /src\/b\.mjs/);
     const persisted = readJsonSafe(ctx.paths.statePath).packs.A;
     assert.equal(persisted.current_tier, 'tier2');
@@ -1005,6 +1006,144 @@ test('running Codex dispatch keeps its task and route while final markdown produ
     assert.equal(emptyReport.transition.outcome, 'ready_for_verify');
     assert.ok(emptyReport.warnings.some((warning) => warning.includes('未解析出待办')));
     assert.deepEqual(cli('status').open_todos, todos);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('a Codex reply reporting unfinished implementation pauses with options and preserves scope todos', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['src/a.mjs'] }], {
+    redaction: { extra_patterns: ['fixture-private-marker'] }
+  });
+  const cli = (...args) => runCli(args, repoDir);
+  const mock = path.join(repoDir, 'mock-codex.cjs');
+  const replyFile = path.join(repoDir, 'reply.md');
+  const reply = [
+    '# 实现进度', '## 没做完', '', '  需要确认接口 fixture-private-marker', '',
+    '- 还差接入测试', '', '## 超范围没改', '- src/shared.mjs：补共享校验'
+  ].join('\r\n');
+  const safeReason = '需要确认接口 [REDACTED:INTERNAL]\n\n- 还差接入测试';
+  try {
+    fs.writeFileSync(replyFile, reply, 'utf8');
+    fs.writeFileSync(mock, `
+      const fs = require('node:fs');
+      const args = process.argv.slice(2);
+      fs.readFileSync(0, 'utf8');
+      fs.copyFileSync(${JSON.stringify(replyFile)}, args[args.indexOf('--output-last-message') + 1]);
+      if (args.includes('--mock-infra')) console.error('Error: 429 rate_limit_exceeded');
+      if (args.includes('--mock-infra') || args.includes('--mock-failed')) process.exitCode = 1;
+    `);
+    const executor = { kind: 'codex', executable: process.execPath, prefix_args: [mock] };
+    ctx.config.executors = { 'tier1-cli': executor, 'tier2-cli': { kind: 'self' } };
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    cli('next');
+    const run = cli('dispatch');
+    assert.equal(run.result.exit_code, 0);
+    assert.equal(run.transition.outcome, 'paused_executor_blocked');
+    assert.match(fs.readFileSync(path.join(run.run_dir, 'task.md'), 'utf8'), /`## 没做完`.*原因和还差什么/);
+    assert.deepEqual(cli('status').open_todos.map(({ run_id, content }) => [run_id, content]), [
+      [run.run_id, 'src/shared.mjs：补共享校验']
+    ]);
+
+    const shell = cli('status', '--format', 'shell');
+    assert.equal(shell.now.phase, 'PAUSE_FOR_HUMAN');
+    assert.equal(shell.now.waiting_for, 'human');
+    assert.equal(shell.question.kind, 'EXECUTOR_BLOCKED');
+    assert.match(shell.question.title, /没做完/);
+    assert.ok(shell.question.body.includes(safeReason));
+    assert.deepEqual(shell.question.options.map(({ id }) => id.split(':')[0]), [
+      'retry', 'approve', 'switch_instance', 'abort'
+    ]);
+    assert.equal(shell.question.options.find(({ id }) => id === 'approve').label, '接受现有改动，进入验证');
+    assert.equal(shell.packs[0].tier1_repairs, 0);
+    assert.equal(shell.packs[0].tier2_repairs, 0);
+    assert.equal(shell.pending.lesson_drafts, 0);
+    assert.equal(shell.packs[0].inflight_run, null);
+    const events = readEvents(ctx.paths.eventsPath);
+    const blocked = events.filter(({ type }) => type === 'implement_blocked');
+    assert.deepEqual(blocked.map(({ run_id, instance, summary }) => [run_id, instance, summary]), [
+      [run.run_id, 'tier1-cli', safeReason]
+    ]);
+    assert.ok(!events.some(({ type }) => type === 'implement_completed'));
+    assert.equal(cli('dispatch').question.id, shell.question.id);
+    const bypass = runCliFailure(['record', 'implement', '--passed'], repoDir);
+    assert.equal(bypass.status, 1);
+    assert.equal(JSON.parse(bypass.stdout).question.id, shell.question.id);
+    assert.match(runCliFailure(['resume', '--action', 'commit'], repoDir).stderr, /EXECUTOR_BLOCKED/);
+
+    cli('pack', 'scope', '--id', 'A', '--add', 'src/shared.mjs', '--reason', '允许补共享校验');
+    const retry = cli('resume', '--action', 'retry', '--decision', '范围已补齐');
+    assert.equal(retry.outcome, 'resumed_implement');
+    assert.equal(retry.active_instance, 'tier1-cli');
+    assert.equal(cli('next').action, 'IMPLEMENT');
+
+    executor.extra_args = ['--mock-failed'];
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    assert.equal(cli('dispatch').transition.outcome, 'repair_tier1');
+    executor.extra_args = ['--mock-infra'];
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    assert.equal(cli('dispatch').transition.question.kind, 'INFRA_BLOCKED');
+    assert.equal(readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'implement_blocked').length, 1);
+    cli('resume', '--action', 'retry');
+
+    delete executor.extra_args;
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    fs.writeFileSync(replyFile, '没做完\n---\n\n~~~md\n代码示例\n~~~\n## 进度\n已检查', 'utf8');
+    const second = cli('dispatch');
+    assert.equal(second.transition.gate.summary, '执行者没写原因');
+    assert.match(fs.readFileSync(path.join(second.run_dir, 'task.md'), 'utf8'), /src\/shared\.mjs/);
+    const afterRepair = cli('status', '--format', 'shell');
+    assert.equal(afterRepair.packs[0].tier1_repairs, 1);
+    assert.equal(afterRepair.packs[0].tier2_repairs, 0);
+    assert.equal(afterRepair.pending.lesson_drafts, 1);
+    assert.equal(cli('answer', '--question', second.question.id, '--option', 'approve').outcome, 'approved');
+    assert.equal(cli('next').action, 'VERIFY');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('self implementation can report a block, switch executor, or abort', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A' }], {
+    redaction: { extra_patterns: ['fixture-private-marker'] }
+  });
+  const cli = (...args) => runCli(args, repoDir);
+  try {
+    cli('next');
+    const run = cli('dispatch');
+    const reason = `需要 fixture-private-marker 授权。\n${'甲'.repeat(850)}原文末尾`;
+    const conflicting = runCliFailure(['record', 'implement', '--passed', '--blocked', reason], repoDir);
+    assert.equal(conflicting.status, 1);
+    assert.match(conflicting.stderr, /--blocked.*--passed|--passed.*--blocked/);
+    assert.equal(readJsonSafe(ctx.paths.statePath).packs.A.inflight_run.run_id, run.run_id);
+
+    const pause = cli('record', 'implement', '--blocked', reason);
+    assert.equal(pause.outcome, 'paused_executor_blocked');
+    assert.equal(pause.question.kind, 'EXECUTOR_BLOCKED');
+    assert.match(pause.question.body, /需要 \[REDACTED:INTERNAL\] 授权/);
+    assert.match(pause.question.body, /已截断/);
+    assert.doesNotMatch(pause.question.body, /原文末尾/);
+    assert.ok(pause.gate.summary.length <= 820);
+    assert.equal(readJsonSafe(path.join(run.run_dir, 'result.json')).status, 'blocked');
+    const event = readEvents(ctx.paths.eventsPath).find(({ type }) => type === 'implement_blocked');
+    assert.equal(event.run_id, run.run_id);
+    assert.equal(event.instance, 'tier1-cli');
+    assert.equal(event.summary, pause.gate.summary);
+
+    const alternate = pause.question.options.find(({ label }) => label.includes('tier1-backup'));
+    const switched = cli('answer', '--question', pause.question.id, '--option', alternate.id);
+    assert.equal(switched.outcome, 'switched_instance');
+    assert.equal(switched.active_instance, 'tier1-backup');
+    assert.equal(cli('next').action, 'IMPLEMENT');
+    assert.equal(cli('dispatch').result.instance_id, 'tier1-backup');
+    cli('record', 'implement', '--blocked', '仍缺少授权');
+    assert.equal(cli('resume', '--action', 'abort').outcome, 'aborted');
+    const shell = cli('status', '--format', 'shell');
+    assert.equal(shell.loop_status, 'ABORTED');
+    assert.equal(shell.question, null);
+    assert.equal(shell.packs[0].tier1_repairs, 0);
+    assert.equal(shell.packs[0].tier2_repairs, 0);
+    assert.equal(shell.pending.lesson_drafts, 0);
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
@@ -1133,7 +1272,7 @@ test('custom-cmd dispatch warns about model and session configuration and reject
   }
 });
 
-test('Claude dispatch saves the last string result as redacted Markdown and records open todos', () => {
+test('Claude dispatch uses the last string result for redacted scope todos and unfinished work', () => {
   const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['src/a.mjs'] }], {
     redaction: { extra_patterns: ['fixture-private-marker'] }
   });
@@ -1149,7 +1288,9 @@ test('Claude dispatch saves the last string result as redacted Markdown and reco
         emit({ type: 'result', result: 'First reply' });
         console.log('Not JSON');
         console.log('{malformed');
-        emit({ type: 'result', result: ${JSON.stringify(reply)}, usage: { output_tokens: 42 } });
+        const reply = process.argv.includes('--mock-blocked')
+          ? '没做完\\n===\\n还差接口定义' : ${JSON.stringify(reply)};
+        emit({ type: 'result', result: reply, usage: { output_tokens: 42 } });
       }
       emit({ type: 'assistant', result: 'Ignore this string' });
       emit({ type: 'result', result: { text: 'Ignore this object' } });
@@ -1175,6 +1316,12 @@ test('Claude dispatch saves the last string result as redacted Markdown and reco
     assert.equal(noFinal.result.final_md, null);
     assert.equal(fs.existsSync(path.join(noFinal.run_dir, 'final.md')), false);
     assert.deepEqual(cli('status').open_todos, todos);
+
+    cfg.prefix_args = [mock, '--mock-blocked'];
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    const blocked = cli('dispatch');
+    assert.equal(blocked.transition.question.kind, 'EXECUTOR_BLOCKED');
+    assert.equal(blocked.transition.gate.summary, '还差接口定义');
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }

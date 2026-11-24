@@ -85,6 +85,7 @@
 | `BUDGET_EXCEEDED` | `repair` 给当前档一次额外修复机会，`commit` 允许进入本地提交阶段，`abort` 终止。 |
 | `REVIEW_CAP_REACHED` | `repair` 给当前档一次额外修复机会，`commit` 允许进入本地提交阶段，`abort` 终止。 |
 | `INFRA_BLOCKED` | `retry` 用当前实例重试，`switch_instance:<标识>` 选择一个已配置的其他实例并重新执行，`abort` 终止。每个实例各有一个选项。 |
+| `EXECUTOR_BLOCKED` | 正文显示执行者没做完的原因。`retry` 补齐条件后用当前实例重新实现，`approve` 接受现有改动并进入验证，`switch_instance:<标识>` 换一个已配置的实例重新实现，`abort` 终止。 |
 | `EXTERNAL_COMMIT` | 正文列出外部提交及其文件、冲突文件。`approve` 以当前 Git HEAD 为基线并回到原阶段（必填），`abort` 终止。 |
 | `RELEASE` | `approve` 记录批准并回到执行阶段，`abort` 终止。 |
 | `MANIFEST_CHANGED` | `confirm` 确认这份清单改动并登记原因（必填）。 |
