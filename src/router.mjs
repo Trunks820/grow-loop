@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { appendEvent, expandPackScope, invalidateSession, readJsonSafe, rememberSession, saveState, writeManifestWithReason } from './state.mjs';
+import { appendEvent, expandPackScope, invalidateSession, readJsonSafe, readVerificationBaseline, rememberSession, saveState, writeJsonAtomic, writeManifestWithReason } from './state.mjs';
 import { buildRedactor } from './redact.mjs';
 import { handoffFillSteps, handoffNeeds } from './handoff.mjs';
 import { taskBriefWarnings } from './task-builder.mjs';
@@ -306,7 +306,7 @@ export function buildNextDirective(ctx, pack, packDef) {
   }
 
   if (pack.status === 'VERIFY') {
-    const { new_tests, timeout_sec, output_encoding, retry_once } = config?.verification ?? {};
+    const { new_tests, timeout_sec, output_encoding, retry_once, baseline } = config?.verification ?? {};
     const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
     return {
       action: 'VERIFY',
@@ -315,7 +315,7 @@ export function buildNextDirective(ctx, pack, packDef) {
         commands: getVerificationCommands(config, packDef),
         new_tests, timeout_sec, output_encoding, retry_once
       }),
-      next_command: `${NEXT_COMMANDS.verify} (runs global and pack commands and records exit codes); use "grow-loop record verify --failed ..." only for failures found outside those commands`
+      next_command: `${NEXT_COMMANDS.verify} (runs global and pack commands${baseline ? ' and checks the full suite for new failures' : ''} and records exit codes); use "grow-loop record verify --failed ..." only for failures found outside those commands`
     };
   }
 
@@ -736,6 +736,7 @@ export function recordVerifyOutcome(ctx, payload) {
       failure: payload.failure ?? null,
       environment_reason: payload.environmentReason ?? null
     });
+    if (payload.baseline) pack.last_verify.baseline = payload.baseline;
   }
 
   appendEvent(stateDir, config, {
@@ -773,6 +774,8 @@ export function recordVerifyOutcome(ctx, payload) {
   }
 
   // Verify passed! Decide whether to run closing review or commit.
+  if (payload.baseline) pack.last_passed_baseline_failures = payload.baseline.failures;
+  else delete pack.last_passed_baseline_failures;
   if (budgets.reviewMode === 'none') {
     pack.status = 'READY_TO_COMMIT';
     saveState(stateDir, state);
@@ -970,6 +973,19 @@ function advanceAfterCompletion({ state, stateDir }) {
   return nextId;
 }
 
+function updateVerificationBaseline(ctx, pack) {
+  const { stateDir, config, paths } = ctx;
+  if (!config?.verification?.baseline || !pack.last_passed_baseline_failures) return;
+  const baseline = readVerificationBaseline(paths.baselinePath);
+  if (!baseline) return;
+  const remaining = new Set(pack.last_passed_baseline_failures);
+  const removed = baseline.failures.filter((name) => !remaining.has(name));
+  if (!removed.length) return;
+  const failures = baseline.failures.filter((name) => remaining.has(name));
+  writeJsonAtomic(paths.baselinePath, { ...baseline, failures });
+  appendEvent(stateDir, config, { type: 'baseline_updated', pack_id: pack.id, removed });
+}
+
 export function recordCommitOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
   const pack = getWritablePack(ctx, payload.packId);
@@ -986,6 +1002,7 @@ export function recordCommitOutcome(ctx, payload) {
   const gitWatch = checkExternalCommits(ctx, pack, packDef, payload.sha);
   if (gitWatch?.status === 'blocked') return buildNextDirective(ctx, pack, packDef);
 
+  updateVerificationBaseline(ctx, pack);
   pack.commit = {
     sha: payload.sha,
     message: payload.message || '',

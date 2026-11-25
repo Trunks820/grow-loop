@@ -64,6 +64,8 @@ Choose one initialization command. The [upstream bridge](docs/UPSTREAM-BRIDGE.md
 
 In the state directory's `config.json`, map `routing.tier1`, `routing.tier2`, and `routing.reviewer` to configured executor instances. Choose a reviewer model different from the implementer's model and keep review read-only. The profile supplies a starting configuration. Set the actual [verification commands and environment](docs/UPSTREAM-BRIDGE.md#verification-settings) before dispatch. Run `grow-loop probe` to check local CLI readiness before using external executors. [Executor configuration](docs/ADAPTER-SPEC.md#1-executor-instances)
 
+If `verification.baseline` is configured, run `grow-loop verify --record-baseline` before starting the first package.
+
 ### Step 1 — Read the code and complete the package brief
 
 Read the code affected by the current package and fill these three manifest fields. Write them so the next executor can act on them without reconstructing the plan.
@@ -101,7 +103,7 @@ The CLI applies the configured brakes. By default a package estimated at 25 file
 
 ### Step 3 — Run verification before review
 
-Run `grow-loop verify` at `VERIFY`. The CLI runs the global checks and then the package checks. Either list can supply the runnable commands. It records exit codes and logs, and stops each attempt at the first failure.
+Run `grow-loop verify` at `VERIFY`. The CLI runs the global checks and then the package checks. It records exit codes and logs, and stops each attempt at the first failure. With `verification.baseline` configured, it then runs the full suite and checks for new test failures against the recorded baseline.
 
 With the default retry, the CLI runs the whole sequence again after a failure. If the second attempt passes, it records a passing `flaky` result without charging a repair or generating a lesson. Read the logs before dispatching a repair. If the failure was environmental, run `grow-loop verify --mark-env "<reason>"` before repair dispatch. This reverses that failure's repair charge, routing change, and lesson, then reruns the checks. If verification still fails, correct the environment and run verification again from `VERIFY`. [Verification settings](docs/UPSTREAM-BRIDGE.md#verification-settings)
 

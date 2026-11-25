@@ -27,6 +27,7 @@ export function getStatePaths(stateDir) {
     manifestPath: path.join(stateDir, 'manifest.json'),
     manifestSnapshotPath: path.join(stateDir, 'manifest.snapshot.json'),
     statePath: path.join(stateDir, 'state.json'),
+    baselinePath: path.join(stateDir, 'baseline.json'),
     eventsPath: path.join(stateDir, 'events.jsonl'),
     lessonsJsonPath: path.join(stateDir, 'lessons.json'),
     lessonsMdPath: path.join(stateDir, 'lessons.md'),
@@ -57,6 +58,20 @@ export function writeJsonAtomic(filePath, data) {
 export function readJsonSafe(filePath, fallback = null) {
   if (!fs.existsSync(filePath)) return fallback;
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+export function readVerificationBaseline(filePath) {
+  const missing = Symbol();
+  try {
+    const baseline = readJsonSafe(filePath, missing);
+    if (baseline === missing) return null;
+    if (Array.isArray(baseline?.failures) && baseline.failures.every((name) => typeof name === 'string' && name)) {
+      return baseline;
+    }
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+  }
+  throw new Error('baseline.json 的失败名单无效，请运行 grow-loop verify --record-baseline 重新记录。');
 }
 
 export function validateManifest(manifest) {

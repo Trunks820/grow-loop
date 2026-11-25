@@ -1688,6 +1688,176 @@ if (fs.readFileSync('attempts.txt', 'utf8') === '1') {
   }
 });
 
+function setupBaselineVerification({ commands, verifyCommands, retryOnce = false } = {}) {
+  const command = `${shellQuote(process.execPath)} full-suite.mjs`;
+  const { repoDir, ctx } = setupCtx([{ id: 'W', verify_commands: verifyCommands }], {
+    verification: {
+      commands, retry_once: retryOnce,
+      baseline: { command, failure_pattern: '^(?:FAILED|ERROR) (\\S+)' }
+    },
+    review: { mode: 'none' }
+  });
+  fs.writeFileSync(path.join(repoDir, 'full-suite.mjs'), `
+import fs from 'node:fs';
+const file = 'full-suite.json';
+const runs = JSON.parse(fs.readFileSync(file, 'utf8'));
+const { stdout = '', stderr = '', code = 0, encoding = 'utf8' } = runs[0];
+if (runs.length > 1) fs.writeFileSync(file, JSON.stringify(runs.slice(1)));
+process.stdout.write(stdout, encoding);
+process.stderr.write(stderr, encoding);
+process.exitCode = code;
+`);
+  const setSuite = (...runs) => writeJsonAtomic(path.join(repoDir, 'full-suite.json'), runs);
+  return { repoDir, ctx, command, setSuite };
+}
+
+test('baseline records decoded failures, reports regressions in repair tasks, and only shrinks at commit', () => {
+  const { repoDir, ctx, command, setSuite } = setupBaselineVerification();
+  const { baselinePath, eventsPath, statePath } = ctx.paths;
+  try {
+    ctx.config.verification.output_encoding = 'utf-16le';
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    const old = {
+      stdout: 'FAILED old::z\nFAILED old::a\n',
+      stderr: 'ERROR old::修复\nFAILED old::a\n',
+      encoding: 'utf16le', code: 1
+    };
+    setSuite(old);
+    const recorded = runCli(['verify', '--record-baseline'], repoDir);
+    assert.equal(recorded.command, command);
+    assert.equal(recorded.exit_code, 1);
+    assert.equal(recorded.head, null);
+    assert.ok(Number.isFinite(Date.parse(recorded.recorded_at)));
+    assert.deepEqual(recorded.failures, ['old::a', 'old::z', 'old::修复']);
+    assert.deepEqual(readJsonSafe(baselinePath), recorded);
+    const [event] = readEvents(eventsPath);
+    assert.deepEqual(event, { ts: event.ts, type: 'baseline_recorded', ...recorded });
+    assert.equal(readJsonSafe(statePath).packs.W.status, 'PENDING');
+
+    runCli(['next'], repoDir);
+    const initial = runCli(['dispatch', '--dry-run'], repoDir);
+    const initialTask = fs.readFileSync(path.join(initial.run_dir, 'task.md'), 'utf8');
+    assert.match(initialTask, /## 全量测试\n\n/);
+    assert.ok(initialTask.includes(command));
+    assert.match(initialTask, /本来就失败的有 3 条/);
+    assert.ok(initialTask.includes(baselinePath.replace(/\\/g, '/')));
+    assert.match(initialTask, /只有名单外的新失败算本包的。交回前请跑一次全量命令/);
+    runCli(['record', 'implement', '--passed'], repoDir);
+    assert.match(runCliFailure(['record', 'verify', '--passed'], repoDir).stderr, /run "grow-loop verify"/);
+    const existing = runCli(['verify'], repoDir);
+    assert.equal(existing.passed, true);
+    assert.deepEqual(existing.commands.map(({ source, exit_code }) => [source, exit_code]), [['baseline', 1]]);
+    assert.deepEqual(existing.baseline, { failures: recorded.failures, fixed: [] });
+
+    runCli(['record', 'implement', '--passed'], repoDir);
+    setSuite({ ...old, stderr: old.stderr + 'FAILED new::case\n' });
+    const regressed = runCli(['verify'], repoDir);
+    assert.equal(regressed.passed, false);
+    assert.equal(regressed.summary, '全量测试新增 1 条失败');
+    assert.deepEqual(regressed.failure.test_names, ['new::case']);
+    const repair = runCli(['dispatch', '--dry-run'], repoDir);
+    const repairTask = fs.readFileSync(path.join(repair.run_dir, 'task.md'), 'utf8');
+    assert.match(repairTask, /### Failed Tests\n- new::case\n\n/);
+    assert.match(repairTask, /## 全量测试\n\n/);
+    assert.match(repairTask, /本来就失败的有 3 条/);
+
+    runCli(['record', 'implement', '--passed'], repoDir);
+    setSuite({ ...old, stderr: '' });
+    const fixed = runCli(['verify'], repoDir);
+    assert.equal(fixed.passed, true);
+    assert.deepEqual(fixed.baseline, { failures: ['old::a', 'old::z'], fixed: ['old::修复'] });
+    assert.deepEqual(readJsonSafe(statePath).packs.W.last_verify.baseline, fixed.baseline);
+    assert.deepEqual(readJsonSafe(baselinePath), recorded);
+
+    // Simulate another package removing old::z before this package records its commit.
+    writeJsonAtomic(baselinePath, { ...recorded, failures: ['old::a', 'old::修复'] });
+    const commit = runCli(['record', 'commit', '--sha', '111111111111'], repoDir);
+    assert.equal(commit.outcome, 'committed');
+    assert.deepEqual(readJsonSafe(baselinePath), { ...recorded, failures: ['old::a'] });
+    const updates = readEvents(eventsPath).filter(({ type }) => type === 'baseline_updated');
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0].pack_id, 'W');
+    assert.deepEqual(updates[0].removed, ['old::修复']);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('baseline setup errors and crashed commands never approve or replace a baseline', () => {
+  const { repoDir, ctx, setSuite } = setupBaselineVerification();
+  const { baselinePath, configPath, eventsPath } = ctx.paths;
+  try {
+    const baseline = ctx.config.verification.baseline;
+    delete ctx.config.verification.baseline;
+    writeJsonAtomic(configPath, ctx.config);
+    assert.match(runCliFailure(['verify', '--record-baseline'], repoDir).stderr, /config.json.*verification\.baseline\.command/);
+    assert.match(runCliFailure(['verify', '--record-baseline', '--mark-env', 'example'], repoDir).stderr, /--record-baseline 和 --mark-env 不能一起用/);
+
+    for (const failure_pattern of ['^(?:FAILED|ERROR) \\S+', '^(FAILED) (\\S+)', '(']) {
+      ctx.config.verification.baseline = { ...baseline, failure_pattern };
+      writeJsonAtomic(configPath, ctx.config);
+      assert.match(runCliFailure(['verify', '--record-baseline'], repoDir).stderr, /verification\.baseline\.failure_pattern/);
+    }
+    ctx.config.verification.baseline = baseline;
+    writeJsonAtomic(configPath, ctx.config);
+    setSuite({ stderr: 'runner stopped before collecting tests\n', code: 2 });
+    assert.match(runCliFailure(['verify', '--record-baseline'], repoDir).stderr, /全量测试跑挂了[^\n]*\nrunner stopped/);
+    assert.equal(fs.existsSync(baselinePath), false);
+
+    runCli(['next'], repoDir);
+    runCli(['record', 'implement', '--passed'], repoDir);
+    assert.match(runCliFailure(['verify'], repoDir).stderr, /缺少 baseline\.json.*--record-baseline/);
+    setSuite({ stdout: 'FAILED old::case\n', code: 1 });
+    const recorded = runCli(['verify', '--record-baseline'], repoDir);
+    setSuite({ stderr: 'runner stopped before collecting tests\n', code: 2 });
+    const crashed = runCli(['verify'], repoDir);
+    assert.equal(crashed.passed, false);
+    assert.match(crashed.summary, /全量测试跑挂了/);
+    assert.match(crashed.failure.excerpt, /runner stopped/);
+    assert.deepEqual(crashed.failure.test_names, []);
+    assert.deepEqual(crashed.baseline.fixed, []);
+    assert.match(runCliFailure(['verify', '--record-baseline'], repoDir).stderr, /全量测试跑挂了/);
+    assert.deepEqual(readJsonSafe(baselinePath), recorded);
+    assert.equal(readEvents(eventsPath).filter(({ type }) => type === 'baseline_recorded').length, 1);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('baseline retries all checks after new failures and records a flaky pass', () => {
+  const node = shellQuote(process.execPath);
+  const { repoDir, ctx, setSuite } = setupBaselineVerification({
+    commands: [`${node} --version`], verifyCommands: [`${node} --version`], retryOnce: true
+  });
+  try {
+    setSuite({ stdout: 'all tests passed\n' });
+    assert.deepEqual(runCli(['verify', '--record-baseline'], repoDir).failures, []);
+    runCli(['next'], repoDir);
+    runCli(['record', 'implement', '--passed'], repoDir);
+    setSuite({ stdout: 'FAILED new::flaky\n', code: 1 }, { stdout: 'all tests passed\n' });
+    const verified = runCli(['verify'], repoDir);
+    assert.equal(verified.passed, true);
+    assert.equal(verified.flaky, true);
+    assert.equal(verified.run_dirs.length, 2);
+    const [first, second] = verified.run_dirs.map((dir) => readJsonSafe(path.join(dir, 'verify-result.json')));
+    assert.deepEqual(first.commands.map(({ source, exit_code }) => [source, exit_code]), [
+      ['global', 0], ['pack', 0], ['baseline', 1]
+    ]);
+    assert.deepEqual(first.failure.test_names, ['new::flaky']);
+    assert.deepEqual(second.commands.map(({ source, exit_code }) => [source, exit_code]), [
+      ['global', 0], ['pack', 0], ['baseline', 0]
+    ]);
+    const pack = readJsonSafe(ctx.paths.statePath).packs.W;
+    assert.equal(pack.tier1_repairs, 0);
+    assert.equal(pack.last_verify.flaky, true);
+    const events = readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'verify_recorded');
+    assert.equal(events.length, 1);
+    assert.equal(events[0].flaky, true);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('mark-env undoes escalation or the budget gate, preserves unrelated lessons, and closes at dispatch', () => {
   for (const exhausted of [false, true]) {
     const { repoDir, stateDir, ctx } = setupCtx([{ id: 'W' }], {

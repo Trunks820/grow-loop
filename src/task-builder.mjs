@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureDir, getStatePaths } from './state.mjs';
+import { ensureDir, getStatePaths, readVerificationBaseline } from './state.mjs';
 import { formatLessonScope, inRoundTechDebt, selectLessonsForPack } from './lessons.mjs';
 import { buildRedactor } from './redact.mjs';
 import { getBudgets, getRepairRounds } from './router.mjs';
@@ -353,6 +353,18 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
         lines.push(`- \`${command}\` (${source})`);
       }
       lines.push('');
+    }
+
+    const baseline = config?.verification?.baseline;
+    if (baseline) {
+      const { baselinePath } = getStatePaths(stateDir);
+      const recorded = readVerificationBaseline(baselinePath);
+      lines.push('## 全量测试', '', `- 命令 \`${baseline.command}\``);
+      const list = `\`${baselinePath.replace(/\\/g, '/')}\``;
+      lines.push(recorded
+        ? `- 本来就失败的有 ${recorded.failures.length} 条，名单在 ${list}。`
+        : `- 名单文件 ${list} 尚未记录，请总控先运行 \`grow-loop verify --record-baseline\`。`);
+      lines.push('- 只有名单外的新失败算本包的。交回前请跑一次全量命令。', '');
     }
 
     lines.push('## 最终回复的报告方式');

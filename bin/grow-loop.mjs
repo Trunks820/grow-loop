@@ -47,7 +47,7 @@ import { buildTaskPrompt, isScopeDirectory, parseImplementBlockedReason, parseOu
 import { addLesson, loadLessons, updateLesson } from '../src/lessons.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
 import { buildRedactor } from '../src/redact.mjs';
-import { getVerificationCommands, runVerification } from '../src/verify.mjs';
+import { getVerificationCommands, recordVerificationBaseline, runVerification } from '../src/verify.mjs';
 import { parseReviewReport } from '../src/review-report.mjs';
 import { ALLOWED_GATE_REASONS } from '../src/gate.mjs';
 import { checkExternalCommits, readGitHeadCommit } from '../src/git-watch.mjs';
@@ -112,7 +112,7 @@ Usage:
   grow-loop lesson list [--status draft|confirmed|disabled]
   grow-loop next      [--repo <dir>] [--state-dir <dir>]
   grow-loop dispatch  [--repo <dir>] [--state-dir <dir>] [--stage implement|review] [--dry-run] [--resume [<session-id>]] [--task-file <path>]
-  grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--pack <id>] [--timeout <sec>] [--mark-env "<reason>"]
+  grow-loop verify    [--repo <dir>] [--state-dir <dir>] [--pack <id>] [--timeout <sec>] [--mark-env "<reason>" | --record-baseline]
   grow-loop record    <implement|verify|review|commit|external|lesson> [flags]
   grow-loop record implement (--passed | --blocked "<reason>") [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
   grow-loop record review --report <report.md> [--reviewer <instance>] [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
@@ -586,7 +586,7 @@ function recordReviewReport(ctx, { packId, reportPath, reviewer, reviewerModel, 
   return recordReviewOutcome(ctx, { ...report, packId, reportPath, reviewer, reviewerModel, reviewRound, runId, executor, dispatch });
 }
 
-function taskFingerprint(ctx, pack) {
+function taskFingerprint(ctx, pack, stage) {
   const { paths } = ctx;
   const inputs = {
     status: pack.status,
@@ -602,7 +602,9 @@ function taskFingerprint(ctx, pack) {
     config: ctx.config
   };
   const hash = createHash('sha256').update(JSON.stringify(inputs));
-  for (const file of [paths.manifestSnapshotPath, paths.lessonsJsonPath, paths.techDebtJsonPath]) {
+  const files = [paths.manifestSnapshotPath, paths.lessonsJsonPath, paths.techDebtJsonPath];
+  if (stage === 'implement' && ctx.config?.verification?.baseline) files.push(paths.baselinePath);
+  for (const file of files) {
     hash.update('\0');
     try {
       hash.update(fs.readFileSync(file));
@@ -624,7 +626,7 @@ function prepareDispatch(ctx, pack, packDef, stage, instanceId, suppliedTask) {
     : fs.mkdtempSync(path.join(runsDir, [stamp, stage, encodeURIComponent(instanceId), ''].join('-')));
   ensureDir(runDir);
   ensureDir(path.join(ctx.paths.artifactsDir, pack.id));
-  const fingerprint = taskFingerprint(ctx, pack);
+  const fingerprint = taskFingerprint(ctx, pack, stage);
   const generatedTask = path.join(runDir, 'task.md');
   let taskFile = suppliedTask;
   if (!taskFile) {
@@ -980,7 +982,16 @@ function cmdRecord(sub, flags) {
 }
 
 async function cmdVerify(flags) {
+  const recordBaseline = 'record-baseline' in flags;
+  if (recordBaseline && 'mark-env' in flags) {
+    throw new Error('--record-baseline 和 --mark-env 不能一起用。');
+  }
   const ctx = loadWorkspace(flags.repo, flags['state-dir']);
+  const timeoutSec = flags.timeout ? Number(flags.timeout) : undefined;
+  if (recordBaseline) {
+    outJson(await recordVerificationBaseline(ctx, { timeoutSec }));
+    return;
+  }
   const packId = flags.pack || ctx.state.active_pack_id;
   const pack = ctx.state.packs[packId];
   const gitCheck = checkPackGit(ctx, pack, getPackDef(ctx.manifest, packId),
@@ -991,7 +1002,7 @@ async function cmdVerify(flags) {
   }
   const res = await runVerification(ctx, {
     packId,
-    timeoutSec: flags.timeout ? Number(flags.timeout) : undefined,
+    timeoutSec,
     markEnv: flags['mark-env']
   });
   outJson({ ...res, ...gitCheck, ...(res.transition?.question && { question: res.transition.question }) });

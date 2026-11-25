@@ -133,7 +133,7 @@ The snapshot is created during initialization. A workspace from an older version
 
 ### Verification settings
 
-Put shared checks in the state directory's `config.json` under `verification.commands`. Put package-specific checks in the pack's `verify_commands` array in `manifest.json`. The CLI runs global commands first and package commands second. At least one runnable command must be present across the two lists. The results label commands `global` or `pack`.
+Put shared checks in the state directory's `config.json` under `verification.commands`. Put package-specific checks in the pack's `verify_commands` array in `manifest.json`. The CLI runs global commands first, package commands second, and the optional full-suite command last. At least one runnable command is required across these settings. The results label commands `global`, `pack`, or `baseline`.
 
 | Setting in `config.json` | Default | Effect |
 |---|---|---|
@@ -141,8 +141,31 @@ Put shared checks in the state directory's `config.json` under `verification.com
 | `verification.path_prepend` | `[]` | Directories prepended to the subprocess `PATH` in list order. |
 | `verification.output_encoding` | `utf-8` | Decodes command output using a `TextDecoder` encoding such as `gbk`. Log files are saved as UTF-8. |
 | `verification.retry_once` | `true` | Reruns the sequence from the beginning after the first failed attempt. Each attempt stops at the first failing command and writes its own logs. |
+| `verification.baseline` | Unset | Runs the full suite and checks for failures outside the recorded list. |
 
 Blank lines and entries that begin with `#` are skipped. See the [verification flow](../SKILL.md#step-3--run-verification-before-review) for retry outcomes and how to handle an environment failure.
+
+To track existing full-suite failures, add a `baseline` object under `verification` in `config.json`. For pytest, use this object.
+
+```json
+{
+  "command": "python -m pytest -q -rfE -p no:cacheprovider",
+  "failure_pattern": "^(?:FAILED|ERROR) (\\S+)"
+}
+```
+
+For Node's test runner, select TAP output.
+
+```json
+{
+  "command": "node --test --test-reporter=tap",
+  "failure_pattern": "^not ok \\d+ - (.+)$"
+}
+```
+
+Use exactly one capture group for the test name. The CLI matches each decoded line of stdout and stderr. Run `grow-loop verify --record-baseline` before implementing the first package to save the sorted, deduplicated list in the state directory's `baseline.json`.
+
+During `grow-loop verify`, any new full-suite failure fails verification. A timeout or a nonzero exit with no recognized test names also fails verification. The result reports baseline tests that now pass under `baseline.fixed`. Recording the package's commit removes those fixed tests from the shared baseline using the last passing verification's failure list.
 
 ---
 
