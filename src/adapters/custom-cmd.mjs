@@ -2,12 +2,23 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   classifyInfraError,
+  probeExecutable,
+  resolveExecutorCommand,
   runAdapterProcess,
-  runBoundedCommand,
+  versionFromProbe,
   writeDryRunReceipt,
   writeFinalMarkdown,
+  writeMissingExecutableResult,
   writeRunResult
 } from './base.mjs';
+
+function resolveCustomCommand(cfg, cwd) {
+  return {
+    ...resolveExecutorCommand(cfg.executable, null, cwd),
+    probeArgs: cfg.probe_args || ['--version'],
+    shell: Boolean(cfg.shell)
+  };
+}
 
 function renderTemplateArgs(rawArgs, vars) {
   return (rawArgs || []).map((arg) =>
@@ -49,35 +60,19 @@ function readFinalFile(finalFile, repoDir, runDir) {
  */
 export const customCmdAdapter = {
   kind: 'custom-cmd',
+  resolveCommand: resolveCustomCommand,
 
   async probe(instanceId, cfg = {}, opts = {}) {
-    if (!cfg.executable) {
-      return {
-        instance_id: instanceId,
-        kind: 'custom-cmd',
-        available: false,
-        cli_version: null,
-        auth_status: 'missing',
-        account_hint: null,
-        capabilities: { read_only: Boolean(cfg.read_only_args), resume: Boolean(cfg.resume_args), jsonl: false, sandbox: 'custom' },
-        latency_ms: 0,
-        error: 'missing_executable_in_config'
-      };
-    }
-
-    const timeoutMs = opts.timeoutMs ?? 8000;
-    const res = await runBoundedCommand(cfg.executable, cfg.probe_args || ['--version'], {
-      timeoutMs,
-      shell: Boolean(cfg.shell)
-    });
+    const command = resolveCustomCommand(cfg, opts.cwd);
+    const res = await probeExecutable(command, opts);
 
     return {
       instance_id: instanceId,
       kind: 'custom-cmd',
       available: res.ok,
-      cli_version: res.ok ? (res.stdout || res.stderr).trim().split(/\r?\n/)[0].slice(0, 120) : null,
+      cli_version: versionFromProbe(res)?.slice(0, 120) ?? null,
       auth_status: res.ok ? 'configured_unverified' : 'missing',
-      account_hint: cfg.label || cfg.executable,
+      account_hint: command.error ? null : cfg.label || cfg.executable,
       capabilities: {
         read_only: Boolean(cfg.read_only_args),
         resume: Boolean(cfg.resume_args),
@@ -85,7 +80,7 @@ export const customCmdAdapter = {
         sandbox: 'custom'
       },
       latency_ms: res.latencyMs,
-      error: res.ok ? null : (res.timedOut ? 'probe_timeout' : (res.stderr || 'probe_failed').trim().slice(0, 200))
+      error: command.error ?? (res.ok ? null : (res.timedOut ? 'probe_timeout' : (res.stderr || 'probe_failed').trim().slice(0, 200)))
     };
   },
 
@@ -108,7 +103,8 @@ export const customCmdAdapter = {
   },
 
   async dryRun({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, redactor }) {
-    compileSessionPattern(cfg?.session_id_pattern);
+    const command = resolveCustomCommand(cfg || {}, repoDir);
+    if (!command.error) compileSessionPattern(cfg?.session_id_pattern);
     const args = this.buildArgs(cfg || {}, { repoDir, runDir, taskFilePath, readOnly, resumeSessionId });
     return writeDryRunReceipt(
       runDir,
@@ -117,26 +113,32 @@ export const customCmdAdapter = {
         kind: 'custom-cmd',
         stage,
         read_only: Boolean(readOnly),
-        executable: cfg?.executable || '',
+        executable: command.cmd ?? command.configured ?? '',
         args,
-        task_file: taskFilePath
+        task_file: taskFilePath,
+        ...(command.error && { warnings: [command.error] })
       },
       redactor
     );
   },
 
-  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor }) {
+  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor,
+    resolvedCommand, executorVersion = null }) {
+    const command = resolvedCommand ?? resolveCustomCommand(cfg || {}, repoDir);
+    const details = { instance_id: instanceId, kind: 'custom-cmd', stage, read_only: Boolean(readOnly) };
+    if (command.error) return writeMissingExecutableResult(runDir, details, command.error, redactor);
     const sessionPattern = compileSessionPattern(cfg?.session_id_pattern);
     const args = this.buildArgs(cfg || {}, { repoDir, runDir, taskFilePath, readOnly, resumeSessionId });
     const stdinText = cfg?.pass_stdin !== false ? fs.readFileSync(taskFilePath, 'utf8') : undefined;
     const proc = await runAdapterProcess({
-      command: cfg.executable,
+      command: command.cmd,
+      exactExecutable: true,
       args,
       cwd: repoDir,
       stdinText,
       runDir,
       timeoutSec: timeoutSec || cfg?.timeout_sec || 3600,
-      shell: Boolean(cfg?.shell),
+      shell: command.shell,
       redactor
     });
 
@@ -150,10 +152,9 @@ export const customCmdAdapter = {
     return writeRunResult(
       runDir,
       {
-        instance_id: instanceId,
-        kind: 'custom-cmd',
-        stage,
-        read_only: Boolean(readOnly),
+        ...details,
+        executable_path: command.cmd,
+        executor_version: executorVersion,
         status: infraError ? 'infra_error' : (proc.exitCode === 0 ? 'completed' : 'failed'),
         exit_code: proc.exitCode,
         elapsed_seconds: proc.elapsedSeconds,

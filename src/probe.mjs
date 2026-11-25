@@ -1,7 +1,15 @@
 import { getAdapter } from './adapters/index.mjs';
-import { runBoundedCommand } from './adapters/base.mjs';
+import { probeExecutable, runBoundedCommand, versionFromProbe } from './adapters/base.mjs';
 import { appendEvent, getStatePaths, writeJsonAtomic } from './state.mjs';
 import { buildRedactor } from './redact.mjs';
+
+export async function probeDispatchVersion(ctx, command) {
+  const result = await probeExecutable(command, {
+    cwd: ctx.state.repo_dir,
+    timeoutMs: ctx.config?.probe?.timeout_ms
+  });
+  return versionFromProbe(result);
+}
 
 /**
  * Instance-level capability discovery via bounded read-only probes.
@@ -17,7 +25,7 @@ export async function probeAllInstances(ctx, options = {}) {
   const results = [];
   for (const [instanceId, instanceCfg] of Object.entries(executors)) {
     const adapter = getAdapter(instanceCfg?.kind || 'self');
-    const raw = await adapter.probe(instanceId, instanceCfg || {}, { timeoutMs });
+    const raw = await adapter.probe(instanceId, instanceCfg || {}, { timeoutMs, cwd: ctx.state.repo_dir });
     results.push(redactor.redactValue(raw));
   }
 

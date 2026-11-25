@@ -38,6 +38,8 @@ export function generateEvidencePack(ctx, outputPath) {
   const events = readEvents(paths.eventsPath);
   const finalImplementations = new Map(events.filter(({ type }) => type === 'implement_completed')
     .map((event) => [event.pack_id, event]));
+  const versionsByRun = new Map(events.filter(({ type, executor_version }) => type === 'dispatch_started' && executor_version !== undefined)
+    .map(({ pack_id, run_id, executor_version }) => [`${pack_id}/${run_id}`, executor_version]));
   const lessonsStore = loadLessons(stateDir);
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
 
@@ -61,12 +63,14 @@ export function generateEvidencePack(ctx, outputPath) {
     const instance = implementation?.instance || p.active_instance || '未派发';
     const tool = implementation?.executor_tool || '无记录';
     const model = implementation?.executor_model || '无记录';
+    const version = versionsByRun.get(`${id}/${implementation?.run_id}`);
+    const versionLabel = version === undefined ? '' : ` · 版本 ${esc(version)}`;
     const sha = p.commit?.sha ? `\`${p.commit.sha.slice(0, 9)}\`` : '未提交';
     const diffStat = p.commit ? `${p.commit.files} files (\`+${p.commit.insertions}/-${p.commit.deletions}\`)` : '无记录';
     const repairs = `${p.tier1_repairs} / ${p.tier2_repairs}${p.escalated ? ' (已升级T2)' : ''}`;
     const completion = p.completed_externally ? ` · 在 loop 外完成（${esc(p.completed_externally.note)}）` : '';
     lines.push(
-      `| **${esc(p.id)}** | ${esc(p.title)} | ${esc(instance)} · ${esc(tool)} / ${esc(model)} | ${sha} | ${diffStat} | ${repairs} | ${p.review_rounds} | **${esc(p.status)}**${completion} |`
+      `| **${esc(p.id)}** | ${esc(p.title)} | ${esc(instance)} · ${esc(tool)} / ${esc(model)}${versionLabel} | ${sha} | ${diffStat} | ${repairs} | ${p.review_rounds} | **${esc(p.status)}**${completion} |`
     );
   }
   lines.push('');
@@ -146,6 +150,20 @@ export function generateEvidencePack(ctx, outputPath) {
             ? `${e.from_instance} → ${e.to_instance} (${e.reason})`
             : `${e.error_class || e.trigger}: ${e.summary || `${e.from_instance} -> ${e.to_instance}`} (修复额度未扣减)`;
       lines.push(`| ${esc(e.ts)} | \`${esc(e.type)}\` | ${esc(e.pack_id)} | ${esc(detail)} |`);
+    }
+  }
+  lines.push('');
+
+  lines.push('#### 执行程序换版本');
+  lines.push('');
+  const versionChanges = events.filter(({ type }) => type === 'executor_version_changed');
+  if (!versionChanges.length) {
+    lines.push('无');
+  } else {
+    lines.push('| 时间 | 包号 | 实例 | 旧路径 | 新路径 | 旧版本 | 新版本 |');
+    lines.push('|---|---|---|---|---|---|---|');
+    for (const e of versionChanges) {
+      lines.push(`| ${esc(e.ts)} | ${esc(e.pack_id)} | ${esc(e.instance)} | ${esc(e.old_path)} | ${esc(e.new_path)} | ${esc(e.old_version)} | ${esc(e.new_version)} |`);
     }
   }
   lines.push('');

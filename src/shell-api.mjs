@@ -154,6 +154,7 @@ function gateQuestion(ctx, pack) {
     body.push(`一档已修复 ${pack.tier1_repairs ?? 0} 次，二档已修复 ${pack.tier2_repairs ?? 0} 次。`);
   }
   if (gate.reason === 'REVIEW_CAP_REACHED') body.push(`已审查 ${pack.review_rounds ?? 0} 轮。`);
+  if (gate.reason === 'INFRA_BLOCKED' && gate.summary) body.push('', gate.summary);
   if (gate.reason === 'EXECUTOR_BLOCKED') {
     body.push('', gate.summary);
     if (gate.allowed_resume_actions?.includes('continue')) {
@@ -176,7 +177,9 @@ function gateQuestion(ctx, pack) {
   }
   const options = (gate.allowed_resume_actions ?? []).flatMap((action) => {
     if (action === 'switch_instance') {
-      return Object.keys(ctx.config?.executors ?? {}).filter((id) => id !== pack.active_instance)
+      const currentInstance = gate.reason === 'INFRA_BLOCKED' && gate.resume_status === 'REVIEW'
+        ? pack.review_instance : pack.active_instance;
+      return Object.keys(ctx.config?.executors ?? {}).filter((id) => id !== currentInstance)
         .map((id) => option(switchOptionId(id), `改用 ${redactor.redactString(id)} 并重新执行`));
     }
     if (Array.isArray(copy[action])) return [option(action, ...copy[action])];

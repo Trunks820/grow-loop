@@ -2,15 +2,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   classifyInfraError,
+  probeExecutable,
+  resolveExecutorCommand,
   runAdapterProcess,
   runBoundedCommand,
+  versionFromProbe,
   writeDryRunReceipt,
+  writeMissingExecutableResult,
   writeRunResult
 } from './base.mjs';
 
-function resolveCodexCommand(cfg) {
-  if (cfg.executable) return { cmd: cfg.executable, prefix: cfg.prefix_args || [] };
-  return { cmd: 'codex', prefix: [] };
+function resolveCodexCommand(cfg, cwd) {
+  const prefix = cfg.executable ? cfg.prefix_args || [] : [];
+  return { ...resolveExecutorCommand(cfg.executable, 'codex', cwd), prefix, probeArgs: [...prefix, '--version'] };
 }
 
 function parseCodexJsonl(stdoutPath) {
@@ -39,11 +43,11 @@ function parseCodexJsonl(stdoutPath) {
  */
 export const codexAdapter = {
   kind: 'codex',
+  resolveCommand: resolveCodexCommand,
 
   async probe(instanceId, cfg = {}, opts = {}) {
-    const { cmd, prefix } = resolveCodexCommand(cfg);
-    const timeoutMs = opts.timeoutMs ?? 8000;
-    const ver = await runBoundedCommand(cmd, [...prefix, '--version'], { timeoutMs });
+    const command = resolveCodexCommand(cfg, opts.cwd);
+    const ver = await probeExecutable(command, opts);
 
     if (!ver.ok) {
       return {
@@ -55,13 +59,15 @@ export const codexAdapter = {
         account_hint: null,
         capabilities: { read_only: true, resume: true, jsonl: true, sandbox: 'codex-native' },
         latency_ms: ver.latencyMs,
-        error: ver.timedOut ? 'probe_timeout' : (ver.stderr || 'codex_cli_not_found').trim().slice(0, 200)
+        error: command.error ?? (ver.timedOut ? 'probe_timeout' : (ver.stderr || 'codex_cli_not_found').trim().slice(0, 200))
       };
     }
 
-    const versionStr = (ver.stdout || ver.stderr).trim().split(/\r?\n/)[0];
+    const versionStr = versionFromProbe(ver);
     // Non-invasive check: ask codex login status if supported, never echo tokens
-    const login = await runBoundedCommand(cmd, [...prefix, 'login', 'status'], { timeoutMs });
+    const login = await runBoundedCommand(command.cmd, [...command.prefix, 'login', 'status'], {
+      timeoutMs: opts.timeoutMs, cwd: opts.cwd, exactExecutable: true
+    });
     const loginOut = `${login.stdout}\n${login.stderr}`.trim();
     let authStatus = 'configured_unverified';
     let accountHint = cfg.label || cfg.model || 'codex-cli';
@@ -89,8 +95,7 @@ export const codexAdapter = {
     };
   },
 
-  buildArgs(cfg, { repoDir, runDir, readOnly, resumeSessionId }) {
-    const { cmd, prefix } = resolveCodexCommand(cfg);
+  buildArgs(cfg, { repoDir, runDir, readOnly, resumeSessionId }, { cmd, prefix } = resolveCodexCommand(cfg, repoDir)) {
     const finalMdPath = path.join(runDir, 'final.md');
     // `codex exec resume` rejects --cd/--sandbox, so they must precede the subcommand.
     const args = [...prefix, 'exec', '--cd', repoDir, '--sandbox', readOnly ? 'read-only' : (cfg.sandbox || 'workspace-write')];
@@ -110,7 +115,8 @@ export const codexAdapter = {
   },
 
   async dryRun({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, redactor }) {
-    const { cmd, args } = this.buildArgs(cfg || {}, { repoDir, runDir, readOnly, resumeSessionId });
+    const command = resolveCodexCommand(cfg || {}, repoDir);
+    const { cmd, args } = this.buildArgs(cfg || {}, { repoDir, runDir, readOnly, resumeSessionId }, command);
     return writeDryRunReceipt(
       runDir,
       {
@@ -118,20 +124,26 @@ export const codexAdapter = {
         kind: 'codex',
         stage,
         read_only: Boolean(readOnly),
-        executable: cmd,
+        executable: cmd ?? command.configured,
         args,
-        task_file: taskFilePath
+        task_file: taskFilePath,
+        ...(command.error && { warnings: [command.error] })
       },
       redactor
     );
   },
 
-  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor, onSessionStarted }) {
-    const { cmd, args, finalMdPath } = this.buildArgs(cfg || {}, { repoDir, runDir, readOnly, resumeSessionId });
+  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor, onSessionStarted,
+    resolvedCommand, executorVersion = null }) {
+    const command = resolvedCommand ?? resolveCodexCommand(cfg || {}, repoDir);
+    const details = { instance_id: instanceId, kind: 'codex', stage, read_only: Boolean(readOnly) };
+    if (command.error) return writeMissingExecutableResult(runDir, details, command.error, redactor);
+    const { cmd, args, finalMdPath } = this.buildArgs(cfg || {}, { repoDir, runDir, readOnly, resumeSessionId }, command);
     const stdinText = fs.readFileSync(taskFilePath, 'utf8');
     let startedThreadId = null;
     const proc = await runAdapterProcess({
       command: cmd,
+      exactExecutable: true,
       args,
       cwd: repoDir,
       stdinText,
@@ -163,10 +175,9 @@ export const codexAdapter = {
     return writeRunResult(
       runDir,
       {
-        instance_id: instanceId,
-        kind: 'codex',
-        stage,
-        read_only: Boolean(readOnly),
+        ...details,
+        executable_path: cmd,
+        executor_version: executorVersion,
         status,
         exit_code: proc.exitCode,
         ...(proc.signal && { exit_signal: proc.signal }),

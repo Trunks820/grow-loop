@@ -14,26 +14,23 @@ In `.loop/config.json`, `executors` maps **instance IDs** rather than vendor nam
     "self": { "kind": "self", "label": "Host Agent Harness" },
     "dsh-fast": {
       "kind": "dsh",
-      "executable": "dsh",
       "profile": "headless",
       "timeout_sec": 3600
     },
     "codex-high": {
       "kind": "codex",
-      "executable": "codex",
       "model": "gpt-5.4",
       "reasoning_effort": "high",
       "timeout_sec": 3600
     },
     "claude-review": {
       "kind": "claude",
-      "executable": "claude",
       "model": "sonnet",
       "timeout_sec": 1800
     },
     "custom-local": {
       "kind": "custom-cmd",
-      "executable": "my-agent-cli",
+      "executable": "/opt/my-agent/bin/my-agent-cli",
       "model": "my-agent-model",
       "probe_args": ["--version"],
       "args": ["run", "--repo", "{{repo}}", "--prompt-file", "{{task_file}}", "--model", "{{model}}", "--output", "{{run_dir}}/reply.md"],
@@ -45,6 +42,19 @@ In `.loop/config.json`, `executors` maps **instance IDs** rather than vendor nam
   }
 }
 ```
+
+A configured `executable` is a file path, absolute or relative to the repository. Each `*` can match characters within one directory name or filename. The resolver keeps existing files and ranks the text matched by successive wildcards from left to right, comparing digit runs numerically. For example, `26.1120.6357.0` ranks above `26.1111.9664.0`, and `10.0` ranks above `9.0`. An unreadable directory yields no matches for that branch.
+
+For Codex Desktop on Windows, use the versioned installation directory in the pattern:
+
+```json
+{
+  "kind": "codex",
+  "executable": "C:/Program Files/WindowsApps/OpenAI.Codex_*_x64__2p2nqsd0c76g0/app/resources/codex.exe"
+}
+```
+
+A configured path never falls back to `PATH`. If it resolves to no file, `probe` explains why the instance is unavailable, `dispatch --dry-run` adds a warning, and live dispatch pauses at `INFRA_BLOCKED` without consuming a repair attempt. Omit `executable` to look up `codex`, `claude`, or `dsh` by name on `PATH`. `custom-cmd` requires an explicit executable.
 
 For `custom-cmd`, `{{model}}` expands to the configured `model` in `args`, `read_only_args`, and `resume_args`. If `model` is omitted, it expands to an empty string. The same `model` value identifies the executor model in the implementation record.
 
@@ -139,7 +149,7 @@ export const myAdapter = {
       session_id: 'optional-native-session-id',
       usage: { input_tokens: 0, output_tokens: 0 },
       final_md: null,      // path to the final Markdown message, when available
-      infra_error: null   // null | 'INFRA_QUOTA' | 'INFRA_AUTH' | 'INFRA_TIMEOUT' | 'INFRA_CLI_CRASH'
+      infra_error: null   // See Infrastructure Error Normalization
     }, redactor);
   }
 };
@@ -148,6 +158,8 @@ export const myAdapter = {
 ### Dispatch state and resume
 
 Dry-run dispatch persists `prepared_run` with `run_id`, `run_dir`, `task_file`, `stage`, `instance` and a `fingerprint` of the package and task inputs. Live dispatch for the same stage and instance reuses the directory. A changed fingerprint regenerates the generated task in place. Each invocation honors its explicit `--task-file`.
+
+For each live external dispatch, the driver resolves the executable and provides its version probe arguments through `resolveCommand()`. The probe runs once before dispatch with `probe.timeout_ms` (8000 ms by default). It uses the same local, read-only arguments as `probe()` uses for version discovery. These are usually `--version`, with `probe_args` available for `custom-cmd` and DSH wrappers. The first output line becomes `executor_version`. A failed or empty probe records `null` and dispatch continues. `dispatch_started` and `result.json` store `executable_path` and `executor_version`. State retains the last observation as `executors_seen[instance] = { path, version, at }`. A different path or version produces an `executor_version_changed` event with both observations, a dispatch warning, and an entry in the evidence pack. The final implementer's version comes from the dispatch that completed implementation.
 
 Before calling `run()`, the CLI consumes `prepared_run` and atomically saves `inflight_run` with the run identifiers, stage, executor instance and start time. `grow-loop status` shows the record. Codex uses `runAdapterProcess({ onStdoutLine })` to read complete stdout lines as they arrive, calls the synchronous `onSessionStarted(threadId)` on `thread.started`, and still parses the full JSONL log for the final result. The CLI immediately persists the ID to `inflight_run` and updates `last_session_id` when the executor still matches the pack's active instance and the route has not changed. `grow-loop dispatch --resume` uses a compatible saved session for the same stage and instance. An explicit `--resume <session-id>` supplies the native ID directly. External runs clear `inflight_run` on exit. An interrupted Codex process leaves the pack available to resume. This includes a nonzero exit after `thread.started` without a signal, terminal event or final message, which can occur when the process is terminated on Windows.
 
@@ -191,10 +203,11 @@ If the file is unreadable or the report is invalid, dispatch prints the report p
 
 ## 4. Infrastructure Error Normalization
 
-Drivers delegate classification to `classifyInfraError(exitCode, stdoutTail, stderrTail, timedOut)` in `src/adapters/base.mjs`:
+Drivers check executable availability before launching the CLI and use `classifyInfraError(exitCode, stdoutTail, stderrTail, timedOut)` for process failures.
 
 | `infra_error` | Trigger Signals | Consumes Repair Budget? |
 |---|---|---|
+| `INFRA_EXECUTABLE_NOT_FOUND` | The executable cannot be located before launch | **NO** |
 | `INFRA_QUOTA` | HTTP `429`, `rate_limit`, `quota_exhausted`, `insufficient_quota`, `too many requests` | **NO** |
 | `INFRA_AUTH` | HTTP `401`/`403`, `unauthenticated`, `not logged in`, `auth failed`, `invalid api key` | **NO** |
 | `INFRA_TIMEOUT` | Process exceeded `timeout_sec` and was terminated | **NO** |

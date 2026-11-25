@@ -33,6 +33,7 @@ import {
   getRepairRounds,
   recordCommitOutcome,
   recordExternalCompletion,
+  recordInfraFailure,
   recordImplementOutcome,
   recordReviewOutcome,
   recordVerifyOutcome,
@@ -41,8 +42,9 @@ import {
   resumeFromGate,
   startOrAdvanceActivePack
 } from '../src/router.mjs';
+import { EXECUTABLE_NOT_FOUND } from '../src/adapters/base.mjs';
 import { getAdapter } from '../src/adapters/index.mjs';
-import { probeAllInstances } from '../src/probe.mjs';
+import { probeAllInstances, probeDispatchVersion } from '../src/probe.mjs';
 import { buildTaskPrompt, isScopeDirectory, parseImplementBlockedReason, parseOutOfScopeItems, taskBriefWarnings } from '../src/task-builder.mjs';
 import { addLesson, loadLessons, updateLesson } from '../src/lessons.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
@@ -649,6 +651,14 @@ function savedSession(pack, stage, instanceId) {
   return stage === 'implement' ? pack.last_session_id : null;
 }
 
+function observeExecutor(state, instance, { executable_path: file, executor_version: version }) {
+  const seen = state.executors_seen ?? {};
+  const previous = Object.hasOwn(seen, instance) ? seen[instance] : null;
+  state.executors_seen = { ...seen, [instance]: { path: file, version, at: new Date().toISOString() } };
+  if (!previous || (previous.path === file && previous.version === version)) return null;
+  return { old_path: previous.path, old_version: previous.version, new_path: file, new_version: version };
+}
+
 async function cmdDispatch(flags) {
   const ctx = loadWorkspace(flags.repo, flags['state-dir']);
   const packId = flags.pack || ctx.state.active_pack_id;
@@ -663,7 +673,8 @@ async function cmdDispatch(flags) {
   if (!['review', 'implement'].includes(stage)) throw new Error('Use --stage implement or review.');
   const readOnly = stage === 'review';
   const reviewRound = pack.review_rounds + 1;
-  const instanceId = flags.instance || (readOnly ? resolveTierInstance(ctx.config, 'reviewer') : pack.active_instance || resolveTierInstance(ctx.config, pack.current_tier || 'tier1'));
+  const instanceId = flags.instance || (readOnly ? resolveTierInstance(ctx.config, 'reviewer', pack)
+    : pack.active_instance || resolveTierInstance(ctx.config, pack.current_tier || 'tier1'));
   const instanceCfg = ctx.config?.executors?.[instanceId] || { kind: 'self' };
   const adapter = getAdapter(instanceCfg.kind || 'self');
   const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
@@ -714,7 +725,7 @@ async function cmdDispatch(flags) {
       instance: instanceId,
       run_id: runId
     });
-    outJson({ run_id: runId, run_dir: runDir, dry_run: receipt, warnings, ...gitCheck });
+    outJson({ run_id: runId, run_dir: runDir, dry_run: receipt, warnings: [...warnings, ...(receipt.warnings ?? [])], ...gitCheck });
     return;
   }
 
@@ -732,12 +743,36 @@ async function cmdDispatch(flags) {
   let startedSessionId;
   let transition = null;
   try {
+    const resolvedCommand = adapter.resolveCommand?.(instanceCfg, adapterInput.repoDir);
+    const executorVersion = resolvedCommand?.cmd ? await probeDispatchVersion(ctx, resolvedCommand) : null;
+    const executable = resolvedCommand && { executable_path: resolvedCommand.cmd, executor_version: executorVersion };
+    let change;
+    if (resolvedCommand?.cmd) {
+      // The version probe can finish after another command has updated the workspace state.
+      const latest = readJsonSafe(ctx.paths.statePath);
+      const current = latest.packs[packId];
+      if (current?.inflight_run?.run_id !== runId || current.status === 'COMMITTED' || latest.loop_status === 'ABORTED') {
+        throw new Error('版本探测期间派活已取消，请查看 grow-loop status。');
+      }
+      change = observeExecutor(latest, instanceId, redactor.redactValue(executable));
+      saveState(ctx.stateDir, latest);
+    }
     appendEvent(ctx.stateDir, ctx.config, {
       type: 'dispatch_started', pack_id: pack.id, stage, instance: instanceId, read_only: readOnly,
-      run_id: runId, started_at: startedAt, resumed_session: resumeSessionId || null
+      run_id: runId, started_at: startedAt, resumed_session: resumeSessionId || null, ...executable
     });
+    if (change) {
+      appendEvent(ctx.stateDir, ctx.config, {
+        type: 'executor_version_changed', pack_id: pack.id, run_id: runId, stage, instance: instanceId, ...change
+      });
+      const oldVersion = change.old_version ?? '未知版本';
+      const newVersion = change.new_version ?? '未知版本';
+      warnings.push(`${redactor.redactString(instanceId)} 的程序换了：${oldVersion} → ${newVersion}`);
+    }
     result = await adapter.run({
       ...adapterInput,
+      resolvedCommand,
+      executorVersion,
       startedAt,
       timeoutSec: flags.timeout ? Number(flags.timeout) : undefined,
       onSessionStarted(sessionId) {
@@ -753,7 +788,8 @@ async function cmdDispatch(flags) {
         saveState(ctx.stateDir, latest);
       }
     });
-    if (adapter.kind === 'custom-cmd' && instanceCfg.session_id_pattern && !result.session_id) {
+    if (adapter.kind === 'custom-cmd' && instanceCfg.session_id_pattern && !result.session_id &&
+        result.infra_error !== EXECUTABLE_NOT_FOUND) {
       warnings.push('custom-cmd 的 session_id_pattern 本次未匹配到会话号。');
     }
     if (result.status !== 'host_action_required') {
@@ -780,9 +816,14 @@ async function cmdDispatch(flags) {
           transition = recordImplementOutcome(ctx, {
             packId, passed: passed && !blockedReason, blockedReason, infraError: result.infra_error || null,
             sessionId: startedSessionId || result.session_id || resumeSessionId, runId, dispatch, executor,
-            summary: result.infra_error ? `Adapter ${instanceId} hit ${result.infra_error}` : `Adapter ${instanceId} exited with code ${result.exit_code}`
+            summary: result.summary ?? (result.infra_error
+              ? `Adapter ${instanceId} hit ${result.infra_error}` : `Adapter ${instanceId} exited with code ${result.exit_code}`)
           });
           recordOutOfScopeReport(ctx, packId, runId, markdown, warnings);
+        } else if (readOnly && result.infra_error === EXECUTABLE_NOT_FOUND) {
+          transition = recordInfraFailure(ctx, current, {
+            instance: instanceId, infraError: result.infra_error, summary: result.summary, stage
+          });
         } else if (readOnly && result.status === 'completed' && !result.infra_error && result.final_md) {
           transition = recordReviewReport(ctx, {
             packId, reportPath: result.final_md, reviewer: instanceId, reviewerModel: instanceCfg.model || null,
@@ -829,6 +870,7 @@ function checkPackGit(ctx, pack, packDef, shouldCheck) {
   if (!pack) return {};
   if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT ||
       pack.gate?.reason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED ||
+      pack.gate?.infra_error === EXECUTABLE_NOT_FOUND ||
       pack.gate?.reason === ALLOWED_GATE_REASONS.OUT_OF_SCOPE_CHANGE) {
     return buildNextDirective(ctx, pack, packDef);
   }

@@ -1,15 +1,22 @@
 import fs from 'node:fs';
 import {
   classifyInfraError,
+  probeExecutable,
+  resolveExecutorCommand,
   runAdapterProcess,
-  runBoundedCommand,
+  versionFromProbe,
   writeDryRunReceipt,
+  writeMissingExecutableResult,
   writeRunResult
 } from './base.mjs';
 
-function resolveDshCommand(cfg) {
-  if (cfg.executable) return { cmd: cfg.executable, prefix: cfg.prefix_args || [] };
-  return { cmd: 'dsh', prefix: [] };
+function resolveDshCommand(cfg, cwd) {
+  const prefix = cfg.executable ? cfg.prefix_args || [] : [];
+  return {
+    ...resolveExecutorCommand(cfg.executable, 'dsh', cwd),
+    prefix,
+    probeArgs: cfg.probe_args || [...prefix, '--version']
+  };
 }
 
 function parseDshJsonl(stdoutPath) {
@@ -61,12 +68,11 @@ function parseDshJsonl(stdoutPath) {
  */
 export const dshAdapter = {
   kind: 'dsh',
+  resolveCommand: resolveDshCommand,
 
   async probe(instanceId, cfg = {}, opts = {}) {
-    const { cmd, prefix } = resolveDshCommand(cfg);
-    const timeoutMs = opts.timeoutMs ?? 8000;
-    const probeArgs = cfg.probe_args || [...prefix, '--version'];
-    const res = await runBoundedCommand(cmd, probeArgs, { timeoutMs });
+    const command = resolveDshCommand(cfg, opts.cwd);
+    const res = await probeExecutable(command, opts);
 
     if (!res.ok) {
       return {
@@ -78,7 +84,7 @@ export const dshAdapter = {
         account_hint: null,
         capabilities: { read_only: false, resume: true, jsonl: true, sandbox: 'dsh-profile' },
         latency_ms: res.latencyMs,
-        error: res.timedOut ? 'probe_timeout' : (res.stderr || 'dsh_cli_not_found').trim().slice(0, 200)
+        error: command.error ?? (res.timedOut ? 'probe_timeout' : (res.stderr || 'dsh_cli_not_found').trim().slice(0, 200))
       };
     }
 
@@ -94,7 +100,7 @@ export const dshAdapter = {
       instance_id: instanceId,
       kind: 'dsh',
       available: authStatus !== 'missing',
-      cli_version: combined.split(/\r?\n/)[0].slice(0, 120),
+      cli_version: versionFromProbe(res)?.slice(0, 120) ?? null,
       auth_status: authStatus,
       account_hint: cfg.label || cfg.profile || 'dsh-cli',
       capabilities: {
@@ -108,8 +114,7 @@ export const dshAdapter = {
     };
   },
 
-  buildArgs(cfg, { repoDir, runDir, taskFilePath, resumeSessionId }) {
-    const { cmd, prefix } = resolveDshCommand(cfg);
+  buildArgs(cfg, { repoDir, runDir, taskFilePath, resumeSessionId }, { cmd, prefix } = resolveDshCommand(cfg, repoDir)) {
     // Optional wrapper mode (e.g., invoke_dsh.py) when cfg.wrapper_mode === 'invoke_dsh'
     if (cfg.wrapper_mode === 'invoke_dsh') {
       const args = [...prefix, '--repo', repoDir, '--task-file', taskFilePath, '--output-dir', runDir];
@@ -126,7 +131,8 @@ export const dshAdapter = {
   },
 
   async dryRun({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, redactor }) {
-    const { cmd, args } = this.buildArgs(cfg || {}, { repoDir, runDir, taskFilePath, resumeSessionId });
+    const command = resolveDshCommand(cfg || {}, repoDir);
+    const { cmd, args } = this.buildArgs(cfg || {}, { repoDir, runDir, taskFilePath, resumeSessionId }, command);
     return writeDryRunReceipt(
       runDir,
       {
@@ -134,19 +140,25 @@ export const dshAdapter = {
         kind: 'dsh',
         stage,
         read_only: Boolean(readOnly),
-        executable: cmd,
+        executable: cmd ?? command.configured,
         args,
-        task_file: taskFilePath
+        task_file: taskFilePath,
+        ...(command.error && { warnings: [command.error] })
       },
       redactor
     );
   },
 
-  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor }) {
-    const { cmd, args, passStdin } = this.buildArgs(cfg || {}, { repoDir, runDir, taskFilePath, resumeSessionId });
+  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor,
+    resolvedCommand, executorVersion = null }) {
+    const command = resolvedCommand ?? resolveDshCommand(cfg || {}, repoDir);
+    const details = { instance_id: instanceId, kind: 'dsh', stage, read_only: Boolean(readOnly) };
+    if (command.error) return writeMissingExecutableResult(runDir, details, command.error, redactor);
+    const { cmd, args, passStdin } = this.buildArgs(cfg || {}, { repoDir, runDir, taskFilePath, resumeSessionId }, command);
     const stdinText = passStdin ? fs.readFileSync(taskFilePath, 'utf8') : undefined;
     const proc = await runAdapterProcess({
       command: cmd,
+      exactExecutable: true,
       args,
       cwd: repoDir,
       stdinText,
@@ -161,10 +173,9 @@ export const dshAdapter = {
     return writeRunResult(
       runDir,
       {
-        instance_id: instanceId,
-        kind: 'dsh',
-        stage,
-        read_only: Boolean(readOnly),
+        ...details,
+        executable_path: cmd,
+        executor_version: executorVersion,
         status: infraError ? 'infra_error' : (proc.exitCode === 0 ? 'completed' : 'failed'),
         exit_code: proc.exitCode,
         elapsed_seconds: proc.elapsedSeconds,

@@ -33,8 +33,9 @@ import { addLesson } from '../src/lessons.mjs';
 import { buildTaskPrompt, parseImplementBlockedReason, taskBriefWarnings } from '../src/task-builder.mjs';
 import { buildRedactor } from '../src/redact.mjs';
 import { generateEvidencePack } from '../src/evidence.mjs';
-import { classifyInfraError } from '../src/adapters/base.mjs';
+import { classifyInfraError, resolveExecutable } from '../src/adapters/base.mjs';
 import { codexAdapter } from '../src/adapters/codex.mjs';
+import { getAdapter } from '../src/adapters/index.mjs';
 import { getVerificationCommands } from '../src/verify.mjs';
 import { parseReviewReport } from '../src/review-report.mjs';
 import { scanReferences } from '../src/ref-scan.mjs';
@@ -952,6 +953,7 @@ test('running Codex dispatch keeps its task and route while final markdown produ
     fs.writeFileSync(mock, `
       const fs = require('node:fs');
       const args = process.argv.slice(2);
+      if (args.includes('--version')) { console.log('fixture-codex 1.0'); process.exit(0); }
       process.stdin.resume();
       console.log(JSON.stringify({ type: 'thread.started', thread_id: 'running-executor-session' }));
       fs.writeFileSync(${JSON.stringify(ready)}, 'ready');
@@ -1080,6 +1082,7 @@ test('a Codex reply reporting unfinished implementation pauses with options and 
     fs.writeFileSync(mock, `
       const fs = require('node:fs');
       const args = process.argv.slice(2);
+      if (args.includes('--version')) { console.log('fixture-codex 1.0'); process.exit(0); }
       fs.readFileSync(0, 'utf8');
       fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(args));
       fs.copyFileSync(${JSON.stringify(replyFile)}, args[args.indexOf('--output-last-message') + 1]);
@@ -1281,6 +1284,7 @@ test('continuing without a saved executor session warns and starts a fresh sessi
     fs.writeFileSync(mock, `
       const fs = require('node:fs');
       const args = process.argv.slice(2);
+      if (args.includes('--version')) { console.log('fixture-codex 1.0'); process.exit(0); }
       if (args.includes('resume')) process.exit(2);
       const task = fs.readFileSync(0, 'utf8');
       const continued = task.includes('## 接着写');
@@ -1462,6 +1466,7 @@ test('Claude dispatch uses the last string result for redacted scope todos and u
   const reply = '# Last reply\nfixture-private-marker\n\n## 超范围没改\n- src/other.mjs：补测试\n';
   try {
     fs.writeFileSync(mock, `
+      if (process.argv.includes('--version')) { console.log('fixture-claude 1.0'); process.exit(0); }
       require('node:fs').readFileSync(0, 'utf8');
       const emit = (event) => console.log(JSON.stringify(event));
       emit({ type: 'system', session_id: 'claude-session' });
@@ -1677,6 +1682,273 @@ test('infra failures (429/auth/timeout) NEVER consume repair budget; fallback on
     assert.equal(fb.ctx.state.packs.W01.tier1_repairs, 0);
   } finally {
     fs.rmSync(fb.repoDir, { recursive: true, force: true });
+  }
+});
+
+test('executable globs rank directory and filename versions numerically and keep only files', () => {
+  const dir = makeTempDir('grow-loop-executable-');
+  try {
+    const variants = ['26.1111.9664.0', '26.1120.6357.0', '9.0', '10.0'].map((version) => path.join(dir, `app_${version}`, 'x.exe'));
+    for (const file of variants) {
+      fs.mkdirSync(path.dirname(file));
+      fs.writeFileSync(file, 'fixture');
+    }
+    fs.mkdirSync(path.join(dir, 'app_99.0', 'x.exe'), { recursive: true });
+    const pattern = path.join(dir, 'app_*', 'x.exe');
+    assert.deepEqual(resolveExecutable(pattern), {
+      path: variants[1], pattern, candidates: [variants[1], variants[0], variants[3], variants[2]]
+    });
+
+    const file9 = path.join(dir, 'app_10.0', 'runner_[v]9.0.exe');
+    const file10 = path.join(dir, 'app_10.0', 'runner_[v]10.0.exe');
+    fs.writeFileSync(file9, 'fixture');
+    fs.writeFileSync(file10, 'fixture');
+    const filenamePattern = 'app_10.0/runner_[v]*.exe';
+    assert.deepEqual(resolveExecutable(filenamePattern, dir), {
+      path: file10, pattern: filenamePattern, candidates: [file10, file9]
+    });
+    assert.equal(resolveExecutable('app_*/runner_[v]*.exe', dir).path, file10);
+    assert.equal(resolveExecutable('literal.exe').path, 'literal.exe');
+
+    // The second pattern attempts readdir on an existing file.
+    for (const unmatched of [path.join(dir, 'app_*x.exe'), path.join(file9, 'app_*')]) {
+      assert.deepEqual(resolveExecutable(unmatched), { path: null, pattern: unmatched, candidates: [] });
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('all four external adapters stop before spawning when a configured executable is missing', async () => {
+  const dir = makeTempDir('grow-loop-executable-missing-');
+  try {
+    for (const kind of ['claude', 'codex', 'dsh', 'custom-cmd']) {
+      const adapter = getAdapter(kind);
+      for (const executable of [path.basename(process.execPath), path.join(dir, 'app_*', 'x.exe')]) {
+        const cfg = { executable };
+        const summary = `找不到执行程序：配置的是 ${executable}，没有匹配的文件。请检查安装或改 config.json 的 executable`;
+        const probe = await adapter.probe(kind, cfg, { cwd: dir });
+        assert.equal(probe.available, false);
+        assert.equal(probe.error, summary);
+
+        const runDir = fs.mkdtempSync(path.join(dir, `${kind}-`));
+        const input = { instanceId: kind, cfg, repoDir: dir, runDir, taskFilePath: path.join(dir, 'absent-task.md'), stage: 'implement' };
+        const preview = await adapter.dryRun(input);
+        assert.deepEqual(preview.warnings, [summary]);
+        const result = await adapter.run(input);
+        assert.equal(result.status, 'infra_error');
+        assert.equal(result.infra_error, 'INFRA_EXECUTABLE_NOT_FOUND');
+        assert.equal(result.summary, summary);
+        assert.equal(result.exit_code, null);
+        assert.equal(result.executable_path, null);
+        assert.equal(result.executor_version, null);
+        assert.deepEqual(fs.readdirSync(runDir).sort(), ['dry-run.json', 'result.json']);
+      }
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('all four external adapters use the latest glob match for probe, dry-run, and run', async () => {
+  const dir = makeTempDir('grow-loop executable-available-');
+  const originalPath = process.env.PATH;
+  try {
+    const windows = process.platform === 'win32';
+    const name = windows ? 'claude.exe' : 'claude';
+    const older = path.join(dir, 'app_9.0', name);
+    const latest = path.join(dir, 'app_10.0', name);
+    fs.mkdirSync(path.dirname(older));
+    fs.mkdirSync(path.dirname(latest));
+    fs.writeFileSync(older, 'must not be started');
+    if (windows) fs.copyFileSync(process.execPath, latest);
+    else fs.symlinkSync(process.execPath, latest);
+    const executable = `app_*/${name}`;
+    const mock = path.join(dir, 'executor.cjs');
+    const task = path.join(dir, 'task.md');
+    fs.writeFileSync(task, 'fixture task');
+    fs.writeFileSync(mock, `
+      const [first] = process.argv.slice(2);
+      if (['--version', '--fixture-version'].includes(first)) {
+        console.log('fixture 10.0');
+      } else if (first === 'login') {
+        console.log('Logged in');
+      } else {
+        const task = require('node:fs').readFileSync(0, 'utf8');
+        console.log('ran: ' + task);
+      }
+    `);
+    for (const kind of ['claude', 'codex', 'dsh', 'custom-cmd']) {
+      const adapter = getAdapter(kind);
+      const cfg = { executable, prefix_args: [mock], args: [mock] };
+      if (kind === 'dsh' || kind === 'custom-cmd') cfg.probe_args = [mock, '--fixture-version'];
+      const probe = await adapter.probe(kind, cfg, { cwd: dir });
+      assert.equal(probe.available, true, probe.error);
+      assert.equal(probe.cli_version, 'fixture 10.0');
+      const runDir = path.join(dir, kind);
+      const input = { instanceId: kind, cfg, repoDir: dir, runDir, taskFilePath: task, stage: 'implement' };
+      assert.equal((await adapter.dryRun(input)).executable, latest);
+      const result = await adapter.run(input);
+      assert.equal(result.status, 'completed');
+      assert.equal(result.executable_path, latest);
+      assert.match(fs.readFileSync(path.join(runDir, 'stdout.log'), 'utf8'), /ran: fixture task/);
+    }
+
+    process.env.PATH = [path.dirname(latest), originalPath ?? ''].join(path.delimiter);
+    const fromPath = await getAdapter('claude').probe('path-default', {}, { cwd: dir });
+    assert.equal(fromPath.available, true, fromPath.error);
+    assert.equal(fromPath.cli_version, process.version);
+    for (const configured of [name, '']) {
+      const explicitMissing = await getAdapter('claude').probe('configured', { executable: configured }, { cwd: dir });
+      assert.equal(explicitMissing.available, false);
+      assert.match(explicitMissing.error, /找不到执行程序/);
+    }
+    const shellProbe = await getAdapter('custom-cmd').probe('shell', { executable, shell: true }, { cwd: dir });
+    assert.equal(shellProbe.available, true, shellProbe.error);
+    assert.equal(shellProbe.cli_version, process.version);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a resolved Windows npm-style shim preserves its arguments when the path contains spaces', { skip: process.platform !== 'win32' }, async () => {
+  const dir = makeTempDir('grow-loop shim-');
+  try {
+    const shim = path.join(dir, 'app_10.0', 'fixture.cmd');
+    const mock = path.join(dir, 'fixture.cjs');
+    fs.mkdirSync(path.dirname(shim));
+    fs.writeFileSync(mock, 'console.log(JSON.stringify(process.argv.slice(2)));');
+    fs.writeFileSync(shim, `@echo off\r\n"${process.execPath}" "${mock}" %*\r\n`);
+    const args = ['--inspect-version', 'argument with spaces', 'quote "inside"', 'trailing slash\\'];
+    const cfg = { executable: 'app_*/fixture.cmd', probe_args: args, args, pass_stdin: false };
+    const adapter = getAdapter('custom-cmd');
+    const probe = await adapter.probe('shim', cfg, { cwd: dir });
+    assert.equal(probe.available, true, probe.error);
+    assert.deepEqual(JSON.parse(probe.cli_version), args);
+    const runDir = path.join(dir, 'run');
+    const result = await adapter.run({ instanceId: 'shim', cfg, repoDir: dir, runDir, stage: 'implement' });
+    assert.equal(result.status, 'completed');
+    assert.equal(result.executable_path, shim);
+    assert.deepEqual(readJsonSafe(result.final_md), args);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a missing executable pauses implementation and review with a Chinese reason and no repair charge', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['app.mjs'] }]);
+  const cli = (...args) => runCli(args, repoDir);
+  const executable = path.join(repoDir, 'missing_*', 'fixture.exe');
+  const summary = `找不到执行程序：配置的是 ${executable}，没有匹配的文件。请检查安装或改 config.json 的 executable`;
+  try {
+    ctx.config.routing.on_infra_failure = 'fallback';
+    ctx.config.executors['tier1-cli'] = { kind: 'codex', executable, fallback_instance: 'tier1-backup' };
+    ctx.config.executors['reviewer-cli'] = { kind: 'claude', executable };
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    cli('next');
+    const probe = cli('probe').instances.find(({ instance_id }) => instance_id === 'tier1-cli');
+    assert.equal(probe.available, false);
+    assert.equal(probe.error, summary);
+    assert.ok(cli('dispatch', '--dry-run').warnings.includes(summary));
+
+    const implementation = cli('dispatch');
+    assert.equal(implementation.result.infra_error, 'INFRA_EXECUTABLE_NOT_FOUND');
+    assert.equal(implementation.transition.outcome, 'paused_infra_blocked');
+    assert.equal(implementation.transition.gate.summary, summary);
+    assert.equal(implementation.question.kind, 'INFRA_BLOCKED');
+    assert.ok(implementation.question.body.includes(summary));
+    const shell = cli('status', '--format', 'shell');
+    assert.deepEqual(shell.question, implementation.question);
+    assert.equal(shell.packs[0].instance, 'tier1-cli');
+    assert.equal(shell.packs[0].tier1_repairs, 0);
+    assert.equal(shell.packs[0].tier2_repairs, 0);
+    const backup = shell.question.options.find(({ label }) => label.includes('tier1-backup'));
+    cli('answer', '--question', shell.question.id, '--option', backup.id);
+    cli('record', 'implement', '--passed');
+    cli('record', 'verify', '--passed', '--allow-self-report');
+
+    const review = cli('dispatch');
+    assert.equal(review.result.stage, 'review');
+    assert.equal(review.result.infra_error, 'INFRA_EXECUTABLE_NOT_FOUND');
+    assert.equal(review.question.kind, 'INFRA_BLOCKED');
+    assert.ok(review.question.body.includes(summary));
+    assert.equal(cli('status', '--format', 'shell').packs[0].review_rounds, 0);
+    assert.equal(cli('answer', '--question', review.question.id, '--option', 'retry').outcome, 'resumed_review');
+    assert.equal(cli('next').reviewer_instance, 'reviewer-cli');
+    const failures = readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'infra_failure');
+    assert.deepEqual(failures.map(({ summary, repair_budget_consumed }) => [summary, repair_budget_consumed]), [[summary, false], [summary, false]]);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('live dispatch records executor versions, warns on change, and proceeds when a version probe times out', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['app.mjs'] }], { probe: { timeout_ms: 1200 } });
+  const cli = (...args) => runCli(args, repoDir);
+  const mock = path.join(repoDir, 'executor.cjs');
+  const versionFile = path.join(repoDir, 'version.txt');
+  const probeCalls = path.join(repoDir, 'probe-calls.txt');
+  const executable = path.resolve(process.execPath);
+  try {
+    fs.writeFileSync(mock, `
+      const fs = require('node:fs');
+      if (process.argv[2] === '--fixture-version') {
+        fs.appendFileSync(${JSON.stringify(probeCalls)}, 'probe\\n');
+        const version = fs.readFileSync(${JSON.stringify(versionFile)}, 'utf8');
+        if (version === 'hang') setTimeout(() => console.log('late version'), 3500);
+        else console.log(version + '\\nignored second line');
+      } else {
+        process.stdin.resume();
+        console.log('completed task');
+      }
+    `);
+    ctx.config.executors['tier1-cli'] = {
+      kind: 'custom-cmd', executable, args: [mock], probe_args: [mock, '--fixture-version'], model: 'fixture-model'
+    };
+    writeJsonAtomic(ctx.paths.configPath, ctx.config);
+    cli('next');
+    fs.writeFileSync(versionFile, 'fixture 1.0');
+    const preview = cli('dispatch', '--dry-run');
+    assert.equal(preview.dry_run.executable, executable);
+    assert.equal(readJsonSafe(ctx.paths.statePath).executors_seen, undefined);
+    assert.equal(fs.existsSync(probeCalls), false);
+
+    function checkDispatch(run, expectedVersion) {
+      assert.equal(run.transition.outcome, 'ready_for_verify');
+      const result = readJsonSafe(path.join(run.run_dir, 'result.json'));
+      assert.equal(result.executable_path, executable);
+      assert.equal(result.executor_version, expectedVersion);
+      const start = readEvents(ctx.paths.eventsPath).find(({ type, run_id }) => type === 'dispatch_started' && run_id === run.run_id);
+      assert.equal(start.executable_path, executable);
+      assert.equal(start.executor_version, expectedVersion);
+      const { path: lastPath, version, at } = readJsonSafe(ctx.paths.statePath).executors_seen['tier1-cli'];
+      assert.equal(lastPath, executable);
+      assert.equal(version, expectedVersion);
+      assert.ok(Number.isFinite(Date.parse(at)));
+    }
+
+    const first = cli('dispatch');
+    checkDispatch(first, 'fixture 1.0');
+    assert.equal(first.run_id, preview.run_id);
+    assert.match(fs.readFileSync(cli('evidence').path, 'utf8'), /#### 执行程序换版本\r?\n\r?\n无/);
+    fs.writeFileSync(versionFile, 'fixture 2.0');
+    const second = cli('dispatch');
+    checkDispatch(second, 'fixture 2.0');
+    assert.ok(second.warnings.includes('tier1-cli 的程序换了：fixture 1.0 → fixture 2.0'));
+    const changes = readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'executor_version_changed');
+    assert.deepEqual(changes.map(({ run_id, old_path, new_path, old_version, new_version }) =>
+      [run_id, old_path, new_path, old_version, new_version]), [[second.run_id, executable, executable, 'fixture 1.0', 'fixture 2.0']]);
+    const evidence = fs.readFileSync(cli('evidence').path, 'utf8');
+    assert.ok(evidence.includes('tier1-cli · custom-cmd / fixture-model · 版本 fixture 2.0'));
+    assert.ok(evidence.includes(`| tier1-cli | ${executable} | ${executable} | fixture 1.0 | fixture 2.0 |`));
+
+    fs.writeFileSync(versionFile, 'hang');
+    checkDispatch(cli('dispatch'), null);
+    assert.equal(fs.readFileSync(probeCalls, 'utf8'), 'probe\n'.repeat(3));
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
 
@@ -2264,6 +2536,7 @@ test('dispatch records valid reviews, rejects invalid reports, and settles in-ro
     fs.writeFileSync(mock, `
       const fs = require('node:fs');
       const args = process.argv.slice(2);
+      if (args.includes('--version')) { console.log('fixture-codex 1.0'); process.exit(0); }
       process.stdin.resume();
       if (args[args.indexOf('--sandbox') + 1] !== 'read-only') throw new Error('Reviewer must be read-only');
       fs.copyFileSync(${JSON.stringify(report)}, args[args.indexOf('--output-last-message') + 1]);
@@ -3146,6 +3419,7 @@ test('Codex saves a split thread.started event before exit and resumes after int
     fs.writeFileSync(mock, [
       "const fs = require('node:fs');",
       'const args = process.argv.slice(2);',
+      'if (args.includes("--version")) { console.log("fixture-codex 1.0"); process.exit(0); }',
       'const marker = ' + JSON.stringify(marker) + ';',
       'const finish = ' + JSON.stringify(finish) + ';',
       'const id = ' + JSON.stringify(session) + ';',
@@ -3318,6 +3592,7 @@ test('self dispatch records implementation and review time and commit checks fla
     fs.writeFileSync(providedTask, 'fixture supplied task');
     fs.writeFileSync(mock, [
       "const fs = require('node:fs');",
+      'if (process.argv.includes("--version")) { console.log("fixture-codex 1.0"); process.exit(0); }',
       'if (fs.readFileSync(0, "utf8") !== "fixture supplied task") process.exit(5);',
       'fs.writeFileSync("next.js", "export const next = 3;");',
       'fs.writeFileSync("approved.log", "fixture scope");',

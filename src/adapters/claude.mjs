@@ -1,16 +1,19 @@
 import fs from 'node:fs';
 import {
   classifyInfraError,
+  probeExecutable,
+  resolveExecutorCommand,
   runAdapterProcess,
-  runBoundedCommand,
+  versionFromProbe,
   writeDryRunReceipt,
   writeFinalMarkdown,
+  writeMissingExecutableResult,
   writeRunResult
 } from './base.mjs';
 
-function resolveClaudeCommand(cfg) {
-  if (cfg.executable) return { cmd: cfg.executable, prefix: cfg.prefix_args || [] };
-  return { cmd: 'claude', prefix: [] };
+function resolveClaudeCommand(cfg, cwd) {
+  const prefix = cfg.executable ? cfg.prefix_args || [] : [];
+  return { ...resolveExecutorCommand(cfg.executable, 'claude', cwd), prefix, probeArgs: [...prefix, '--version'] };
 }
 
 function parseClaudeJson(stdoutPath) {
@@ -39,11 +42,11 @@ function parseClaudeJson(stdoutPath) {
  */
 export const claudeAdapter = {
   kind: 'claude',
+  resolveCommand: resolveClaudeCommand,
 
   async probe(instanceId, cfg = {}, opts = {}) {
-    const { cmd, prefix } = resolveClaudeCommand(cfg);
-    const timeoutMs = opts.timeoutMs ?? 8000;
-    const ver = await runBoundedCommand(cmd, [...prefix, '--version'], { timeoutMs });
+    const command = resolveClaudeCommand(cfg, opts.cwd);
+    const ver = await probeExecutable(command, opts);
 
     if (!ver.ok) {
       return {
@@ -55,7 +58,7 @@ export const claudeAdapter = {
         account_hint: null,
         capabilities: { read_only: true, resume: true, jsonl: true, sandbox: 'permission-mode' },
         latency_ms: ver.latencyMs,
-        error: ver.timedOut ? 'probe_timeout' : (ver.stderr || 'claude_cli_not_found').trim().slice(0, 200)
+        error: command.error ?? (ver.timedOut ? 'probe_timeout' : (ver.stderr || 'claude_cli_not_found').trim().slice(0, 200))
       };
     }
 
@@ -63,7 +66,7 @@ export const claudeAdapter = {
       instance_id: instanceId,
       kind: 'claude',
       available: true,
-      cli_version: (ver.stdout || ver.stderr).trim().split(/\r?\n/)[0],
+      cli_version: versionFromProbe(ver),
       auth_status: 'configured_unverified',
       account_hint: cfg.label || cfg.model || 'claude-cli',
       capabilities: {
@@ -77,8 +80,7 @@ export const claudeAdapter = {
     };
   },
 
-  buildArgs(cfg, { readOnly, resumeSessionId }) {
-    const { cmd, prefix } = resolveClaudeCommand(cfg);
+  buildArgs(cfg, { readOnly, resumeSessionId }, { cmd, prefix } = resolveClaudeCommand(cfg)) {
     const args = [...prefix, '-p', '--output-format', 'stream-json'];
     if (readOnly) {
       args.push('--permission-mode', 'plan');
@@ -91,8 +93,9 @@ export const claudeAdapter = {
     return { cmd, args };
   },
 
-  async dryRun({ instanceId, cfg, runDir, taskFilePath, stage, readOnly, resumeSessionId, redactor }) {
-    const { cmd, args } = this.buildArgs(cfg || {}, { readOnly, resumeSessionId });
+  async dryRun({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, redactor }) {
+    const command = resolveClaudeCommand(cfg || {}, repoDir);
+    const { cmd, args } = this.buildArgs(cfg || {}, { readOnly, resumeSessionId }, command);
     return writeDryRunReceipt(
       runDir,
       {
@@ -100,19 +103,25 @@ export const claudeAdapter = {
         kind: 'claude',
         stage,
         read_only: Boolean(readOnly),
-        executable: cmd,
+        executable: cmd ?? command.configured,
         args,
-        task_file: taskFilePath
+        task_file: taskFilePath,
+        ...(command.error && { warnings: [command.error] })
       },
       redactor
     );
   },
 
-  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor }) {
-    const { cmd, args } = this.buildArgs(cfg || {}, { readOnly, resumeSessionId });
+  async run({ instanceId, cfg, repoDir, runDir, taskFilePath, stage, readOnly, resumeSessionId, timeoutSec, redactor,
+    resolvedCommand, executorVersion = null }) {
+    const command = resolvedCommand ?? resolveClaudeCommand(cfg || {}, repoDir);
+    const details = { instance_id: instanceId, kind: 'claude', stage, read_only: Boolean(readOnly) };
+    if (command.error) return writeMissingExecutableResult(runDir, details, command.error, redactor);
+    const { cmd, args } = this.buildArgs(cfg || {}, { readOnly, resumeSessionId }, command);
     const stdinText = fs.readFileSync(taskFilePath, 'utf8');
     const proc = await runAdapterProcess({
       command: cmd,
+      exactExecutable: true,
       args,
       cwd: repoDir,
       stdinText,
@@ -128,10 +137,9 @@ export const claudeAdapter = {
     return writeRunResult(
       runDir,
       {
-        instance_id: instanceId,
-        kind: 'claude',
-        stage,
-        read_only: Boolean(readOnly),
+        ...details,
+        executable_path: cmd,
+        executor_version: executorVersion,
         status: infraError ? 'infra_error' : (proc.exitCode === 0 ? 'completed' : 'failed'),
         exit_code: proc.exitCode,
         elapsed_seconds: proc.elapsedSeconds,

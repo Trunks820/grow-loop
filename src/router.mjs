@@ -9,7 +9,7 @@ import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
 import { addLesson, closeLessonsForPack, deferInRoundTechDebt, recordReviewTechDebt, removeLesson, selectLessonsForPack } from './lessons.mjs';
 import { getBlockingReviewSeverities } from './review-report.mjs';
 import { checkExternalCommits, readCommitFiles, readGitPosition, readWorktreeSnapshot, scanCommitScope, scanOutOfScopeChanges } from './git-watch.mjs';
-import { writeRunResult } from './adapters/base.mjs';
+import { EXECUTABLE_NOT_FOUND, writeRunResult } from './adapters/base.mjs';
 import { buildQuestion, dispatchStillRunning, NEXT_COMMANDS } from './shell-api.mjs';
 
 const PREFLIGHT_GATE_REASONS = new Set([
@@ -34,10 +34,10 @@ export function getBudgets(config) {
   };
 }
 
-export function resolveTierInstance(config, tier) {
+export function resolveTierInstance(config, tier, pack) {
   const routing = config?.routing || {};
   if (tier === 'reviewer') {
-    return routing.reviewer || routing.tier2 || routing.tier1 || 'self';
+    return pack?.review_instance || routing.reviewer || routing.tier2 || routing.tier1 || 'self';
   }
   if (tier === 'tier2') {
     return routing.tier2 || routing.tier1 || 'self';
@@ -321,7 +321,7 @@ export function buildNextDirective(ctx, pack, packDef) {
 
   if (pack.status === 'REVIEW') {
     const nextRound = pack.review_rounds + 1;
-    const reviewerInstance = resolveTierInstance(config, 'reviewer');
+    const reviewerInstance = resolveTierInstance(config, 'reviewer', pack);
     return {
       action: 'REVIEW',
       ...packInfo,
@@ -521,6 +521,11 @@ function getWritablePack(ctx, packId) {
     error.question = buildQuestion(ctx, pack);
     throw error;
   }
+  if (pack.gate?.infra_error === EXECUTABLE_NOT_FOUND) {
+    const error = new Error(pack.gate.summary);
+    error.question = buildQuestion(ctx, pack);
+    throw error;
+  }
   requireHandoffPreflight(pack, getPackDef(manifest, pack.id), ctx);
   return pack;
 }
@@ -557,6 +562,54 @@ function completeSelfRun(ctx, pack, stage, payload, status, instance) {
   return { executor, selfRunId: run.run_id };
 }
 
+export function recordInfraFailure(ctx, pack, { instance, infraError, summary, canFallback = false, stage = 'implement' }) {
+  const { stateDir, config, state } = ctx;
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  const reason = redactor.redactString(summary || infraError);
+  const missingExecutable = infraError === EXECUTABLE_NOT_FOUND;
+  pack.infra_failures = (pack.infra_failures ?? 0) + 1;
+  appendEvent(stateDir, config, {
+    type: 'infra_failure',
+    pack_id: pack.id,
+    instance,
+    error_class: infraError,
+    summary: reason,
+    repair_budget_consumed: false
+  });
+
+  const fallback = config?.executors?.[instance]?.fallback_instance;
+  if (!missingExecutable && canFallback && config?.routing?.on_infra_failure === 'fallback' && fallback && config?.executors?.[fallback]) {
+    const prev = pack.active_instance;
+    pack.active_instance = fallback;
+    invalidateSession(pack);
+    pack.status = 'IMPLEMENT';
+    appendEvent(stateDir, config, {
+      type: 'infra_fallback',
+      pack_id: pack.id,
+      from_instance: prev,
+      to_instance: pack.active_instance,
+      trigger: infraError
+    });
+    saveState(stateDir, state);
+    return { outcome: 'infra_fallback', active_instance: pack.active_instance };
+  }
+
+  const gateSummary = missingExecutable ? reason
+    : redactor.redactString(`Executor "${instance}" hit infrastructure failure (${infraError}): ${summary || ''}. Repair budget was NOT consumed.`);
+  pack.status = 'PAUSED_FOR_HUMAN';
+  pack.gate = createGate(ALLOWED_GATE_REASONS.INFRA_BLOCKED, gateSummary, {
+    recommended_action: 'fix_cli_or_switch_instance',
+    allowed_resume_actions: ['retry', 'switch_instance', 'abort']
+  });
+  if (missingExecutable) pack.gate.infra_error = infraError;
+  if (stage === 'review') {
+    pack.gate.resume_status = 'REVIEW';
+    pack.review_instance = instance;
+  }
+  saveState(stateDir, state);
+  return { outcome: 'paused_infra_blocked', gate: pack.gate, question: buildQuestion(ctx, pack) };
+}
+
 export function recordImplementOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
   const pack = getWritablePack(ctx, payload.packId);
@@ -580,45 +633,9 @@ export function recordImplementOutcome(ctx, payload) {
 
   // Infrastructure failure immunity: NEVER consumes tier1/tier2 repair budgets
   if (payload.infraError) {
-    pack.infra_failures += 1;
-    appendEvent(stateDir, config, {
-      type: 'infra_failure',
-      pack_id: pack.id,
-      instance: runInstance,
-      error_class: payload.infraError,
-      summary: payload.summary || payload.infraError,
-      repair_budget_consumed: false
+    return recordInfraFailure(ctx, pack, {
+      instance: runInstance, infraError: payload.infraError, summary: payload.summary, canFallback: canResume
     });
-
-    const instanceCfg = config?.executors?.[runInstance] || {};
-    const onInfra = config?.routing?.on_infra_failure || 'pause_for_human';
-    if (canResume && onInfra === 'fallback' && instanceCfg.fallback_instance && config?.executors?.[instanceCfg.fallback_instance]) {
-      const prev = pack.active_instance;
-      pack.active_instance = instanceCfg.fallback_instance;
-      invalidateSession(pack);
-      pack.status = 'IMPLEMENT';
-      appendEvent(stateDir, config, {
-        type: 'infra_fallback',
-        pack_id: pack.id,
-        from_instance: prev,
-        to_instance: pack.active_instance,
-        trigger: payload.infraError
-      });
-      saveState(stateDir, state);
-      return { outcome: 'infra_fallback', active_instance: pack.active_instance };
-    }
-
-    pack.status = 'PAUSED_FOR_HUMAN';
-    pack.gate = createGate(
-      ALLOWED_GATE_REASONS.INFRA_BLOCKED,
-      `Executor "${runInstance}" hit infrastructure failure (${payload.infraError}): ${payload.summary || ''}. Repair budget was NOT consumed.`,
-      {
-        recommended_action: 'fix_cli_or_switch_instance',
-        allowed_resume_actions: ['retry', 'switch_instance', 'abort']
-      }
-    );
-    saveState(stateDir, state);
-    return { outcome: 'paused_infra_blocked', gate: pack.gate, question: buildQuestion(ctx, pack) };
   }
 
   if (payload.blockedReason) {
@@ -835,6 +852,7 @@ export function recordReviewOutcome(ctx, payload) {
   const reviewerModel = payload.reviewerModel === undefined ? executor.executor_model : payload.reviewerModel;
   const summary = redactor.redactString(payload.summary || '');
 
+  delete pack.review_instance;
   pack.review_rounds += 1;
   const findings = Array.isArray(payload.findings) ? payload.findings : [];
   const blocking = [];
@@ -1199,6 +1217,16 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   } else if (act === 'continue') {
     throw new Error('Use --action continue for an EXECUTOR_BLOCKED gate.');
   }
+  const retryReview = gateReason === ALLOWED_GATE_REASONS.INFRA_BLOCKED && prevGate.resume_status === 'REVIEW';
+  if (prevGate?.infra_error === EXECUTABLE_NOT_FOUND) {
+    if (!prevGate.allowed_resume_actions.includes(act)) {
+      throw new Error('Use --action retry, switch_instance or abort for an INFRA_BLOCKED gate.');
+    }
+    const failedInstance = retryReview ? pack.review_instance : pack.active_instance;
+    if (act === 'switch_instance' && (instance === failedInstance || !Object.hasOwn(config?.executors ?? {}, instance))) {
+      throw new Error('Choose a different configured executor with --instance.');
+    }
+  }
   if (gateReason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
     if (!prevGate.allowed_resume_actions.includes(act)) {
       throw new Error('Use --action approve or abort for an EXTERNAL_COMMIT gate.');
@@ -1239,6 +1267,18 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
     pack.status = 'READY_TO_COMMIT';
     saveState(stateDir, state);
     return { outcome: 'ready_to_commit', pack_id: pack.id };
+  }
+
+  if (retryReview && (act === 'retry' || act === 'switch_instance')) {
+    if (act === 'switch_instance') pack.review_instance = instance;
+    pack.gate = null;
+    pack.status = 'REVIEW';
+    saveState(stateDir, state);
+    return {
+      outcome: act === 'retry' ? 'resumed_review' : 'switched_instance',
+      pack_id: pack.id,
+      reviewer_instance: redactor.redactString(pack.review_instance)
+    };
   }
 
   if (act === 'switch_instance') {
