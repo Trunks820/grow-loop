@@ -362,12 +362,13 @@ export function buildNextDirective(ctx, pack, packDef) {
   };
 }
 
-function pauseForOutOfScopeChange(ctx, pack, resumeStatus, scan) {
+function pauseForOutOfScopeChange(ctx, pack, resumeStatus, scan, previousGate) {
   const { stateDir, config, state } = ctx;
   const reason = ALLOWED_GATE_REASONS.OUT_OF_SCOPE_CHANGE;
-  const summary = '发现本包范围外的改动。请决定扩大范围、撤掉改动或终止流程。';
+  const summary = previousGate?.summary ?? '发现本包范围外的改动。请决定扩大范围、确认已撤掉改动、放行非本包改动或终止流程。';
+  const actions = previousGate?.allowed_resume_actions ?? ['expand', 'revert', 'ignore', 'abort'];
   pack.gate = {
-    ...createGate(reason, summary, { allowed_resume_actions: ['expand', 'revert', 'abort'] }),
+    ...createGate(reason, summary, { allowed_resume_actions: actions }),
     out_of_scope_files: scan.files,
     resume_status: resumeStatus,
     ...(scan.notices.worktree_notice && { worktree_notice: scan.notices.worktree_notice })
@@ -1078,6 +1079,7 @@ function resumeOutOfScopeChange(ctx, pack, packDef, action, decision) {
   const { stateDir, config, state } = ctx;
   const gate = pack.gate;
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  let previousIgnore;
   if (action === 'expand') {
     if (typeof decision !== 'string' || !decision.trim()) {
       throw outOfScopeGateError(ctx, pack, '扩大范围需要填写非空的 --decision 原话。');
@@ -1094,27 +1096,46 @@ function resumeOutOfScopeChange(ctx, pack, packDef, action, decision) {
       Object.assign(pack, previousApproval);
       throw error;
     }
-  }
-
-  const scan = scanOutOfScopeChanges(ctx, pack, getPackDef(ctx.manifest, pack.id));
-  if (action === 'revert') {
-    if (scan.files === null) throw outOfScopeGateError(ctx, pack, 'Git 无法读取当前工作区，无法确认越界改动已撤掉。');
-    if (scan.files.length) {
-      if (!isDeepStrictEqual(scan.files, gate.out_of_scope_files)) {
-        pauseForOutOfScopeChange(ctx, pack, gate.resume_status, scan);
-      }
-      const files = scan.files.map(({ path: file }) => redactor.redactString(file)).join('、');
-      throw outOfScopeGateError(ctx, pack, `仍有范围外的改动。请撤掉这些改动后再继续：${files}`);
+  } else if (action === 'ignore') {
+    if (typeof decision !== 'string' || !decision.trim()) {
+      throw outOfScopeGateError(ctx, pack, '放行非本包改动需要填写非空的 --decision 原话。');
     }
+    const snapshot = readWorktreeSnapshot(state.repo_dir, gate.out_of_scope_files.map(({ path: file }) => file));
+    if (snapshot === null) throw outOfScopeGateError(ctx, pack, 'Git 无法读取当前工作区内容，无法放行这些改动。');
+    previousIgnore = { start_worktree: pack.start_worktree, decisions: pack.decisions, gate, status: pack.status };
+    pack.start_worktree = { ...pack.start_worktree, ...snapshot };
+    pack.decisions = [...(pack.decisions ?? []), {
+      gate_reason: gate.reason, action, decision: redactor.redactString(decision), at: new Date().toISOString()
+    }];
   }
 
-  recordGateResume(ctx, pack, action, decision);
-  if (scan.files?.length) return outOfScopeOutcome(ctx, pack, gate.resume_status, scan);
-  pack.gate = null;
-  pack.status = gate.resume_status;
-  saveState(stateDir, state);
-  const outcome = pack.status === 'VERIFY' ? 'ready_for_verify' : 'ready_to_commit';
-  return { outcome, pack_id: pack.id, status: pack.status, ...scan.notices };
+  try {
+    const scan = scanOutOfScopeChanges(ctx, pack, getPackDef(ctx.manifest, pack.id));
+    if (action === 'ignore' && scan.notices.worktree_notice) {
+      throw outOfScopeGateError(ctx, pack, 'Git 无法复查当前工作区内容，无法放行这些改动。');
+    }
+    if (action === 'revert') {
+      if (scan.files === null) throw outOfScopeGateError(ctx, pack, 'Git 无法读取当前工作区，无法确认越界改动已撤掉。');
+      if (scan.files.length) {
+        if (!isDeepStrictEqual(scan.files, gate.out_of_scope_files)) {
+          pauseForOutOfScopeChange(ctx, pack, gate.resume_status, scan, gate);
+        }
+        const files = scan.files.map(({ path: file }) => redactor.redactString(file)).join('、');
+        throw outOfScopeGateError(ctx, pack, `仍有范围外的改动。请撤掉这些改动后再继续：${files}`);
+      }
+    }
+
+    recordGateResume(ctx, pack, action, decision);
+    if (scan.files?.length) return outOfScopeOutcome(ctx, pack, gate.resume_status, scan);
+    pack.gate = null;
+    pack.status = gate.resume_status;
+    saveState(stateDir, state);
+    const outcome = pack.status === 'VERIFY' ? 'ready_for_verify' : 'ready_to_commit';
+    return { outcome, pack_id: pack.id, status: pack.status, ...scan.notices };
+  } catch (error) {
+    if (previousIgnore) Object.assign(pack, previousIgnore);
+    throw error;
+  }
 }
 
 export function resumeFromGate(ctx, { packId, action, decision, instance }) {
@@ -1135,11 +1156,11 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   let approvedPosition = null;
   if (gateReason === ALLOWED_GATE_REASONS.OUT_OF_SCOPE_CHANGE) {
     if (!prevGate.allowed_resume_actions.includes(act)) {
-      throw outOfScopeGateError(ctx, pack, '请为 OUT_OF_SCOPE_CHANGE 选择 --action expand、revert 或 abort。');
+      throw outOfScopeGateError(ctx, pack, `请为 OUT_OF_SCOPE_CHANGE 选择 --action ${prevGate.allowed_resume_actions.join('、')} 中的一项。`);
     }
     if (act !== 'abort') return resumeOutOfScopeChange(ctx, pack, packDef, act, decision);
-  } else if (act === 'expand' || act === 'revert') {
-    throw new Error('expand 和 revert 适用于 OUT_OF_SCOPE_CHANGE 关口。');
+  } else if (['expand', 'revert', 'ignore'].includes(act)) {
+    throw new Error('expand、revert 和 ignore 适用于 OUT_OF_SCOPE_CHANGE 关口。');
   }
   if (gateReason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED) {
     if (!prevGate.allowed_resume_actions.includes(act)) {

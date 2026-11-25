@@ -56,10 +56,11 @@ const GATE_COPY = {
     approve: ['接受这些外部提交并从原阶段继续', '请填写核对结果和放行理由。']
   },
   OUT_OF_SCOPE_CHANGE: {
-    title: '本包改到了范围外的文件',
+    title: '发现本包范围外的改动',
     body: '请核对以下文件及其 Git 状态。处理后会从暂停前的阶段继续。',
     expand: ['把这些文件加进本包范围，继续', '请填写同意扩大范围的原话。'],
-    revert: ['我已撤掉这些改动，继续']
+    revert: ['我已撤掉这些改动，继续'],
+    ignore: ['这些不是本包改的，放行', '请填写确认这些改动不属于本包的原话。']
   },
   RELEASE: {
     title: '发布相关操作需要你批准',
@@ -130,6 +131,15 @@ function switchOptionId(instance) {
   return `switch_instance:${fingerprint(instance)}`;
 }
 
+function gitStatusLabel(status) {
+  if (status === '??') return '新增（未跟踪）';
+  if (status.includes('U')) return '冲突';
+  if (status.includes('D')) return '删除';
+  if (status.includes('A')) return '新增';
+  if (status.includes('M')) return '修改';
+  return status;
+}
+
 function gateQuestion(ctx, pack) {
   const { gate } = pack;
   const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
@@ -149,8 +159,13 @@ function gateQuestion(ctx, pack) {
       '冲突文件', bullets(gate.conflicting_files ?? []));
   }
   if (gate.reason === 'OUT_OF_SCOPE_CHANGE') {
-    body.push(bullets(gate.out_of_scope_files.map(({ path, status }) => `${path}（${status}）`)));
-    if (gate.worktree_notice) body.push(gate.worktree_notice);
+    body.push(bullets(gate.out_of_scope_files.map(({ path, status }) => `${path}（${gitStatusLabel(status)}）`)));
+    if (gate.worktree_notice) {
+      body.push(gate.worktree_notice);
+      if (gate.allowed_resume_actions?.includes('ignore')) {
+        body.push('这些文件里可能有开工前就改过的，不是本包改的请选「这些不是本包改的，放行」');
+      }
+    }
   }
   const options = (gate.allowed_resume_actions ?? []).flatMap((action) => {
     if (action === 'switch_instance') {

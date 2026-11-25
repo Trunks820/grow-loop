@@ -66,9 +66,13 @@ function hashWorktreeChanges(repoDir, changes) {
   return snapshot;
 }
 
-export function readWorktreeSnapshot(repoDir) {
+export function readWorktreeSnapshot(repoDir, files) {
   const changes = readWorktreeChanges(repoDir);
-  return changes === null ? null : hashWorktreeChanges(repoDir, changes);
+  if (changes === null) return null;
+  if (!files) return hashWorktreeChanges(repoDir, changes);
+
+  const byPath = new Map(changes.map((change) => [change.path, change]));
+  return hashWorktreeChanges(repoDir, files.map((file) => byPath.get(file) ?? { path: file, status: '' }));
 }
 
 export function readGitPosition(repoDir) {

@@ -86,7 +86,7 @@ At `PAUSE_FOR_HUMAN` or a pending manifest change, use `grow-loop status --forma
 
 At `EXECUTOR_BLOCKED`, present the executor's reason and wait for the human to choose whether to retry after resolving the blocker, verify the existing changes, switch executors, or abort.
 
-At `OUT_OF_SCOPE_CHANGE`, show the listed files and wait for the human to approve expanding scope, confirm the changes were reverted, or abort.
+At `OUT_OF_SCOPE_CHANGE`, show the listed files and wait for the human to approve expanding scope, confirm the changes were reverted, confirm in their own words that the changes came from outside this package so work can continue, or abort.
 
 ```sh
 grow-loop dispatch --stage implement --dry-run

@@ -3250,9 +3250,11 @@ test('out-of-scope changes are measured from startup and expand requires a recor
     assert.deepEqual(readEvents(ctx.paths.eventsPath).find(({ type }) => type === 'out_of_scope_detected').files, files);
     assert.deepEqual(cli('status', '--format', 'shell').question, paused.question);
     assert.equal(paused.question.kind, 'OUT_OF_SCOPE_CHANGE');
-    assert.match(paused.question.body, /deleted later\.mjs（ D）/);
+    assert.match(paused.question.body, /changed later\.mjs（修改）/);
+    assert.match(paused.question.body, /deleted later\.mjs（删除）/);
+    assert.match(paused.question.body, /extra\[ab\]\.mjs（新增（未跟踪））/);
     assert.deepEqual(paused.question.options.map(({ id, needs_text }) => [id, needs_text]),
-      [['expand', true], ['revert', false], ['abort', false]]);
+      [['expand', true], ['revert', false], ['ignore', true], ['abort', false]]);
     assert.equal(cli('verify').question.id, paused.question.id);
     assert.equal(cli('dispatch', '--dry-run').question.id, paused.question.id);
     assert.equal(cli('record', 'verify', '--passed').question.id, paused.question.id);
@@ -3301,6 +3303,91 @@ test('out-of-scope changes are measured from startup and expand requires a recor
   }
 });
 
+test('ignoring out-of-scope changes updates the snapshot without approving files for commit', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['app.mjs'] }]);
+  const cli = (...args) => runCli(args, repoDir);
+  const fail = (...args) => runCliFailure(args, repoDir);
+  const write = (file, content) => fs.writeFileSync(path.join(repoDir, file), content);
+  const saved = () => readJsonSafe(ctx.paths.statePath).packs.A;
+  const events = () => readEvents(ctx.paths.eventsPath);
+  try {
+    fixtureGit(repoDir, 'init');
+    for (const file of ['app.mjs', 'personal.mjs', 'removed.mjs']) write(file, 'fixture baseline');
+    fixtureCommit(repoDir, 'fixture baseline', 'app.mjs', 'personal.mjs', 'removed.mjs');
+    assert.equal(cli('next').action, 'IMPLEMENT');
+    write('app.mjs', 'fixture package change');
+    write('personal.mjs', 'fixture outside change');
+    fs.unlinkSync(path.join(repoDir, 'removed.mjs'));
+
+    const paused = cli('record', 'implement', '--passed');
+    assert.equal(paused.gate.resume_status, 'VERIFY');
+    const option = paused.question.options.find(({ id }) => id === 'ignore');
+    assert.equal(option.label, '这些不是本包改的，放行');
+    assert.equal(option.needs_text, true);
+    const answer = ['answer', '--question', paused.question.id, '--option', 'ignore'];
+    const before = saved();
+    assert.match(fail(...answer).stderr, /非空的 --text/);
+    assert.match(fail('resume', '--action', 'ignore').stderr, /非空的 --decision/);
+    assert.match(fail('resume', '--action', 'ignore', '--decision', '   ').stderr, /非空的 --decision/);
+
+    const decision = '  这些是我在执行期间手动改的。\n请保留这些文件。  ';
+    const gitDir = path.join(repoDir, '.git');
+    const unavailableGitDir = path.join(repoDir, '.git-unavailable');
+    fs.renameSync(gitDir, unavailableGitDir);
+    try {
+      assert.match(fail(...answer, '--text', decision).stderr, /无法读取当前工作区内容/);
+    } finally {
+      fs.renameSync(unavailableGitDir, gitDir);
+    }
+    assert.deepEqual(saved(), before);
+    assert.equal(events().some(({ type, action }) => type === 'gate_resumed' && action === 'ignore'), false);
+
+    write('personal.mjs', 'fixture outside change updated while paused');
+    assert.equal(cli(...answer, '--text', decision).status, 'VERIFY');
+    const resumed = saved();
+    assert.deepEqual(resumed.start_worktree, {
+      ...before.start_worktree,
+      'personal.mjs': fixtureGit(repoDir, 'hash-object', 'personal.mjs'),
+      'removed.mjs': null
+    });
+    assert.equal(resumed.gate, null);
+    assert.deepEqual(resumed.approved_out_of_scope, before.approved_out_of_scope);
+    assert.deepEqual(loadWorkspace(repoDir).manifest.packs[0].scope_files, ['app.mjs']);
+    assert.equal(resumed.decisions.at(-1).action, 'ignore');
+    assert.equal(resumed.decisions.at(-1).decision, decision);
+    const event = events().find(({ type, action }) => type === 'gate_resumed' && action === 'ignore');
+    assert.equal(event.decision, decision);
+    assert.equal(event.gate_reason, 'OUT_OF_SCOPE_CHANGE');
+
+    cli('record', 'verify', '--passed', '--allow-self-report');
+    cli('record', 'review', '--verdict', 'pass');
+    assert.equal(cli('next').action, 'COMMIT');
+    write('personal.mjs', 'fixture outside change after ignore');
+    const pausedAgain = cli('next');
+    assert.equal(pausedAgain.gate.resume_status, 'READY_TO_COMMIT');
+    assert.deepEqual(pausedAgain.gate.out_of_scope_files, [{ path: 'personal.mjs', status: ' M' }]);
+
+    write('late.mjs', 'fixture change after the gate was opened');
+    fixtureGit(repoDir, 'add', '--', 'late.mjs');
+    const pending = cli('resume', '--action', 'ignore', '--decision', '这次仍然是我手动修改的。');
+    assert.equal(pending.outcome, 'paused_out_of_scope_change');
+    assert.equal(pending.gate.resume_status, 'READY_TO_COMMIT');
+    assert.deepEqual(pending.gate.out_of_scope_files, [{ path: 'late.mjs', status: 'A ' }]);
+    assert.match(pending.question.body, /late\.mjs（新增）/);
+    fixtureGit(repoDir, 'rm', '-f', '--', 'late.mjs');
+    assert.equal(cli('resume', '--action', 'revert').status, 'READY_TO_COMMIT');
+
+    fixtureCommit(repoDir, 'fixture commit with ignored file', 'app.mjs', 'personal.mjs');
+    const rejected = fail('record', 'commit', '--from-git');
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, /本次提交包含未批准的范围外文件。\s+- personal\.mjs/);
+    assert.equal(saved().status, 'READY_TO_COMMIT');
+    assert.equal(saved().commit, null);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('executor approval pauses for out-of-scope changes and revert rechecks the worktree', () => {
   const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['app.mjs'] }]);
   try {
@@ -3326,6 +3413,48 @@ test('executor approval pauses for out-of-scope changes and revert rechecks the 
     fs.unlinkSync(stray);
     assert.equal(cli('resume', '--action', 'revert').status, 'VERIFY');
     assert.equal(cli('status', '--format', 'shell').question, null);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('an existing out-of-scope gate can be answered with its original actions', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['app.mjs'] }]);
+  const cli = (...args) => runCli(args, repoDir);
+  try {
+    fixtureGit(repoDir, 'init');
+    fs.writeFileSync(path.join(repoDir, 'app.mjs'), 'fixture baseline');
+    fixtureCommit(repoDir, 'fixture baseline', 'app.mjs');
+    cli('next');
+    const stray = path.join(repoDir, 'unexpected.mjs');
+    fs.writeFileSync(stray, 'fixture outside scope');
+    cli('record', 'implement', '--passed');
+    const state = readJsonSafe(ctx.paths.statePath);
+    const gate = state.packs.A.gate;
+    gate.summary = '发现本包范围外的改动。请决定扩大范围、撤掉改动或终止流程。';
+    gate.allowed_resume_actions = ['expand', 'revert', 'abort'];
+    gate.out_of_scope_files.push({ path: 'conflicted.mjs', status: 'UD' }, { path: 'type-changed.mjs', status: ' T' });
+    saveState(ctx.stateDir, state);
+
+    const { question } = cli('status', '--format', 'shell');
+    assert.deepEqual(question.options.map(({ id }) => id), gate.allowed_resume_actions);
+    assert.match(question.body, /conflicted\.mjs（冲突）/);
+    assert.match(question.body, /type-changed\.mjs（ T）/);
+    const denied = runCliFailure(['resume', '--action', 'ignore', '--decision', '这些是我改的。'], repoDir);
+    assert.match(denied.stderr, /OUT_OF_SCOPE_CHANGE/);
+    assert.deepEqual(readJsonSafe(ctx.paths.statePath).packs.A.gate, gate);
+
+    const another = path.join(repoDir, 'another.mjs');
+    fs.writeFileSync(another, 'fixture second outside change');
+    const retry = runCliFailure(['answer', '--question', question.id, '--option', 'revert'], repoDir);
+    assert.match(retry.stderr, /仍有范围外的改动.*another\.mjs/);
+    const refreshed = cli('next');
+    assert.deepEqual(refreshed.gate.allowed_resume_actions, gate.allowed_resume_actions);
+    assert.equal(refreshed.gate.summary, gate.summary);
+    assert.notEqual(refreshed.question.id, question.id);
+    fs.unlinkSync(stray);
+    fs.unlinkSync(another);
+    assert.equal(cli('answer', '--question', refreshed.question.id, '--option', 'revert').status, 'VERIFY');
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
@@ -3359,12 +3488,19 @@ test('out-of-scope checks handle unavailable Git and legacy baselines', () => {
     assert.equal(backfilled.packs.A.base_commit, base);
     assert.equal(backfilled.packs.A.start_worktree['unexpected.mjs'], fixtureGit(repoDir, 'hash-object', 'unexpected.mjs'));
 
-    delete backfilled.packs.A.start_worktree;
+    backfilled.packs.A.start_worktree = null;
     saveState(ctx.stateDir, backfilled);
     const fallback = cli('next');
     assert.equal(fallback.gate.reason, 'OUT_OF_SCOPE_CHANGE');
     assert.deepEqual(fallback.gate.out_of_scope_files, [{ path: 'unexpected.mjs', status: '??' }]);
     assert.match(fallback.question.body, /越界检查只按本包范围判断/);
+    assert.ok(fallback.question.body.includes('这些文件里可能有开工前就改过的，不是本包改的请选「这些不是本包改的，放行」'));
+    assert.equal(cli('resume', '--action', 'ignore', '--decision', '这是开工前就有的改动。').status, 'READY_TO_COMMIT');
+    assert.deepEqual(readJsonSafe(ctx.paths.statePath).packs.A.start_worktree, {
+      'unexpected.mjs': fixtureGit(repoDir, 'hash-object', 'unexpected.mjs')
+    });
+    fs.writeFileSync(other, 'fixture change after ignore');
+    assert.equal(cli('next').gate.reason, 'OUT_OF_SCOPE_CHANGE');
     assert.equal(cli('resume', '--action', 'abort').outcome, 'aborted');
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
