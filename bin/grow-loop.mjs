@@ -93,7 +93,7 @@ function outJson(obj) {
 }
 
 function printHelp() {
-  process.stdout.write(`grow-loop v0.2.1 — Harness-agnostic multi-package delivery loop
+  process.stdout.write(`grow-loop v0.2.2 — Harness-agnostic multi-package delivery loop
 
 Usage:
   grow-loop init      [--repo <dir>] [--state-dir <dir>] [--profile standard-test|live-smoke] [--manifest <file> | --handoff <file>] [--project <name>] [--no-gitignore] [--force]
@@ -120,7 +120,7 @@ Usage:
   grow-loop record review --report <report.md> [--reviewer <instance>] [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
   grow-loop record external --pack <ID> --note "<what was completed outside the loop>"
   grow-loop record lesson --summary "<text>" [--pack <ID>] [--rule "<text>"] [--scope global|tags] [--tags a,b]
-  grow-loop resume    [--decision "<text>"] [--action approve|repair|continue|retry|commit|switch_instance|expand|revert|abort] [--instance <id>]
+  grow-loop resume    [--decision "<text>"] [--action approve|repair|continue|retry|commit|switch_instance|expand|revert|ignore|abort] [--instance <id>]
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
 
 Default state directory: <repo>/.loop/ (auto-added to .gitignore; override with --state-dir or GROW_LOOP_STATE_DIR)

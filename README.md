@@ -4,7 +4,7 @@
 [![Node.js >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`grow-loop` 帮助 Codex、Claude Code、DeepSeek Harness 等宿主按工作包完成代码交付。总控按 CLI 返回的动作派活，由 CLI 运行本机验证，再由审查者关包，总控登记本地提交。CLI 管理修复预算、人工门禁、教训和证据，其他宿主可以接着同一状态目录继续执行。[0.2.1 变更记录](CHANGELOG.md)
+`grow-loop` 帮助 Codex、Claude Code、DeepSeek Harness 等宿主按工作包完成代码交付。总控按 CLI 返回的动作派活，由 CLI 运行本机验证，再由审查者关包，总控登记本地提交。CLI 管理修复预算、人工门禁、教训和证据，其他宿主可以接着同一状态目录继续执行。[0.2.2 变更记录](CHANGELOG.md)
 
 ## 快速开始
 
