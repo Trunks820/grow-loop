@@ -6,6 +6,7 @@ import { buildRedactor } from './redact.mjs';
 import { getBudgets, getRepairRounds } from './router.mjs';
 import { getVerificationPlan } from './verify.mjs';
 import { namesCode, scanReferences } from './ref-scan.mjs';
+import { hasGlob, repoRelativePath, scopeMatcher } from './scope-paths.mjs';
 
 const briefFields = {
   pitfalls: '避坑提示',
@@ -13,18 +14,10 @@ const briefFields = {
   preserve_behaviors: '要保住的旧行为'
 };
 
-const globChars = /[*?\[\]{}]/;
 const emptyReport = /^(?:无|没有|暂无)[。.!！]?$/;
 
 function textItems(value) {
   return Array.isArray(value) ? value.filter((item) => typeof item === 'string' && item.trim()) : [];
-}
-
-function repoRelativePath(file, repoDir) {
-  const slashes = file.replace(/\\/g, '/');
-  const relative = repoDir && path.isAbsolute(slashes) ? path.relative(repoDir, slashes) : slashes;
-  const normalized = path.posix.normalize(relative.replace(/\\/g, '/'));
-  return normalized === '..' || normalized.startsWith('../') || path.win32.isAbsolute(normalized) ? null : normalized;
 }
 
 export function isScopeDirectory(file, repoDir) {
@@ -46,7 +39,8 @@ function verificationTestFiles(packDef, repoDir) {
     const args = command.match(/(?:[^\s"';&|<>()]+|"[^"]*"|'[^']*')+/g) ?? [];
     for (const arg of args) {
       const file = arg.replace(/"([^"]*)"|'([^']*)'/g, '$1$2').replace(/^--[\w-]+=/, '').split('::', 1)[0];
-      if (!file || file.startsWith('-') || file.includes('://') || globChars.test(file)) continue;
+      // Keep skipping shell patterns in command arguments, including brace expansion.
+      if (!file || file.startsWith('-') || file.includes('://') || hasGlob(file) || /[\]{}]/.test(file)) continue;
       const relative = repoRelativePath(file, repoDir);
       if (!relative) continue;
       const isTest = /(?:^|\/)(?:test|tests|__tests__)\/.+/.test(relative) ||
@@ -71,12 +65,10 @@ export function taskBriefWarnings(packDef, config, repoDir) {
   for (const file of scope) {
     if (isScopeDirectory(file, repoDir)) warnings.push(`范围里的「${file}」是目录，请列出具体文件。`);
   }
-  if (![...scope].some((file) => globChars.test(file))) {
-    const scopedPaths = new Set([...scope].map((file) => repoRelativePath(file, repoDir)));
-    for (const file of verificationTestFiles(packDef, repoDir)) {
-      if (!scopedPaths.has(file)) {
-        warnings.push(`验证命令点名的「${file}」不在本包范围，执行者改不了它；要改请用 pack scope 扩范围。`);
-      }
+  const scopedPaths = scopeMatcher(repoDir, scope);
+  for (const file of verificationTestFiles(packDef, repoDir)) {
+    if (!scopedPaths.has(file)) {
+      warnings.push(`验证命令点名的「${file}」不在本包范围，执行者改不了它；要改请用 pack scope 扩范围。`);
     }
   }
   const redactor = buildRedactor(config?.redaction?.extra_patterns || []);

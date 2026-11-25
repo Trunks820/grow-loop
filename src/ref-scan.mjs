@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
+import { hasGlob, repoRelativePath } from './scope-paths.mjs';
 
-const globChars = /[*?\[\]{}]/;
 const inlineCode = /`([^`\r\n]+)`/g;
 const namedIdentifier = /(?<![\w$])[A-Za-z_$][\w$]*(?:[a-z0-9][A-Z]|_[A-Za-z0-9])[\w$]*/;
 const call = /(?<![\w$])([A-Za-z_$][\w$]*)\(/;
@@ -51,21 +51,16 @@ function functionNames(hint) {
   return names.filter((name) => name.length >= 4 && !commonNames.has(name));
 }
 
-function repoPath(repoDir, file) {
-  const normalized = path.posix.normalize((path.isAbsolute(file) ? path.relative(repoDir, file) : file).replace(/\\/g, '/'));
-  return normalized === '..' || normalized.startsWith('../') || path.isAbsolute(normalized) ? null : normalized;
-}
-
 export function scanReferences(repoDir, stateDir, { scope_files = [], co_change_files = [], pitfalls = [] }) {
   const normalizeFiles = (files) => (Array.isArray(files) ? files : [])
     .filter((file) => typeof file === 'string' && file.trim())
-    .map((file) => repoPath(repoDir, file))
+    .map((file) => repoRelativePath(file, repoDir))
     .filter(Boolean);
   const scope = normalizeFiles(scope_files);
   const coChange = normalizeFiles(co_change_files);
   const terms = new Map();
   for (const file of scope) {
-    if (globChars.test(file)) continue;
+    if (hasGlob(file)) continue;
     const basename = path.posix.basename(file);
     const extension = path.posix.extname(basename);
     if (extension && basename.length >= 4) terms.set(basename, false);
@@ -82,13 +77,13 @@ export function scanReferences(repoDir, stateDir, { scope_files = [], co_change_
   }
   // Stems come last so their matches cannot crowd out the names a pitfall cites before the cap.
   for (const file of scope) {
-    const stem = globChars.test(file) ? null : fileStem(file);
+    const stem = hasGlob(file) ? null : fileStem(file);
     if (stem && !terms.has(stem)) terms.set(stem, true);
   }
 
-  const statePath = repoPath(repoDir, path.resolve(stateDir));
+  const statePath = repoRelativePath(path.resolve(stateDir), repoDir);
   const exclusions = [...new Set([...scope, ...coChange])].map((file) =>
-    globChars.test(file) ? `:(exclude,glob)${file}` : `:(exclude,literal)${file}`
+    hasGlob(file) ? `:(exclude,glob)${file}` : `:(exclude,literal)${file}`
   );
   if (statePath && statePath !== '.') exclusions.push(`:(exclude,literal)${statePath.replace(/\/$/, '')}/`);
 

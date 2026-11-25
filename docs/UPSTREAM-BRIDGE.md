@@ -72,17 +72,19 @@ Use a loop manifest for a hand-authored package list, or import a JSON handoff f
 | `estimated_files` | No | `>= 25` auto-starts at `tier2`; `>= 50` triggers `PAUSED_FOR_HUMAN` (`BLAST_RADIUS_SPLIT`). |
 | `cross_module` | No | `true` auto-starts at `tier2` (configurable via `blast_radius.escalate_tier2_cross_module`). |
 | `tier` | No | `"tier1"` or `"tier2"`. Takes priority over automatic tier selection at preflight. The split and approval gates still apply. Use `pack tier` for in-progress changes. |
-| `scope_files` | For handoffs | Explicit file allowlist / expected touchpoints injected into `task.md`. Also used as lower bound for `estimated_files`. Dispatch warns about directory entries here or in `co_change_files`. |
+| `scope_files` | For handoffs | File paths or glob patterns that define the package scope and appear in `task.md`. Also used as a lower bound for `estimated_files`. Dispatch warns about directory entries here or in `co_change_files`. |
 | `pitfalls` | No | Array of string warnings that name specific code using backticks, file paths, or identifiers such as `itemRepo.findById` or `findById()`. |
-| `co_change_files` | No | Array of repo-relative file paths that the coordinator expects to change together. Keep authorized files in `scope_files`. |
+| `co_change_files` | No | Array of repo-relative file paths or glob patterns for files that the coordinator expects to change together. Keep authorized files in `scope_files`. |
 | `preserve_behaviors` | No | Array of strings describing existing behavior. Included in implementation, repair, and both review rounds. |
 | `decisions` | No | Array of objects with `question`, verbatim `decision`, and an optional `at` timestamp (ISO 8601 or `null`). Task briefs include these alongside package questions and recorded gate decisions. `init`, `import`, `manifest-ack` and other manifest writes reject an entry without a non-empty `question` and `decision`. |
 | `forwarded_findings` | No | Findings added by `forward`. Each entry has `from_pack_id`, `content`, `reason`, and `at` (ISO 8601 timestamp). They appear in initial and repair implementation prompts. |
 | `acceptance_criteria` | No | Observable verification criteria injected into `task.md` and checked during `VERIFY`/`REVIEW`. |
-| `verify_commands` | No | Array of local verification commands. Runs after global `verification.commands` and appears in implementation and repair briefs. Dispatch warns when these commands name a test file outside `scope_files` and `co_change_files`, and skips the comparison if either list contains a glob. |
+| `verify_commands` | No | Array of local verification commands. Runs after global `verification.commands` and appears in implementation and repair briefs. Dispatch warns when a command names a test file that matches no path or glob in either scope list. Command arguments that are themselves patterns are skipped. |
 | `open_questions` | No | Non-empty array triggers `PAUSED_FOR_HUMAN` (`AMBIGUITY`) before `IMPLEMENT`. |
 | `external_effects` | No | Non-empty array (e.g., `["prod-db-migration", "webhook-notify"]`) triggers `PAUSED_FOR_HUMAN` (`EXTERNAL_EFFECT`) before `IMPLEMENT`. |
 | `tags` | For handoffs | Used to match and prioritize relevant past lessons from `lessons.json` when generating `task.md`. |
+
+In both scope lists, patterns follow Git's `:(glob)` pathspec rules. A single `*` matches zero or more bytes within a path component and `?` matches one. A full `**/` component matches zero or more directory levels, and a trailing `/**` matches all files under that directory. Bracket expressions support ranges such as `[a-z]` and negation such as `[!a]`. Braces are literal, so `{a,b}.js` names one file. [Git pathspec documentation](https://git-scm.com/docs/gitglossary#def_pathspec)
 
 ---
 

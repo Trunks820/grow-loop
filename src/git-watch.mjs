@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
 import { buildRedactor } from './redact.mjs';
+import { scopeMatcher } from './scope-paths.mjs';
 import { appendEvent, readEvents, saveState } from './state.mjs';
 
 function git(cwd, args) {
@@ -35,10 +36,8 @@ function resolveCommit(repoDir, sha) {
 }
 
 function scopeFiles(repoDir, packDef) {
-  return new Set([packDef?.scope_files, packDef?.co_change_files]
-    .flatMap((files) => Array.isArray(files) ? files : [])
-    .filter((file) => typeof file === 'string' && file.trim())
-    .map((file) => path.posix.normalize((path.isAbsolute(file) ? path.relative(repoDir, file) : file).replace(/\\/g, '/'))));
+  return scopeMatcher(repoDir, [packDef?.scope_files, packDef?.co_change_files]
+    .flatMap((files) => Array.isArray(files) ? files : []));
 }
 
 function isArtifact(file) {
@@ -132,11 +131,13 @@ export function checkExternalCommits(ctx, pack, packDef, recordingSha) {
   }
 
   const protectedFiles = scopeFiles(repoDir, packDef);
+  const completedFiles = new Set();
   for (const commit of completedCommits) {
     const files = commit.changed_files ?? readCommitFiles(repoDir, commit.sha);
-    for (const file of files ?? []) protectedFiles.add(file);
+    for (const file of files ?? []) completedFiles.add(file);
   }
-  const conflictingFiles = [...new Set(commits.flatMap(({ files }) => files.filter((file) => protectedFiles.has(file))))];
+  const conflictingFiles = [...new Set(commits.flatMap(({ files }) =>
+    files.filter((file) => protectedFiles.has(file) || completedFiles.has(file))))];
   if (conflictingFiles.length) {
     pack.gate = {
       ...createGate(ALLOWED_GATE_REASONS.EXTERNAL_COMMIT, '外部提交改动了本包范围或已完成包的文件。请核对后选择放行或终止。'),

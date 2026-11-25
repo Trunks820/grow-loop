@@ -38,6 +38,7 @@ import { codexAdapter } from '../src/adapters/codex.mjs';
 import { getVerificationCommands } from '../src/verify.mjs';
 import { parseReviewReport } from '../src/review-report.mjs';
 import { scanReferences } from '../src/ref-scan.mjs';
+import { hasGlob, repoRelativePath, scopeMatcher } from '../src/scope-paths.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2263,6 +2264,41 @@ test('dispatch previews warn about incomplete briefs, scan references and create
   }
 });
 
+test('scope matcher uses Git glob rules and keeps literal entries exact', () => {
+  const repoDir = path.resolve('fixture-repo');
+  const cases = [
+    ['src/*.mjs', ['src/a.mjs', 'src/.hidden.mjs'], ['src/sub/b.mjs', 'other/a.mjs']],
+    ['**/x.mjs', ['x.mjs', 'a/b/x.mjs'], ['a/xx.mjs']],
+    ['src/**/x.mjs', ['src/x.mjs', 'src/a/b/x.mjs'], ['other/src/x.mjs', 'src/a/xx.mjs']],
+    ['tests/**', ['tests/x.test.mjs', 'tests/unit/nested/x.test.mjs'], ['tests', 'tests-extra/x.test.mjs']],
+    ['src/a?b.mjs', ['src/acb.mjs'], ['src/a/b.mjs', 'src/ab.mjs', 'src/aéb.mjs']],
+    ['src/[a-c].mjs', ['src/a.mjs', 'src/c.mjs'], ['src/d.mjs', 'src/ab.mjs']],
+    ['src/[!a].mjs', ['src/b.mjs'], ['src/a.mjs', 'src/ab.mjs']],
+    ['src/[[:digit:]].mjs', ['src/9.mjs'], ['src/a.mjs']],
+    ['src/{a,b}.mjs', ['src/{a,b}.mjs'], ['src/a.mjs', 'src/b.mjs']],
+    ['src', ['src'], ['src/a.mjs']]
+  ];
+  for (const [pattern, included, excluded] of cases) {
+    const matcher = scopeMatcher(repoDir, [pattern]);
+    for (const file of included) assert.equal(matcher.has(file), true, `${pattern} should match ${file}`);
+    for (const file of excluded) assert.equal(matcher.has(file), false, `${pattern} should skip ${file}`);
+  }
+  for (const pattern of ['a*', 'a?', '[a']) assert.equal(hasGlob(pattern), true);
+  for (const literal of ['a]', '{a,b}', 'src/a.mjs']) assert.equal(hasGlob(literal), false);
+
+  const matcher = scopeMatcher(repoDir, ['.\\src\\*.mjs', path.join(repoDir, 'other', 'file.mjs'), '../outside.mjs']);
+  assert.equal(matcher.has(path.join(repoDir, 'src', 'a.mjs')), true);
+  assert.equal(matcher.has('other\\sub\\..\\file.mjs'), true);
+  assert.equal(matcher.has('../outside.mjs'), false);
+  assert.equal(scopeMatcher(repoDir, ['**']).has(path.resolve(repoDir, '..', 'outside.mjs')), false);
+  assert.equal(repoRelativePath(path.join(repoDir, 'src', 'a.mjs'), repoDir), 'src/a.mjs');
+  assert.equal(repoRelativePath('C:\\fixture-repo\\src\\a.mjs', 'C:\\fixture-repo'), 'src/a.mjs');
+  assert.equal(repoRelativePath('Z:\\outside.mjs', 'C:\\fixture-repo'), null);
+  assert.equal(repoRelativePath('src\\..\\..', repoDir), null);
+  assert.equal(repoRelativePath('../outside.mjs', repoDir), null);
+  assert.equal(repoRelativePath('/outside.mjs'), null);
+});
+
 test('dispatch warns about scope directories and unscoped tests named by package checks', () => {
   const pack = {
     id: 'A',
@@ -2274,6 +2310,7 @@ test('dispatch warns about scope directories and unscoped tests named by package
       "node --test lib/fixture-private-marker.test.mjs lib/sample.spec.ts 'test/sample_test.go' __tests__/smoke",
       'node --test checks/allowed.test.mjs src/helper.mjs',
       'pytest .\\test\\test_allowed.py tests/cases.py::test_delete tests/generated ../tests/outside.py',
+      "node --test 'elsewhere/*.test.mjs' 'elsewhere/{a,b}.test.mjs'",
       '# pytest tests/comment.py'
     ]
   };
@@ -2307,7 +2344,14 @@ test('dispatch warns about scope directories and unscoped tests named by package
       ].map(testWarning)
     ]);
     assert.deepEqual(initial.warnings, preview.warnings);
-    assert.deepEqual(cli('dispatch', '--dry-run', '--pack', 'GLOB').warnings, [...oldWarnings, directoryWarning('later\\')]);
+    assert.deepEqual(cli('dispatch', '--dry-run', '--pack', 'GLOB').warnings, [
+      ...oldWarnings,
+      directoryWarning('later\\'),
+      ...[
+        'test_core.py', 'lib/[REDACTED:INTERNAL].test.mjs', 'lib/sample.spec.ts',
+        'test/sample_test.go', '__tests__/smoke', 'checks/allowed.test.mjs', 'test/test_allowed.py'
+      ].map(testWarning)
+    ]);
     assert.deepEqual(taskBriefWarnings({ co_change_files: ['fixtures\\existing', 'later\\'] }, {}), [
       '「避坑提示」未填写。', '「要保住的旧行为」未填写。', directoryWarning('later\\')
     ]);
@@ -2327,8 +2371,10 @@ test('reference scan finds extensionless imports after pitfall names and skips g
   };
   const scope_files = [
     'src/services/orderService.ts', 'src/order.ts', 'src/index.ts', 'src/utils.ts',
-    'src/orderService.test.ts', 'src/global.d.ts', 'pkg/route_planning.py', 'src/main/java/com/foo/OrderRepo.java'
+    'src/orderService.test.ts', 'src/global.d.ts', 'pkg/route_planning.py', 'src/main/java/com/foo/OrderRepo.java',
+    'src/{view}.ts'
   ];
+  const co_change_files = ['generated/**/*.ts'];
   const pitfalls = ['调用 planRoute() 前先核对出发时间'];
   try {
     execFileSync('git', ['init'], { cwd: repoDir, stdio: 'ignore' });
@@ -2337,6 +2383,7 @@ test('reference scan finds extensionless imports after pitfall names and skips g
       'pages/extensionless.ts': "import { place } from '../src/services/orderService';",
       'pages/esm.ts': "import { place } from '../src/services/orderService.js';",
       'pages/order-user.ts': "import { total } from '../src/order';",
+      'pages/view.ts': "import '../src/{view}.ts';",
       'app/Main.java': 'import com.foo.OrderRepo;',
       'app/module.py': 'from pkg import route_planning',
       'pkg/relative.py': 'from .route_planning import plan'
@@ -2344,11 +2391,14 @@ test('reference scan finds extensionless imports after pitfall names and skips g
     for (const [file, content] of Object.entries(callers)) write(file, content);
     write('pages/generic.ts', "import a from '../src/index'; import b from '../src/utils'; import '../src/global';");
     write('pages/border.css', '.cell { border: 0; }');
-    const scan = () => scanReferences(repoDir, path.join(repoDir, '.loop'), { scope_files, pitfalls });
+    write('generated/skipped.ts', 'planRoute(start);');
+    write('generated/nested/skipped.ts', 'planRoute(start);');
+    const scan = () => scanReferences(repoDir, path.join(repoDir, '.loop'), { scope_files, co_change_files, pitfalls });
     assert.deepEqual(Object.fromEntries(scan().matches), {
       'pages/extensionless.ts': 'orderService',
       'pages/esm.ts': 'orderService',
       'pages/order-user.ts': 'order',
+      'pages/view.ts': '{view}.ts',
       'app/Main.java': 'OrderRepo',
       'app/module.py': 'route_planning',
       'pkg/relative.py': 'route_planning'
@@ -3102,23 +3152,59 @@ test('record external rejects packages already in an implementation, verificatio
   }
 });
 
+test('Git checkpoints use globs for stray files and pause for external changes within scope', () => {
+  const { repoDir } = setupCtx([{ id: 'A', scope_files: ['src/*.mjs', 'tests/**'] }], {
+    verification: { commands: [shellQuote(process.execPath) + ' --check tests/x.test.mjs'] }
+  });
+  const cli = (...args) => runCli(args, repoDir);
+  const write = (file, content = '') => fs.writeFileSync(path.join(repoDir, file), content);
+  try {
+    fixtureGit(repoDir, 'init', '-b', 'fixture-branch');
+    ensureGitignoreEntry(repoDir, resolveStateDir(repoDir));
+    fs.mkdirSync(path.join(repoDir, 'tests'));
+    fs.mkdirSync(path.join(repoDir, 'src', 'sub'), { recursive: true });
+    write('tests/x.test.mjs');
+    fixtureCommit(repoDir, 'fixture baseline', '.gitignore', 'tests/x.test.mjs');
+    assert.equal(cli('next').action, 'IMPLEMENT');
+    cli('record', 'implement', '--passed');
+    assert.equal(cli('verify').passed, true);
+    cli('record', 'review', '--verdict', 'pass');
+
+    write('src/a.mjs');
+    write('src/sub/b.mjs');
+    const next = cli('next');
+    assert.equal(next.action, 'COMMIT');
+    assert.deepEqual(next.stray_files, [{ path: 'src/sub/b.mjs', status: '??', artifact: false }]);
+
+    write('tests/x.test.mjs', 'export const changed = true;\n');
+    const sha = fixtureCommit(repoDir, 'fixture external test change', 'tests/x.test.mjs');
+    const paused = cli('next');
+    assert.equal(paused.action, 'PAUSE_FOR_HUMAN');
+    assert.equal(paused.gate.reason, 'EXTERNAL_COMMIT');
+    assert.deepEqual(paused.gate.conflicting_files, ['tests/x.test.mjs']);
+    assert.deepEqual(paused.gate.external_commits, [{ sha, files: ['tests/x.test.mjs'] }]);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
 test('Git checkpoints warn once for unrelated commits and gate current and completed pack changes', () => {
   const { repoDir, ctx } = setupCtx([
-    { id: 'A', scope_files: ['done.js'] },
+    { id: 'A', scope_files: ['done[ab].js'] },
     { id: 'B', scope_files: ['active.js'], co_change_files: ['companion.js'] },
-    { id: 'EXTERNAL', scope_files: ['unrelated.js'] }
+    { id: 'EXTERNAL', scope_files: ['donea.js'] }
   ], { verification: { commands: [shellQuote(process.execPath) + ' --check active.js'] } });
   const cli = (...args) => runCli(args, repoDir);
   const write = (file, content) => fs.writeFileSync(path.join(repoDir, file), content);
   const saved = () => readJsonSafe(ctx.paths.statePath).packs.B;
   try {
     fixtureGit(repoDir, 'init', '-b', 'fixture-branch');
-    for (const file of ['done.js', 'active.js', 'companion.js']) write(file, 'let value = 1;\n');
-    fixtureCommit(repoDir, 'fixture baseline', 'done.js', 'active.js', 'companion.js');
+    for (const file of ['done[ab].js', 'active.js', 'companion.js']) write(file, 'let value = 1;\n');
+    fixtureCommit(repoDir, 'fixture baseline', 'done[ab].js', 'active.js', 'companion.js');
     cli('record', 'external', '--pack', 'EXTERNAL', '--note', 'Completed outside the test loop');
     cli('next');
-    write('done.js', 'let value = 2;\n');
-    const completed = fixtureCommit(repoDir, 'fixture pack A implementation', 'done.js');
+    write('done[ab].js', 'let value = 2;\n');
+    const completed = fixtureCommit(repoDir, 'fixture pack A implementation', 'done[ab].js');
     cli('record', 'commit', '--from-git');
     assert.match(runCliFailure(['record', 'external', '--pack', 'A', '--note', 'Already recorded'], repoDir).stderr, /already committed/);
     cli('next');
@@ -3126,11 +3212,11 @@ test('Git checkpoints warn once for unrelated commits and gate current and compl
     assert.equal(saved().base_branch, 'fixture-branch');
     cli('record', 'implement', '--passed');
 
-    write('unrelated.js', 'let other = 1;\n');
-    const unrelated = fixtureCommit(repoDir, 'fixture external unrelated', 'unrelated.js');
+    write('donea.js', 'let other = 1;\n');
+    const unrelated = fixtureCommit(repoDir, 'fixture external unrelated', 'donea.js');
     const verified = cli('verify');
     assert.equal(verified.passed, true);
-    assert.deepEqual(verified.git_watch.commits, [{ sha: unrelated, files: ['unrelated.js'] }]);
+    assert.deepEqual(verified.git_watch.commits, [{ sha: unrelated, files: ['donea.js'] }]);
     assert.equal(cli('dispatch', '--stage', 'review', '--dry-run').git_watch, undefined);
 
     write('active.js', 'let value = 3;\n');
@@ -3155,12 +3241,12 @@ test('Git checkpoints warn once for unrelated commits and gate current and compl
     assert.equal(saved().resolved_gates.EXTERNAL_COMMIT.decision, decision);
     cli('record', 'review', '--verdict', 'pass');
 
-    write('done.js', 'let value = 4;\n');
-    const later = fixtureCommit(repoDir, 'fixture external completed overlap', 'done.js');
+    write('done[ab].js', 'let value = 4;\n');
+    const later = fixtureCommit(repoDir, 'fixture external completed overlap', 'done[ab].js');
     const commitGate = cli('next');
     assert.equal(commitGate.action, 'PAUSE_FOR_HUMAN');
-    assert.deepEqual(commitGate.gate.external_commits, [{ sha: later, files: ['done.js'] }]);
-    assert.deepEqual(commitGate.gate.conflicting_files, ['done.js']);
+    assert.deepEqual(commitGate.gate.external_commits, [{ sha: later, files: ['done[ab].js'] }]);
+    assert.deepEqual(commitGate.gate.conflicting_files, ['done[ab].js']);
     assert.equal(cli('resume', '--decision', '已核对完成包的改动，继续').status, 'READY_TO_COMMIT');
     assert.equal(cli('next').action, 'COMMIT');
 
@@ -3181,7 +3267,7 @@ test('Git checkpoints warn once for unrelated commits and gate current and compl
     assert.equal(shell.packs[1].commit, own);
     assert.equal(shell.packs[2].commit, null);
     const notices = readEvents(ctx.paths.eventsPath).filter(({ type }) => type === 'external_commits_noticed');
-    assert.deepEqual(notices.map(({ commits }) => commits), [[{ sha: unrelated, files: ['unrelated.js'] }]]);
+    assert.deepEqual(notices.map(({ commits }) => commits), [[{ sha: unrelated, files: ['donea.js'] }]]);
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
