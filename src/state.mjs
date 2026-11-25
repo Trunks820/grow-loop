@@ -192,6 +192,7 @@ export function createInitialPackState(packDef) {
     completed_externally: null,
     base_commit: null,
     base_branch: null,
+    start_worktree: null,
     started_at: null,
     completed_at: null
   };
@@ -377,6 +378,24 @@ export function writeManifestWithReason(ctx, manifest, reason, source, details) 
   if (changed) writeJsonAtomic(paths.manifestSnapshotPath, manifest);
   ctx.manifest = manifest;
   ctx.manifestChange = null;
+  return changes;
+}
+
+export function writePackDefinition(ctx, packDef, reason, source, details) {
+  const packs = ctx.manifest.packs.map((pack) => pack.id === packDef.id ? packDef : pack);
+  writeManifestWithReason(ctx, { ...ctx.manifest, packs }, reason, source, { pack_id: packDef.id, ...details });
+}
+
+export function expandPackScope(ctx, packDef, files, reason, details) {
+  const scopeFiles = [...new Set([...(packDef.scope_files || []), ...files])];
+  const priorEstimate = Number(packDef.estimated_files);
+  const estimatedFiles = Math.max(Number.isFinite(priorEstimate) ? priorEstimate : 0, scopeFiles.length);
+  const changes = {
+    added_files: scopeFiles.filter((file) => !packDef.scope_files?.includes(file)),
+    estimated_files: estimatedFiles
+  };
+  writePackDefinition(ctx, { ...packDef, scope_files: scopeFiles, estimated_files: estimatedFiles },
+    reason, 'pack_scope', { ...changes, ...details });
   return changes;
 }
 

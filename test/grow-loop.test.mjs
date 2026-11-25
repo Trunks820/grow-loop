@@ -2719,6 +2719,7 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
           depends_on: [],
           risk: 'low',
           estimated_files: 2,
+          scope_files: ['hello.js'],
           acceptance_criteria: ['AC-W01-01: hello() returns greeting'],
           tags: ['core']
         },
@@ -2729,6 +2730,7 @@ test('full CLI E2E flow: init -> probe -> next -> dispatch dry-run -> record -> 
           depends_on: ['W01'],
           risk: 'low',
           estimated_files: 2,
+          scope_files: ['index.js'],
           acceptance_criteria: ['AC-W02-01: index.js outputs greeting'],
           tags: ['core']
         }
@@ -2960,8 +2962,12 @@ test('self dispatch records implementation and review time and commit checks fla
     assert.equal(saved().inflight_run.run_id, impl.run_id);
     assert.equal(impl.result.elapsed_seconds, null);
     fs.appendFileSync(path.join(repoDir, 'app.js'), 'const next = 2;\n');
-    cli('record', 'implement', '--passed', '--executor-tool', 'host-codex', '--executor-model', 'fixture-model',
+    fs.appendFileSync(path.join(repoDir, 'fixture-notes.md'), '\nfixture implementation notes');
+    const implementation = cli('record', 'implement', '--passed', '--executor-tool', 'host-codex', '--executor-model', 'fixture-model',
       '--executor-effort', 'high');
+    assert.equal(implementation.outcome, 'ready_for_verify');
+    assert.ok(implementation.stray_files_notice);
+    assert.deepEqual(implementation.stray_files, [{ path: 'fixture-notes.md', status: ' M', artifact: true }]);
     const implResult = readJsonSafe(path.join(impl.run_dir, 'result.json'));
     assert.equal(implResult.status, 'completed');
     assert.equal(implResult.executor_tool, 'host-codex');
@@ -3020,21 +3026,27 @@ test('self dispatch records implementation and review time and commit checks fla
     cfg.executors.external = { kind: 'codex', executable: process.execPath, prefix_args: [mock] };
     writeJsonAtomic(paths.configPath, cfg);
     cli('next');
-    assert.equal(cli('dispatch', '--instance', 'external', '--task-file', providedTask).transition.outcome, 'ready_for_verify');
+    const { transition } = cli('dispatch', '--instance', 'external', '--task-file', providedTask);
+    assert.equal(transition.outcome, 'paused_out_of_scope_change');
+    assert.deepEqual(transition.gate.out_of_scope_files, [{ path: 'other.txt', status: '??' }]);
+    assert.ok(transition.stray_files_notice);
+    fs.unlinkSync(path.join(repoDir, 'other.txt'));
+    assert.equal(cli('resume', '--action', 'revert').status, 'VERIFY');
     assert.equal(cli('verify').passed, true);
     cli('record', 'review', '--verdict', 'pass');
     const next = cli('next');
     assert.equal(next.action, 'COMMIT');
     assert.deepEqual(next.stray_files, [
       { path: 'fixture-notes.md', status: ' M', artifact: true },
-      { path: 'fixture screenshot.png', status: '??', artifact: true },
-      { path: 'other.txt', status: '??', artifact: false }
+      { path: 'fixture screenshot.png', status: '??', artifact: true }
     ]);
+    assert.ok(next.stray_files_notice);
     assert.equal(next.artifacts_dir, path.join(paths.artifactsDir, 'external-pack'));
     fixtureCommit(repoDir, 'fixture commit containing a screenshot', 'next.js', 'approved.log', 'fixture screenshot.png');
     const recorded = cli('record', 'commit', '--from-git');
     assert.equal(recorded.outcome, 'committed');
     assert.deepEqual(recorded.stray_files, [{ path: 'fixture screenshot.png', status: 'committed', artifact: true }]);
+    assert.ok(recorded.stray_files_notice);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -3173,8 +3185,13 @@ test('Git checkpoints use globs for stray files and pause for external changes w
     write('src/a.mjs');
     write('src/sub/b.mjs');
     const next = cli('next');
-    assert.equal(next.action, 'COMMIT');
-    assert.deepEqual(next.stray_files, [{ path: 'src/sub/b.mjs', status: '??', artifact: false }]);
+    assert.equal(next.action, 'PAUSE_FOR_HUMAN');
+    assert.equal(next.gate.reason, 'OUT_OF_SCOPE_CHANGE');
+    assert.equal(next.gate.resume_status, 'READY_TO_COMMIT');
+    assert.deepEqual(next.gate.out_of_scope_files, [{ path: 'src/sub/b.mjs', status: '??' }]);
+    fs.unlinkSync(path.join(repoDir, 'src/sub/b.mjs'));
+    assert.equal(cli('answer', '--question', next.question.id, '--option', 'revert').status, 'READY_TO_COMMIT');
+    assert.equal(cli('next').action, 'COMMIT');
 
     write('tests/x.test.mjs', 'export const changed = true;\n');
     const sha = fixtureCommit(repoDir, 'fixture external test change', 'tests/x.test.mjs');
@@ -3183,6 +3200,172 @@ test('Git checkpoints use globs for stray files and pause for external changes w
     assert.equal(paused.gate.reason, 'EXTERNAL_COMMIT');
     assert.deepEqual(paused.gate.conflicting_files, ['tests/x.test.mjs']);
     assert.deepEqual(paused.gate.external_commits, [{ sha, files: ['tests/x.test.mjs'] }]);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('out-of-scope changes are measured from startup and expand requires a recorded decision', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['app.mjs'], co_change_files: ['companion.mjs'] }]);
+  try {
+    const cli = (...args) => runCli(args, repoDir);
+    const fail = (...args) => runCliFailure(args, repoDir);
+    const write = (file, content = 'fixture change') => fs.writeFileSync(path.join(repoDir, file), content);
+    const remove = (file) => fs.unlinkSync(path.join(repoDir, file));
+    const saved = () => readJsonSafe(ctx.paths.statePath).packs.A;
+
+    fixtureGit(repoDir, 'init');
+    const tracked = ['已有改动.mjs', 'changed later.mjs', 'deleted before.mjs', 'deleted later.mjs'];
+    for (const file of tracked) write(file, 'fixture baseline');
+    const base = fixtureCommit(repoDir, 'fixture baseline', ...tracked);
+    write('已有改动.mjs');
+    write('changed later.mjs');
+    write('untracked before.mjs');
+    remove('deleted before.mjs');
+
+    assert.equal(cli('next').action, 'IMPLEMENT');
+    const snapshot = saved().start_worktree;
+    for (const file of ['已有改动.mjs', 'changed later.mjs', 'untracked before.mjs']) {
+      assert.equal(snapshot[file], fixtureGit(repoDir, 'hash-object', '--no-filters', '--', file));
+    }
+    assert.equal(snapshot['deleted before.mjs'], null);
+    write('changed later.mjs', 'fixture second change');
+    write('extra[ab].mjs');
+    write('companion.mjs');
+    write('.loop/unignored-state.mjs');
+    remove('deleted later.mjs');
+
+    const paused = cli('record', 'implement', '--passed');
+    assert.equal(paused.outcome, 'paused_out_of_scope_change');
+    assert.equal(paused.gate.resume_status, 'VERIFY');
+    const files = [
+      { path: 'changed later.mjs', status: ' M' },
+      { path: 'deleted later.mjs', status: ' D' },
+      { path: 'extra[ab].mjs', status: '??' }
+    ];
+    assert.deepEqual(paused.gate.out_of_scope_files, files);
+    const { status, tier1_repairs, tier2_repairs, last_verify } = saved();
+    assert.deepEqual([status, tier1_repairs, tier2_repairs, last_verify], ['PAUSED_FOR_HUMAN', 0, 0, null]);
+    assert.deepEqual(readJsonSafe(ctx.paths.lessonsJsonPath, { items: [] }).items, []);
+    assert.deepEqual(readEvents(ctx.paths.eventsPath).find(({ type }) => type === 'out_of_scope_detected').files, files);
+    assert.deepEqual(cli('status', '--format', 'shell').question, paused.question);
+    assert.equal(paused.question.kind, 'OUT_OF_SCOPE_CHANGE');
+    assert.match(paused.question.body, /deleted later\.mjs（ D）/);
+    assert.deepEqual(paused.question.options.map(({ id, needs_text }) => [id, needs_text]),
+      [['expand', true], ['revert', false], ['abort', false]]);
+    assert.equal(cli('verify').question.id, paused.question.id);
+    assert.equal(cli('dispatch', '--dry-run').question.id, paused.question.id);
+    assert.equal(cli('record', 'verify', '--passed').question.id, paused.question.id);
+    assert.match(fail('record', 'implement', '--passed').stderr, /OUT_OF_SCOPE_CHANGE/);
+    assert.match(fail('record', 'external', '--pack', 'A', '--note', '已完成').stderr, /OUT_OF_SCOPE_CHANGE/);
+    assert.match(fail('resume', '--action', 'approve').stderr, /OUT_OF_SCOPE_CHANGE/);
+    assert.match(fail('resume', '--action', 'expand', '--decision', '   ').stderr, /非空的 --decision/);
+    const answer = ['answer', '--question', paused.question.id, '--option', 'expand'];
+    assert.match(fail(...answer).stderr, /非空的 --text/);
+    const decision = '  同意把修正涉及的三个文件加入本包。\n保持测试范围。  ';
+    assert.equal(cli(...answer, '--text', decision).status, 'VERIFY');
+    const approved = files.map(({ path: file }) => file);
+    const { manifest } = loadWorkspace(repoDir);
+    assert.deepEqual(manifest.packs[0].scope_files, ['app.mjs', ...approved]);
+    assert.deepEqual(saved().approved_out_of_scope, approved);
+    assert.equal(saved().decisions.at(-1).decision, decision);
+    const scopeEvent = readEvents(ctx.paths.eventsPath).find(({ source }) => source === 'pack_scope');
+    assert.equal(scopeEvent.reason, decision.trim());
+    assert.deepEqual(scopeEvent.details.added_files, approved);
+    assert.equal(cli('next').action, 'VERIFY');
+    cli('record', 'verify', '--passed', '--allow-self-report');
+    cli('record', 'review', '--verdict', 'pass');
+    assert.equal(cli('next').action, 'COMMIT');
+
+    write('extraa.mjs'); // The approved literal path contains brackets and must not grant this match.
+    const bad = fixtureCommit(repoDir, 'fixture with unapproved file', ':(literal)extra[ab].mjs', 'extraa.mjs');
+    const stateBefore = readJsonSafe(ctx.paths.statePath);
+    for (const args of [['--from-git'], ['--sha', bad]]) {
+      const rejected = fail('record', 'commit', ...args);
+      assert.equal(rejected.status, 1);
+      assert.match(rejected.stderr, /- extraa\.mjs/);
+      assert.match(rejected.stderr, /撤出提交后重新提交再登记.*需要人先同意扩范围/);
+    }
+    assert.deepEqual(readJsonSafe(ctx.paths.statePath), stateBefore);
+    assert.equal(readEvents(ctx.paths.eventsPath).some(({ type }) => type === 'pack_committed'), false);
+
+    fixtureGit(repoDir, 'reset', '--mixed', base);
+    const reloaded = loadWorkspace(repoDir);
+    writeManifestWithReason(reloaded, { ...manifest, packs: [{ ...manifest.packs[0], scope_files: ['app.mjs'] }] },
+      '保留这次关口逐文件批准的记录', 'internal_test');
+    const good = fixtureCommit(repoDir, 'fixture containing approved files only', ':(literal)extra[ab].mjs', 'deleted later.mjs');
+    assert.equal(cli('record', 'commit', '--from-git').outcome, 'committed');
+    assert.equal(saved().commit.sha, good);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('executor approval pauses for out-of-scope changes and revert rechecks the worktree', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['app.mjs'] }]);
+  try {
+    const cli = (...args) => runCli(args, repoDir);
+    fixtureGit(repoDir, 'init');
+    fs.writeFileSync(path.join(repoDir, 'app.mjs'), 'fixture baseline');
+    fixtureCommit(repoDir, 'fixture baseline', 'app.mjs');
+    cli('next');
+    const stray = path.join(repoDir, 'unexpected.mjs');
+    fs.writeFileSync(stray, 'fixture outside scope');
+
+    const executor = cli('record', 'implement', '--blocked', '需要确认现有改动');
+    assert.equal(executor.question.kind, 'EXECUTOR_BLOCKED');
+    const paused = cli('answer', '--question', executor.question.id, '--option', 'approve');
+    assert.equal(paused.question.kind, 'OUT_OF_SCOPE_CHANGE');
+    assert.equal(paused.gate.resume_status, 'VERIFY');
+    const revert = runCliFailure(['resume', '--action', 'revert'], repoDir);
+    assert.equal(revert.status, 1);
+    assert.match(revert.stderr, /仍有范围外的改动.*unexpected\.mjs/);
+    assert.deepEqual(cli('status', '--format', 'shell').question, paused.question);
+    assert.equal(readEvents(ctx.paths.eventsPath).some(({ type, action }) => type === 'gate_resumed' && action === 'revert'), false);
+
+    fs.unlinkSync(stray);
+    assert.equal(cli('resume', '--action', 'revert').status, 'VERIFY');
+    assert.equal(cli('status', '--format', 'shell').question, null);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('out-of-scope checks handle unavailable Git and legacy baselines', () => {
+  const { repoDir, ctx } = setupCtx([{ id: 'A', scope_files: ['app.mjs'] }]);
+  try {
+    const cli = (...args) => runCli(args, repoDir);
+    cli('next');
+    const state = readJsonSafe(ctx.paths.statePath);
+    assert.equal(state.packs.A.start_worktree, null);
+    delete state.packs.A.start_worktree;
+    saveState(ctx.stateDir, state);
+    const implementation = cli('record', 'implement', '--passed');
+    assert.equal(implementation.status, 'VERIFY');
+    assert.match(implementation.worktree_notice, /开工时没记到工作区快照/);
+    cli('record', 'verify', '--passed', '--allow-self-report');
+    cli('record', 'review', '--verdict', 'pass');
+    const skipped = cli('next');
+    assert.equal(skipped.action, 'COMMIT');
+    assert.equal(skipped.git_watch.status, 'skipped');
+
+    fixtureGit(repoDir, 'init');
+    fs.writeFileSync(path.join(repoDir, 'app.mjs'), 'fixture baseline');
+    const base = fixtureCommit(repoDir, 'fixture baseline', 'app.mjs');
+    const other = path.join(repoDir, 'unexpected.mjs');
+    fs.writeFileSync(other, 'fixture preexisting change');
+    assert.equal(cli('next').action, 'COMMIT');
+    const backfilled = readJsonSafe(ctx.paths.statePath);
+    assert.equal(backfilled.packs.A.base_commit, base);
+    assert.equal(backfilled.packs.A.start_worktree['unexpected.mjs'], fixtureGit(repoDir, 'hash-object', 'unexpected.mjs'));
+
+    delete backfilled.packs.A.start_worktree;
+    saveState(ctx.stateDir, backfilled);
+    const fallback = cli('next');
+    assert.equal(fallback.gate.reason, 'OUT_OF_SCOPE_CHANGE');
+    assert.deepEqual(fallback.gate.out_of_scope_files, [{ path: 'unexpected.mjs', status: '??' }]);
+    assert.match(fallback.question.body, /越界检查只按本包范围判断/);
+    assert.equal(cli('resume', '--action', 'abort').outcome, 'aborted');
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }

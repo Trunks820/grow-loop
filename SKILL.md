@@ -86,6 +86,8 @@ At `PAUSE_FOR_HUMAN` or a pending manifest change, use `grow-loop status --forma
 
 At `EXECUTOR_BLOCKED`, present the executor's reason and wait for the human to choose whether to retry after resolving the blocker, verify the existing changes, switch executors, or abort.
 
+At `OUT_OF_SCOPE_CHANGE`, show the listed files and wait for the human to approve expanding scope, confirm the changes were reverted, or abort.
+
 ```sh
 grow-loop dispatch --stage implement --dry-run
 grow-loop dispatch --stage implement
@@ -141,5 +143,7 @@ Present the overlap to the human using the gate procedure in Step 2. Approval re
 ### Step 8 — Commit locally and generate evidence
 
 When `next` returns `COMMIT`, inspect `stray_files` and the Git diff. Move any misplaced reports or drafts to the artifact directory in the task brief. Stage the explicit package files, commit locally, and run `grow-loop record commit --from-git`. The command also warns about out-of-scope artifacts already in that commit.
+
+If commit recording rejects unapproved out-of-scope files, remove them from the commit and record it again, or get the human's approval to expand scope first.
 
 Repeat `grow-loop next` until `COMPLETED`, then run `grow-loop evidence`. Check that `scanHits` is empty before sharing the redacted `evidence.md` in the state directory. The evidence includes elapsed execution time and the final implementer's tool and model for each recorded package.

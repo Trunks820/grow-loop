@@ -55,6 +55,12 @@ const GATE_COPY = {
     body: '请核对以下提交和冲突文件。放行后会以当前 Git HEAD 为基线，从原来的阶段继续。',
     approve: ['接受这些外部提交并从原阶段继续', '请填写核对结果和放行理由。']
   },
+  OUT_OF_SCOPE_CHANGE: {
+    title: '本包改到了范围外的文件',
+    body: '请核对以下文件及其 Git 状态。处理后会从暂停前的阶段继续。',
+    expand: ['把这些文件加进本包范围，继续', '请填写同意扩大范围的原话。'],
+    revert: ['我已撤掉这些改动，继续']
+  },
   RELEASE: {
     title: '发布相关操作需要你批准',
     body: '推送、合并或部署需要你的授权。请选择是否记录批准并继续任务。',
@@ -142,12 +148,16 @@ function gateQuestion(ctx, pack) {
     body.push('外部提交', bullets((gate.external_commits ?? []).map(({ sha, files }) => `${sha}（${files.join('、')}）`)),
       '冲突文件', bullets(gate.conflicting_files ?? []));
   }
+  if (gate.reason === 'OUT_OF_SCOPE_CHANGE') {
+    body.push(bullets(gate.out_of_scope_files.map(({ path, status }) => `${path}（${status}）`)));
+    if (gate.worktree_notice) body.push(gate.worktree_notice);
+  }
   const options = (gate.allowed_resume_actions ?? []).flatMap((action) => {
     if (action === 'switch_instance') {
       return Object.keys(ctx.config?.executors ?? {}).filter((id) => id !== pack.active_instance)
         .map((id) => option(switchOptionId(id), `改用 ${redactor.redactString(id)} 并重新执行`));
     }
-    if (action === 'approve' && copy.approve) return [option(action, ...copy.approve)];
+    if (Array.isArray(copy[action])) return [option(action, ...copy[action])];
     return Object.hasOwn(ACTION_LABELS, action) ? [option(action, ACTION_LABELS[action])] : [];
   });
   const choices = options.map(({ id, needs_text }) => [id, needs_text]);

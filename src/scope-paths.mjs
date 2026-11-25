@@ -90,11 +90,13 @@ function globExpression(pattern) {
   return new RegExp(source + '$');
 }
 
-export function scopeMatcher(repoDir, files) {
+export function scopeMatcher(repoDir, files, literalFiles = []) {
+  // A file approved by name stays literal even when its name contains glob syntax.
+  const exact = new Set(literalFiles);
   const literals = new Set();
   const globs = [];
   for (const file of files) {
-    if (typeof file !== 'string' || !file.trim()) continue;
+    if (typeof file !== 'string' || !file.trim() || exact.has(file)) continue;
     const relative = repoRelativePath(file, repoDir);
     if (relative === null) continue;
     if (hasGlob(relative)) {
@@ -108,6 +110,7 @@ export function scopeMatcher(repoDir, files) {
   }
   return {
     has(file) {
+      if (exact.has(file)) return true;
       const relative = repoRelativePath(file, repoDir);
       if (relative === null) return false;
       if (literals.has(relative)) return true;

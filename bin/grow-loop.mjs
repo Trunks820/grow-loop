@@ -11,6 +11,7 @@ import {
   createInitialState,
   ensureDir,
   ensureGitignoreEntry,
+  expandPackScope,
   getStatePaths,
   invalidateSession,
   loadWorkspace,
@@ -22,7 +23,8 @@ import {
   saveState,
   validateDecisions,
   writeJsonAtomic,
-  writeManifestWithReason
+  writeManifestWithReason,
+  writePackDefinition
 } from '../src/state.mjs';
 import {
   buildNextDirective,
@@ -116,7 +118,7 @@ Usage:
   grow-loop record review --report <report.md> [--reviewer <instance>] [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
   grow-loop record external --pack <ID> --note "<what was completed outside the loop>"
   grow-loop record lesson --summary "<text>" [--pack <ID>] [--rule "<text>"] [--scope global|tags] [--tags a,b]
-  grow-loop resume    --decision "<text>" [--action approve|repair|retry|commit|switch_instance|abort] [--instance <id>]
+  grow-loop resume    [--decision "<text>"] [--action approve|repair|retry|commit|switch_instance|expand|revert|abort] [--instance <id>]
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
 
 Default state directory: <repo>/.loop/ (auto-added to .gitignore; override with --state-dir or GROW_LOOP_STATE_DIR)
@@ -344,11 +346,6 @@ function requireOpenTodo(ctx, value) {
   return todo;
 }
 
-function updatePackDef(ctx, packDef, reason, source, details) {
-  const packs = ctx.manifest.packs.map((pack) => pack.id === packDef.id ? packDef : pack);
-  writeManifestWithReason(ctx, { ...ctx.manifest, packs }, reason, source, { pack_id: packDef.id, ...details });
-}
-
 function cmdPackInsert(ctx, flags, reason) {
   const position = chooseFlag(flags, 'after', 'before');
   const anchorId = requireText(flags[position], position);
@@ -432,7 +429,7 @@ function cmdPackTier(ctx, flags, reason) {
       });
     }
   }
-  updatePackDef(ctx, { ...packDef, tier }, reason, 'pack_tier', details);
+  writePackDefinition(ctx, { ...packDef, tier }, reason, 'pack_tier', details);
   outJson({ ok: true, pack_id: packDef.id, ...details });
 }
 
@@ -446,18 +443,15 @@ function cmdPackScope(ctx, flags, reason) {
     throw new Error(redactor.redactString(`范围里的「${directory}」是目录，请列出具体文件。`));
   }
   const todo = flags.todo === undefined ? null : requireOpenTodo(ctx, flags.todo);
-  const scopeFiles = [...new Set([...(packDef.scope_files || []), ...files])];
-  const priorEstimate = Number(packDef.estimated_files);
-  const estimatedFiles = Math.max(Number.isFinite(priorEstimate) ? priorEstimate : 0, scopeFiles.length);
-  const details = { added_files: scopeFiles.filter((file) => !packDef.scope_files?.includes(file)), estimated_files: estimatedFiles };
+  const details = {};
   if (todo) {
     todo.status = 'expanded';
     todo.target_pack_id = packDef.id;
     details.todo_id = todo.id;
     details.todo_status = todo.status;
   }
-  updatePackDef(ctx, { ...packDef, scope_files: scopeFiles, estimated_files: estimatedFiles }, reason, 'pack_scope', details);
-  outJson({ ok: true, pack_id: packDef.id, ...details });
+  const changes = expandPackScope(ctx, packDef, files, reason, details);
+  outJson({ ok: true, pack_id: packDef.id, ...changes, ...details });
 }
 
 function cmdPack(sub, flags) {
@@ -489,7 +483,7 @@ function cmdForward(flags) {
     details.todo_id = todo.id;
     details.todo_status = todo.status;
   }
-  updatePackDef(ctx, { ...target, forwarded_findings: [...(target.forwarded_findings || []), finding] }, reason, 'forward', details);
+  writePackDefinition(ctx, { ...target, forwarded_findings: [...(target.forwarded_findings || []), finding] }, reason, 'forward', details);
   outJson({ ok: true, to_pack_id: target.id, ...details });
 }
 
@@ -761,6 +755,7 @@ async function cmdDispatch(flags) {
     if (result.status !== 'host_action_required') {
       // An operator may have changed the route, scope, or todos while the adapter ran.
       ctx.state = readJsonSafe(ctx.paths.statePath);
+      ctx.manifest = readManifest(ctx.paths.manifestSnapshotPath) ?? ctx.manifest;
       const current = ctx.state.packs[packId];
       const run = current?.inflight_run;
       if (run?.run_id === runId && current.status !== 'COMMITTED' && ctx.state.loop_status !== 'ABORTED') {
@@ -829,7 +824,8 @@ function recordOutOfScopeReport(ctx, packId, runId, markdown, warnings) {
 function checkPackGit(ctx, pack, packDef, shouldCheck) {
   if (!pack) return {};
   if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT ||
-      pack.gate?.reason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED) {
+      pack.gate?.reason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED ||
+      pack.gate?.reason === ALLOWED_GATE_REASONS.OUT_OF_SCOPE_CHANGE) {
     return buildNextDirective(ctx, pack, packDef);
   }
   if (!shouldCheck || pack.status === 'COMMITTED') return {};

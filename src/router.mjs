@@ -1,5 +1,6 @@
 import path from 'node:path';
-import { appendEvent, invalidateSession, readJsonSafe, rememberSession, saveState, writeManifestWithReason } from './state.mjs';
+import { isDeepStrictEqual } from 'node:util';
+import { appendEvent, expandPackScope, invalidateSession, readJsonSafe, rememberSession, saveState, writeManifestWithReason } from './state.mjs';
 import { buildRedactor } from './redact.mjs';
 import { handoffFillSteps, handoffNeeds } from './handoff.mjs';
 import { taskBriefWarnings } from './task-builder.mjs';
@@ -7,7 +8,7 @@ import { getVerificationCommands } from './verify.mjs';
 import { ALLOWED_GATE_REASONS, createGate } from './gate.mjs';
 import { addLesson, closeLessonsForPack, deferInRoundTechDebt, recordReviewTechDebt, removeLesson, selectLessonsForPack } from './lessons.mjs';
 import { getBlockingReviewSeverities } from './review-report.mjs';
-import { checkExternalCommits, readCommitFiles, readGitPosition, scanStrayFiles } from './git-watch.mjs';
+import { checkExternalCommits, readCommitFiles, readGitPosition, readWorktreeSnapshot, scanCommitScope, scanOutOfScopeChanges } from './git-watch.mjs';
 import { writeRunResult } from './adapters/base.mjs';
 import { buildQuestion, dispatchStillRunning, NEXT_COMMANDS } from './shell-api.mjs';
 
@@ -163,6 +164,7 @@ export function startOrAdvanceActivePack(ctx) {
       const position = readGitPosition(state.repo_dir);
       pack.base_commit = position?.head ?? null;
       pack.base_branch = position?.branch ?? null;
+      pack.start_worktree = readWorktreeSnapshot(state.repo_dir);
     }
     pack.resolved_gates = pack.resolved_gates || {};
     const br = evaluateBlastRadius(config, packDef, pack);
@@ -271,10 +273,12 @@ export function buildNextDirective(ctx, pack, packDef) {
     .map(({ id, summary, rule, scope, scope_tags }) => ({ id, summary, rule, scope, scope_tags }));
 
   if (pack.status === 'PAUSED_FOR_HUMAN') {
+    const gate = pack.gate?.reason === ALLOWED_GATE_REASONS.OUT_OF_SCOPE_CHANGE
+      ? buildRedactor(config?.redaction?.extra_patterns || []).redactValue(pack.gate) : pack.gate;
     return {
       action: 'PAUSE_FOR_HUMAN',
       ...packInfo,
-      gate: pack.gate,
+      gate,
       resume_hint: `grow-loop resume --decision "<your decision>" --action <${(pack.gate?.allowed_resume_actions || ['approve']).join('|')}>`,
       question: buildQuestion(ctx, pack)
     };
@@ -336,10 +340,16 @@ export function buildNextDirective(ctx, pack, packDef) {
   if (pack.status === 'READY_TO_COMMIT') {
     const gitWatch = checkExternalCommits(ctx, pack, packDef);
     if (gitWatch?.status === 'blocked') return buildNextDirective(ctx, pack, packDef);
+    const scan = scanOutOfScopeChanges(ctx, pack, packDef);
+    if (scan.files?.length) {
+      pauseForOutOfScopeChange(ctx, pack, 'READY_TO_COMMIT', scan);
+      return { ...buildNextDirective(ctx, pack, packDef), ...scan.notices, ...(gitWatch && { git_watch: gitWatch }) };
+    }
     return {
       action: 'COMMIT',
       ...packInfo,
-      ...scanStrayFiles(ctx, pack, packDef),
+      stray_files: [],
+      ...scan.notices,
       ...(gitWatch && { git_watch: gitWatch }),
       approval_note: 'Local commit ONLY (git add explicit files + git commit). NEVER git push / merge / deploy without RELEASE gate.',
       next_command: `Commit locally, then call: ${NEXT_COMMANDS.commit}`
@@ -350,6 +360,35 @@ export function buildNextDirective(ctx, pack, packDef) {
     action: pack.status,
     ...packInfo
   };
+}
+
+function pauseForOutOfScopeChange(ctx, pack, resumeStatus, scan) {
+  const { stateDir, config, state } = ctx;
+  const reason = ALLOWED_GATE_REASONS.OUT_OF_SCOPE_CHANGE;
+  const summary = '发现本包范围外的改动。请决定扩大范围、撤掉改动或终止流程。';
+  pack.gate = {
+    ...createGate(reason, summary, { allowed_resume_actions: ['expand', 'revert', 'abort'] }),
+    out_of_scope_files: scan.files,
+    resume_status: resumeStatus,
+    ...(scan.notices.worktree_notice && { worktree_notice: scan.notices.worktree_notice })
+  };
+  pack.status = 'PAUSED_FOR_HUMAN';
+  saveState(stateDir, state);
+  const details = { pack_id: pack.id, gate_reason: reason, summary, resume_status: resumeStatus, files: scan.files };
+  appendEvent(stateDir, config, { type: 'out_of_scope_detected', ...details });
+  appendEvent(stateDir, config, { type: 'gate_paused', pack_id: pack.id, gate_reason: reason, summary });
+}
+
+function outOfScopeOutcome(ctx, pack, resumeStatus, scan) {
+  pauseForOutOfScopeChange(ctx, pack, resumeStatus, scan);
+  const redactor = buildRedactor(ctx.config?.redaction?.extra_patterns || []);
+  return { outcome: 'paused_out_of_scope_change', gate: redactor.redactValue(pack.gate), question: buildQuestion(ctx, pack), ...scan.notices };
+}
+
+function outOfScopeGateError(ctx, pack, message = '请先处理 OUT_OF_SCOPE_CHANGE，才能继续本包。') {
+  const error = new Error(message);
+  error.question = buildQuestion(ctx, pack);
+  return error;
 }
 
 export function getRepairRounds(pack) {
@@ -475,6 +514,7 @@ function getWritablePack(ctx, packId) {
   if (!pack) throw new Error('No active pack found');
   if (pack.status === 'COMMITTED') throw new Error(`Pack ${pack.id} is already committed.`);
   if (state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.OUT_OF_SCOPE_CHANGE) throw outOfScopeGateError(ctx, pack);
   if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED) {
     const error = new Error('Answer the EXECUTOR_BLOCKED question before advancing this package.');
     error.question = buildQuestion(ctx, pack);
@@ -599,7 +639,7 @@ export function recordImplementOutcome(ctx, payload) {
   }
 
   if (payload.passed) {
-    pack.status = 'VERIFY';
+    const scan = scanOutOfScopeChanges(ctx, pack, getPackDef(ctx.manifest, pack.id));
     appendEvent(stateDir, config, {
       type: 'implement_completed',
       pack_id: pack.id,
@@ -610,8 +650,10 @@ export function recordImplementOutcome(ctx, payload) {
       ...executor,
       summary: payload.summary || 'Implementation completed'
     });
+    if (scan.files?.length) return outOfScopeOutcome(ctx, pack, 'VERIFY', scan);
+    pack.status = 'VERIFY';
     saveState(stateDir, state);
-    return { outcome: 'ready_for_verify', status: pack.status };
+    return { outcome: 'ready_for_verify', status: pack.status, ...scan.notices };
   }
 
   recordFailureLesson(ctx, pack, {
@@ -931,9 +973,17 @@ export function recordCommitOutcome(ctx, payload) {
   const { stateDir, config, state } = ctx;
   const pack = getWritablePack(ctx, payload.packId);
   const packDef = getPackDef(ctx.manifest, pack.id);
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) return buildNextDirective(ctx, pack, packDef);
+  const changedFiles = readCommitFiles(state.repo_dir, payload.sha);
+  if (payload.fromGit && changedFiles === null) throw new Error('Git 无法列出本次提交改动的文件。请恢复 Git 检查后重新登记。');
+  const scope = scanCommitScope(ctx, pack, packDef, changedFiles);
+  if (scope.files.length) {
+    const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+    const files = scope.files.map((file) => `- ${redactor.redactString(file)}`).join('\n');
+    throw new Error(`本次提交包含未批准的范围外文件。\n${files}\n把这些文件撤出提交后重新提交再登记。要保留它们，需要人先同意扩范围。`);
+  }
   const gitWatch = checkExternalCommits(ctx, pack, packDef, payload.sha);
   if (gitWatch?.status === 'blocked') return buildNextDirective(ctx, pack, packDef);
-  const changedFiles = readCommitFiles(state.repo_dir, payload.sha);
 
   pack.commit = {
     sha: payload.sha,
@@ -974,7 +1024,7 @@ export function recordCommitOutcome(ctx, payload) {
     next_pack_id: nextId,
     loop_status: state.loop_status,
     ...(gitWatch && { git_watch: gitWatch }),
-    ...(payload.fromGit && scanStrayFiles(ctx, pack, packDef, changedFiles))
+    ...(payload.fromGit && scope.notices)
   };
 }
 
@@ -987,6 +1037,7 @@ export function recordExternalCompletion(ctx, { packId, note }) {
   const pack = state.packs[packId];
   if (pack.status === 'COMMITTED') throw new Error(`Pack ${pack.id} is already committed.`);
   if (state.loop_status === 'ABORTED') throw new Error('The loop was aborted.');
+  if (pack.gate?.reason === ALLOWED_GATE_REASONS.OUT_OF_SCOPE_CHANGE) throw outOfScopeGateError(ctx, pack);
   if (!['PENDING', 'PAUSED_FOR_HUMAN'].includes(pack.status)) {
     throw new Error(`Pack ${pack.id} is in ${pack.status}. Continue the normal workflow to "grow-loop record commit --from-git", or use "grow-loop resume" if the pack pauses.`);
   }
@@ -1016,6 +1067,56 @@ export function recordExternalCompletion(ctx, { packId, note }) {
   };
 }
 
+function recordGateResume(ctx, pack, action, decision, instance) {
+  appendEvent(ctx.stateDir, ctx.config, {
+    type: 'gate_resumed', pack_id: pack.id, gate_reason: pack.gate?.reason || 'UNKNOWN',
+    action, decision: decision || '', switch_instance: instance || null
+  });
+}
+
+function resumeOutOfScopeChange(ctx, pack, packDef, action, decision) {
+  const { stateDir, config, state } = ctx;
+  const gate = pack.gate;
+  const redactor = buildRedactor(config?.redaction?.extra_patterns || []);
+  if (action === 'expand') {
+    if (typeof decision !== 'string' || !decision.trim()) {
+      throw outOfScopeGateError(ctx, pack, '扩大范围需要填写非空的 --decision 原话。');
+    }
+    const files = gate.out_of_scope_files.map(({ path: file }) => file);
+    const previousApproval = { approved_out_of_scope: pack.approved_out_of_scope, decisions: pack.decisions };
+    pack.approved_out_of_scope = [...new Set([...(previousApproval.approved_out_of_scope ?? []), ...files])];
+    pack.decisions = [...(previousApproval.decisions ?? []), {
+      gate_reason: gate.reason, action, decision: redactor.redactString(decision), at: new Date().toISOString()
+    }];
+    try {
+      expandPackScope(ctx, packDef, files, decision, { gate_reason: gate.reason });
+    } catch (error) {
+      Object.assign(pack, previousApproval);
+      throw error;
+    }
+  }
+
+  const scan = scanOutOfScopeChanges(ctx, pack, getPackDef(ctx.manifest, pack.id));
+  if (action === 'revert') {
+    if (scan.files === null) throw outOfScopeGateError(ctx, pack, 'Git 无法读取当前工作区，无法确认越界改动已撤掉。');
+    if (scan.files.length) {
+      if (!isDeepStrictEqual(scan.files, gate.out_of_scope_files)) {
+        pauseForOutOfScopeChange(ctx, pack, gate.resume_status, scan);
+      }
+      const files = scan.files.map(({ path: file }) => redactor.redactString(file)).join('、');
+      throw outOfScopeGateError(ctx, pack, `仍有范围外的改动。请撤掉这些改动后再继续：${files}`);
+    }
+  }
+
+  recordGateResume(ctx, pack, action, decision);
+  if (scan.files?.length) return outOfScopeOutcome(ctx, pack, gate.resume_status, scan);
+  pack.gate = null;
+  pack.status = gate.resume_status;
+  saveState(stateDir, state);
+  const outcome = pack.status === 'VERIFY' ? 'ready_for_verify' : 'ready_to_commit';
+  return { outcome, pack_id: pack.id, status: pack.status, ...scan.notices };
+}
+
 export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   const { stateDir, config, manifest, state } = ctx;
   const pack = state.packs[packId || state.active_pack_id];
@@ -1032,6 +1133,14 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   const at = new Date().toISOString();
   const questions = prevGate?.questions?.length ? { questions: redactor.redactValue(prevGate.questions) } : {};
   let approvedPosition = null;
+  if (gateReason === ALLOWED_GATE_REASONS.OUT_OF_SCOPE_CHANGE) {
+    if (!prevGate.allowed_resume_actions.includes(act)) {
+      throw outOfScopeGateError(ctx, pack, '请为 OUT_OF_SCOPE_CHANGE 选择 --action expand、revert 或 abort。');
+    }
+    if (act !== 'abort') return resumeOutOfScopeChange(ctx, pack, packDef, act, decision);
+  } else if (act === 'expand' || act === 'revert') {
+    throw new Error('expand 和 revert 适用于 OUT_OF_SCOPE_CHANGE 关口。');
+  }
   if (gateReason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED) {
     if (!prevGate.allowed_resume_actions.includes(act)) {
       throw new Error('Use --action retry, approve, switch_instance or abort for an EXECUTOR_BLOCKED gate.');
@@ -1053,14 +1162,7 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
     }
   }
 
-  appendEvent(stateDir, config, {
-    type: 'gate_resumed',
-    pack_id: pack.id,
-    gate_reason: gateReason,
-    action: act,
-    decision: decision || '',
-    switch_instance: instance || null
-  });
+  recordGateResume(ctx, pack, act, decision, instance);
 
   if (act === 'switch_instance' && (!instance || !config?.executors?.[instance])) {
     throw new Error(`Unknown executor instance "${instance}" in config.executors`);
@@ -1131,9 +1233,11 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   pack.gate = null;
 
   if (gateReason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED) {
+    const scan = scanOutOfScopeChanges(ctx, pack, packDef);
+    if (scan.files?.length) return outOfScopeOutcome(ctx, pack, 'VERIFY', scan);
     pack.status = 'VERIFY';
     saveState(stateDir, state);
-    return { outcome: 'approved', pack_id: pack.id, status: pack.status };
+    return { outcome: 'approved', pack_id: pack.id, status: pack.status, ...scan.notices };
   }
 
   if (approvedPosition) {

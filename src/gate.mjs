@@ -14,6 +14,7 @@ export const ALLOWED_GATE_REASONS = Object.freeze({
   REVIEW_CAP_REACHED: 'REVIEW_CAP_REACHED', // 2 closing review rounds failed with BLOCKER/HIGH
   INFRA_BLOCKED: 'INFRA_BLOCKED',       // Quota exhausted (429), auth expired, missing CLI
   EXECUTOR_BLOCKED: 'EXECUTOR_BLOCKED', // Executor reported that the package goal is unfinished
+  OUT_OF_SCOPE_CHANGE: 'OUT_OF_SCOPE_CHANGE', // Worktree changes outside the approved package scope
   RELEASE: 'RELEASE'                    // Push, merge to main branch, deploy
 });
 
