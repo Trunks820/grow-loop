@@ -118,7 +118,7 @@ Usage:
   grow-loop record review --report <report.md> [--reviewer <instance>] [--executor-tool <tool>] [--executor-model <model>] [--executor-effort <effort>]
   grow-loop record external --pack <ID> --note "<what was completed outside the loop>"
   grow-loop record lesson --summary "<text>" [--pack <ID>] [--rule "<text>"] [--scope global|tags] [--tags a,b]
-  grow-loop resume    [--decision "<text>"] [--action approve|repair|retry|commit|switch_instance|expand|revert|abort] [--instance <id>]
+  grow-loop resume    [--decision "<text>"] [--action approve|repair|continue|retry|commit|switch_instance|expand|revert|abort] [--instance <id>]
   grow-loop evidence  [--repo <dir>] [--state-dir <dir>] [--out <path>]
 
 Default state directory: <repo>/.loop/ (auto-added to .gitignore; override with --state-dir or GROW_LOOP_STATE_DIR)
@@ -598,6 +598,7 @@ function taskFingerprint(ctx, pack, stage) {
     last_verify: pack.last_verify,
     findings: pack.pending_blocking_findings,
     decisions: pack.decisions,
+    continue_pending: stage === 'implement' ? pack.continue_pending : undefined,
     gates: pack.resolved_gates,
     config: ctx.config
   };
@@ -691,9 +692,10 @@ async function cmdDispatch(flags) {
     throw new Error('Specify a readable task file with --task-file <path>.');
   }
   let resumeSessionId = null;
-  if (flags.resume === true) resumeSessionId = savedSession(pack, stage, instanceId);
+  const useSavedSession = flags.resume === true || (flags.resume === undefined && stage === 'implement' && pack.continue_pending);
+  if (useSavedSession) resumeSessionId = savedSession(pack, stage, instanceId);
   else if (flags.resume !== undefined) resumeSessionId = requireText(flags.resume, 'resume');
-  if (flags.resume === true && !resumeSessionId) warnings.push('当前阶段和执行实例没有可续的会话，本次会启动新会话。');
+  if (useSavedSession && !resumeSessionId) warnings.push('当前阶段和执行实例没有可续的会话，本次会启动新会话。');
   const prepared = prepareDispatch(ctx, pack, packDef, stage, instanceId, suppliedTask);
   const { run_id: runId, run_dir: runDir, task_file: taskFilePath } = prepared;
   const adapterInput = {

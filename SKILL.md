@@ -86,7 +86,13 @@ Run `grow-loop next` at each transition. Follow the returned action and package.
 
 At `PAUSE_FOR_HUMAN` or a pending manifest change, use `grow-loop status --format shell` to read the current `question`. Present the options and wait for the human's decision. Submit the chosen option with `grow-loop answer --question <id> --option <id> --text "<verbatim answer>"`, including text when requested. If the question has no options, follow its instructions to complete the manifest or resolve the dependency, then run `grow-loop next`. The existing `grow-loop resume --action <action> --decision "<verbatim decision>"` also accepts gate decisions. [Question and answer contract](docs/SHELL-API.md#中文问题)
 
-At `EXECUTOR_BLOCKED`, present the executor's reason and wait for the human to choose whether to retry after resolving the blocker, verify the existing changes, switch executors, or abort.
+At `EXECUTOR_BLOCKED`, present the executor's reason and wait for the human's decision.
+
+- Work remains and the blocker is resolved. If the human approved changes to files outside the package scope, first run `grow-loop pack scope --id <ID> --add <file> --reason "<reason>"`. Choose `continue` (「接着写」) and record the human's exact words. The next implementation dispatch reuses the saved session when available and includes the blocker, decision, and newly added files in the task brief. This keeps the repair budget intact.
+- The current executor should start again from the beginning. Choose `retry`.
+- The implementation is complete and ready to check. Choose `approve` to accept the current changes and advance to verification.
+
+The human can also choose another configured executor to start again or abort the loop.
 
 At `OUT_OF_SCOPE_CHANGE`, show the listed files and wait for the human to approve expanding scope, confirm the changes were reverted, confirm in their own words that the changes came from outside this package so work can continue, or abort.
 

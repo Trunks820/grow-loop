@@ -571,6 +571,7 @@ export function recordImplementOutcome(ctx, payload) {
   const runStatus = payload.infraError ? 'infra_error'
     : payload.blockedReason ? 'blocked' : (payload.passed ? 'completed' : 'failed');
   const { executor, selfRunId } = completeSelfRun(ctx, pack, 'implement', payload, runStatus, runInstance);
+  delete pack.continue_pending;
   if (pack.last_verify) delete pack.last_verify.repair_undo;
 
   if (payload.sessionId && canResume) rememberSession(pack, payload.sessionId, 'implement', runInstance);
@@ -627,10 +628,15 @@ export function recordImplementOutcome(ctx, payload) {
     const summary = characters.length > 800
       ? `${characters.slice(0, 800).join('').trimEnd()}…（原因已截断）`
       : reason;
+    const packDef = getPackDef(ctx.manifest, pack.id);
     pack.status = 'PAUSED_FOR_HUMAN';
-    pack.gate = createGate(ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED, summary, {
-      allowed_resume_actions: ['retry', 'approve', 'switch_instance', 'abort']
-    });
+    pack.gate = {
+      ...createGate(ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED, summary, {
+        allowed_resume_actions: ['continue', 'retry', 'approve', 'switch_instance', 'abort']
+      }),
+      scope_files: Array.isArray(packDef?.scope_files) ? [...packDef.scope_files] : [],
+      co_change_files: Array.isArray(packDef?.co_change_files) ? [...packDef.co_change_files] : []
+    };
     appendEvent(stateDir, config, {
       type: 'implement_blocked', pack_id: pack.id, run_id: runId,
       tier: runTier, instance: runInstance, ...executor, summary
@@ -1181,11 +1187,17 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   }
   if (gateReason === ALLOWED_GATE_REASONS.EXECUTOR_BLOCKED) {
     if (!prevGate.allowed_resume_actions.includes(act)) {
-      throw new Error('Use --action retry, approve, switch_instance or abort for an EXECUTOR_BLOCKED gate.');
+      const continueAction = prevGate.allowed_resume_actions.includes('continue') ? 'continue, ' : '';
+      throw new Error(`Use --action ${continueAction}retry, approve, switch_instance or abort for an EXECUTOR_BLOCKED gate.`);
+    }
+    if (act === 'continue' && (typeof decision !== 'string' || !decision.trim())) {
+      throw new Error('接着写需要填写非空的 --decision 原话。');
     }
     if (act === 'switch_instance' && (instance === pack.active_instance || !Object.hasOwn(config?.executors ?? {}, instance))) {
       throw new Error('Choose a different configured executor with --instance.');
     }
+  } else if (act === 'continue') {
+    throw new Error('Use --action continue for an EXECUTOR_BLOCKED gate.');
   }
   if (gateReason === ALLOWED_GATE_REASONS.EXTERNAL_COMMIT) {
     if (!prevGate.allowed_resume_actions.includes(act)) {
@@ -1205,7 +1217,7 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
   if (act === 'switch_instance' && (!instance || !config?.executors?.[instance])) {
     throw new Error(`Unknown executor instance "${instance}" in config.executors`);
   }
-  if (['repair', 'retry', 'commit', 'switch_instance'].includes(act) && typeof decision === 'string' && decision.trim()) {
+  if (['continue', 'repair', 'retry', 'commit', 'switch_instance'].includes(act) && typeof decision === 'string' && decision.trim()) {
     (pack.decisions ??= []).push({
       gate_reason: gateReason,
       action: act,
@@ -1238,8 +1250,19 @@ export function resumeFromGate(ctx, { packId, action, decision, instance }) {
     return { outcome: 'switched_instance', pack_id: pack.id, active_instance: instance };
   }
 
-  if (act === 'repair' || act === 'retry') {
+  if (act === 'continue' || act === 'repair' || act === 'retry') {
     pack.gate = null;
+    if (act === 'continue') {
+      const previousScope = new Set([...(prevGate.scope_files ?? []), ...(prevGate.co_change_files ?? [])]);
+      const currentScope = new Set([packDef?.scope_files, packDef?.co_change_files]
+        .flatMap((files) => Array.isArray(files) ? files : []));
+      pack.continue_pending = {
+        blocked_reason: prevGate.summary,
+        decision: pack.decisions.at(-1).decision,
+        at,
+        added_scope: [...currentScope].filter((file) => !previousScope.has(file))
+      };
+    }
     if (act === 'repair') {
       // Explicit human authorization grants one extra repair round on current tier
       countRepairRound(pack);

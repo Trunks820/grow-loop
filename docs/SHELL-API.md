@@ -86,13 +86,15 @@
 | `BUDGET_EXCEEDED` | `repair` 给当前档一次额外修复机会，`commit` 允许进入本地提交阶段，`abort` 终止。 |
 | `REVIEW_CAP_REACHED` | `repair` 给当前档一次额外修复机会，`commit` 允许进入本地提交阶段，`abort` 终止。 |
 | `INFRA_BLOCKED` | `retry` 用当前实例重试，`switch_instance:<标识>` 选择一个已配置的其他实例并重新执行，`abort` 终止。每个实例各有一个选项。 |
-| `EXECUTOR_BLOCKED` | 正文显示执行者没做完的原因。`retry` 补齐条件后用当前实例重新实现，`approve` 接受现有改动并进入验证，`switch_instance:<标识>` 换一个已配置的实例重新实现，`abort` 终止。 |
+| `EXECUTOR_BLOCKED` | 正文显示执行者没做完的原因。`continue` 在扩范围或补好条件后让执行者接着写（原话必填，不扣修复次数），`retry` 用当前实例从头重新执行，`approve` 确认代码已写完并接受现有改动进入验证，`switch_instance:<标识>` 换一个已配置的实例重新实现，`abort` 终止。 |
 | `EXTERNAL_COMMIT` | 正文列出外部提交及其文件、冲突文件。`approve` 以当前 Git HEAD 为基线并回到原阶段（必填），`abort` 终止。 |
 | `OUT_OF_SCOPE_CHANGE` | 正文用中文显示范围外文件的 Git 状态。`expand` 将列出的文件加入包范围（必填），`revert` 确认改动已撤掉，`ignore` 将非本包改动的当前内容记入开工快照（必填，登记提交时仍按范围外文件检查），`abort` 终止。越界复查通过后回到验证或准备提交阶段。 |
 | `RELEASE` | `approve` 记录批准并回到执行阶段，`abort` 终止。 |
 | `MANIFEST_CHANGED` | `confirm` 确认这份清单改动并登记原因（必填）。 |
 | `NEEDS_FILL` | `options` 为空。按正文补齐工作区的 `manifest.json`，确认改动后再运行 `next`。 |
 | `BLOCKED_DEPENDENCY` | `options` 为空。按正文处理未提交的前置包，再运行 `next`。 |
+
+如果执行者因为范围外的文件停下，人同意改这些文件，先用 `grow-loop pack scope` 扩范围，再选 `continue`。用 `answer` 回填时传 `--text`，用 `resume` 时传 `--decision`。继续后回到 `IMPLEMENT`，保留修复次数且不生成教训。下次派活默认续用当前实例保存的实现会话，找不到会话时会新开并在 `warnings` 提醒。任务书开头会列出停下的原因、决定原话和暂停后新加进范围的文件。旧状态里的关口仍可按原有选项回填。
 
 ## 回填
 

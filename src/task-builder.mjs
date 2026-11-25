@@ -257,12 +257,23 @@ export function buildTaskPrompt(ctx, { pack, packDef, stage, runDir }) {
     lines.push(`{ "verdict": "pass", "summary": "...", "findings": ${JSON.stringify(exampleFindings)} }`);
     lines.push('```');
   } else {
+    const continuation = pack.continue_pending;
     const isRepair = getRepairRounds(pack) > 0;
     const repairs = pack.current_tier === 'tier2' ? pack.tier2_repairs : pack.tier1_repairs;
     const attempt = repairs > 0 ? ` attempt ${repairs}` : '';
-    const modeLabel = isRepair ? `REPAIR (${pack.current_tier}${attempt})` : `INITIAL (${pack.current_tier})`;
+    const modeLabel = continuation ? `CONTINUE (${pack.current_tier})`
+      : isRepair ? `REPAIR (${pack.current_tier}${attempt})` : `INITIAL (${pack.current_tier})`;
     lines.push(`# Work Package ${pack.id} · ${modeLabel} — ${pack.title}`);
     lines.push('');
+    if (continuation) {
+      lines.push('## 接着写', '', '接着把目标做完，已完成的部分不要重做。', '', '### 上次停下的原因');
+      addVerbatim(lines, continuation.blocked_reason);
+      lines.push('### 人的决定原话');
+      addVerbatim(lines, continuation.decision);
+      lines.push('### 新加进范围的文件');
+      const files = continuation.added_scope.map((file) => `- \`${file}\``);
+      lines.push(...(files.length ? files : ['无。']), '');
+    }
     lines.push('## Hard Constraints');
     lines.push('- Work strictly within the authorized repository and package scope below.');
     lines.push('- Do NOT `git commit`, `git push`, merge branches, deploy, send external messages, or modify global user CLI configs.');

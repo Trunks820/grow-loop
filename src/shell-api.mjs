@@ -47,8 +47,10 @@ const GATE_COPY = {
   },
   EXECUTOR_BLOCKED: {
     title: '执行者报告没做完',
-    body: '请根据执行者的说明，决定补齐条件后重试、接受现有改动进入验证、换实例或终止。',
-    approve: ['接受现有改动，进入验证']
+    body: '请根据执行者的说明选择下一步。',
+    continue: ['已扩范围或补好条件，让执行者接着写（不扣修复次数）', '请填写同意扩范围或确认条件已补齐的原话。'],
+    retry: ['用当前实例从头重新执行'],
+    approve: ['代码已写完，接受现有改动进入验证']
   },
   EXTERNAL_COMMIT: {
     title: '外部提交改到了需要保护的文件',
@@ -152,7 +154,12 @@ function gateQuestion(ctx, pack) {
     body.push(`一档已修复 ${pack.tier1_repairs ?? 0} 次，二档已修复 ${pack.tier2_repairs ?? 0} 次。`);
   }
   if (gate.reason === 'REVIEW_CAP_REACHED') body.push(`已审查 ${pack.review_rounds ?? 0} 轮。`);
-  if (gate.reason === 'EXECUTOR_BLOCKED') body.push('', gate.summary);
+  if (gate.reason === 'EXECUTOR_BLOCKED') {
+    body.push('', gate.summary);
+    if (gate.allowed_resume_actions?.includes('continue')) {
+      body.push('', '如果执行者因为范围外的文件停下，你同意改这些文件，请先用 grow-loop pack scope 扩范围，再选「接着写」。');
+    }
+  }
   if (gate.questions?.length) body.push(bullets(gate.questions));
   if (gate.reason === 'EXTERNAL_COMMIT') {
     body.push('外部提交', bullets((gate.external_commits ?? []).map(({ sha, files }) => `${sha}（${files.join('、')}）`)),
