@@ -143,7 +143,7 @@ Put shared checks in the state directory's `config.json` under `verification.com
 | `verification.retry_once` | `true` | Reruns the sequence from the beginning after the first failed attempt. Each attempt stops at the first failing command and writes its own logs. |
 | `verification.baseline` | Unset | Runs the full suite and checks for failures outside the recorded list. |
 
-Blank lines and entries that begin with `#` are skipped. See the [verification flow](../SKILL.md#step-3--run-verification-before-review) for retry outcomes and how to handle an environment failure.
+Blank lines and entries that begin with `#` are skipped. See the [verification rules](LOOP-RULES.md#3-verification) for retry outcomes and the [verification step](../SKILL.md#step-3--run-verification-before-review) for how to handle an environment failure.
 
 To track existing full-suite failures, add a `baseline` object under `verification` in `config.json`. For pytest, use this object.
 

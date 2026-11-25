@@ -86,6 +86,7 @@ grow-loop/
 │   ├── handoff.mjs           # 交接清单导入
 │   ├── task-builder.mjs      # 任务书生成
 │   ├── ref-scan.mjs          # 联改引用搜索
+│   ├── scope-paths.mjs       # 路径规整与范围通配符匹配
 │   ├── probe.mjs             # 本机执行器探活
 │   ├── verify.mjs            # 本机验证与日志
 │   ├── review-report.mjs     # Markdown 审查报告解析
@@ -95,6 +96,7 @@ grow-loop/
 │   ├── evidence.mjs          # 交付证据包
 │   └── redact.mjs            # 脱敏和残留扫描
 ├── docs/
+│   ├── LOOP-RULES.md         # CLI 自己执行的规矩（档位、修复、验证、审查、教训、Git 检查）
 │   ├── UPSTREAM-BRIDGE.md    # 清单、上游转换与验证配置
 │   ├── ADAPTER-SPEC.md       # 执行器、派发记录与审查格式
 │   └── SHELL-API.md          # 壳状态与回填契约
