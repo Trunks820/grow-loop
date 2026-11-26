@@ -1724,9 +1724,10 @@ test('all four external adapters stop before spawning when a configured executab
   try {
     for (const kind of ['claude', 'codex', 'dsh', 'custom-cmd']) {
       const adapter = getAdapter(kind);
-      for (const executable of [path.basename(process.execPath), path.join(dir, 'app_*', 'x.exe')]) {
+      for (const executable of ['grow-loop-missing-cli', path.join(dir, 'x.exe'), path.join(dir, 'app_*', 'x.exe')]) {
         const cfg = { executable };
-        const summary = `找不到执行程序：配置的是 ${executable}，没有匹配的文件。请检查安装或改 config.json 的 executable`;
+        const reason = path.basename(executable) === executable ? 'PATH 里没有这个命令' : '没有匹配的文件';
+        const summary = `找不到执行程序：配置的是 ${executable}，${reason}。请检查安装或改 config.json 的 executable`;
         const probe = await adapter.probe(kind, cfg, { cwd: dir });
         assert.equal(probe.available, false);
         assert.equal(probe.error, summary);
@@ -1798,10 +1799,22 @@ test('all four external adapters use the latest glob match for probe, dry-run, a
     const fromPath = await getAdapter('claude').probe('path-default', {}, { cwd: dir });
     assert.equal(fromPath.available, true, fromPath.error);
     assert.equal(fromPath.cli_version, process.version);
-    for (const configured of [name, '']) {
+    const named = windows ? [name, 'claude'] : [name];
+    for (const kind of ['claude', 'custom-cmd']) {
+      for (const configured of named) {
+        const byName = await getAdapter(kind).probe('named', { executable: configured }, { cwd: dir });
+        assert.equal(byName.available, true, byName.error);
+        assert.equal(getAdapter(kind).resolveCommand({ executable: configured }, dir).cmd, latest);
+      }
+    }
+    for (const configured of ['', path.join(dir, 'gone', name), `gone_*/${name}`]) {
       const explicitMissing = await getAdapter('claude').probe('configured', { executable: configured }, { cwd: dir });
       assert.equal(explicitMissing.available, false);
       assert.match(explicitMissing.error, /找不到执行程序/);
+    }
+    if (windows) {
+      assert.equal(getAdapter('claude').resolveCommand({ executable: path.join(path.dirname(latest), 'claude') }, dir).cmd, latest);
+      assert.equal(getAdapter('claude').resolveCommand({ executable: 'app_*/claude' }, dir).cmd, null);
     }
     const shellProbe = await getAdapter('custom-cmd').probe('shell', { executable, shell: true }, { cwd: dir });
     assert.equal(shellProbe.available, true, shellProbe.error);
@@ -1813,7 +1826,47 @@ test('all four external adapters use the latest glob match for probe, dry-run, a
   }
 });
 
-test('a resolved Windows npm-style shim preserves its arguments when the path contains spaces', { skip: process.platform !== 'win32' }, async () => {
+test('executable names use PATH and Windows paths prefer command extensions over npm shims', () => {
+  const dir = makeTempDir('grow-loop executable-names-');
+  const originalPath = process.env.PATH;
+  try {
+    const windows = process.platform === 'win32';
+    const bin = path.join(dir, 'npm bin');
+    fs.mkdirSync(bin);
+    for (const name of ['codex', 'dsh']) {
+      if (windows) {
+        fs.writeFileSync(path.join(bin, name), '#!/bin/sh\n');
+        fs.writeFileSync(path.join(bin, `${name}.cmd`), '@echo off\r\n');
+      } else {
+        fs.writeFileSync(path.join(bin, name), '#!/bin/sh\n', { mode: 0o755 });
+      }
+    }
+    process.env.PATH = windows ? `"${bin}"` : bin;
+    const expected = (name) => path.join(bin, windows ? `${name}.cmd` : name);
+
+    for (const kind of ['codex', 'dsh']) {
+      const adapter = getAdapter(kind);
+      assert.equal(adapter.resolveCommand({}, dir).cmd, expected(kind));
+      assert.equal(adapter.resolveCommand({ executable: kind }, dir).cmd, expected(kind));
+      assert.equal(adapter.resolveCommand({ executable: path.join(bin, kind) }, dir).cmd, expected(kind));
+    }
+    if (windows) {
+      assert.equal(getAdapter('codex').resolveCommand({ executable: 'CODEX.CMD' }, dir).cmd?.toLowerCase(), expected('codex').toLowerCase());
+      const script = path.join(dir, 'agent.py');
+      fs.writeFileSync(script, 'print(1)\n');
+      assert.equal(getAdapter('custom-cmd').resolveCommand({ executable: script }, dir).cmd, script);
+    }
+    const unset = getAdapter('custom-cmd').resolveCommand({}, dir);
+    assert.equal(unset.cmd, null);
+    assert.match(unset.error, /（未配置）/);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a resolved Windows npm-style shim preserves its arguments when the path contains spaces',{ skip: process.platform !== 'win32' }, async () => {
   const dir = makeTempDir('grow-loop shim-');
   try {
     const shim = path.join(dir, 'app_10.0', 'fixture.cmd');

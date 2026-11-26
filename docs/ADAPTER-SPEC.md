@@ -43,7 +43,7 @@ In `.loop/config.json`, `executors` maps **instance IDs** rather than vendor nam
 }
 ```
 
-A configured `executable` is a file path, absolute or relative to the repository. Each `*` can match characters within one directory name or filename. The resolver keeps existing files and ranks the text matched by successive wildcards from left to right, comparing digit runs numerically. For example, `26.1120.6357.0` ranks above `26.1111.9664.0`, and `10.0` ranks above `9.0`. An unreadable directory yields no matches for that branch.
+A configured `executable` is a command name or a file path. A plain name such as `codex` or `my-agent-cli` is looked up on `PATH` the way a shell finds a command. A value containing `/` or `*`, or on Windows `\` or a drive letter such as `C:`, is a file path, absolute or relative to the repository. On Windows, a name or a path without `*` that does not end in `.exe`, `.com`, `.cmd`, or `.bat` is tried with those extensions in that order, and such a path is then tried as written. A path with `*` matches as written, so include the extension. Each `*` can match characters within one directory name or filename. The resolver keeps existing files and ranks the text matched by successive wildcards from left to right, comparing digit runs numerically. For example, `26.1120.6357.0` ranks above `26.1111.9664.0`, and `10.0` ranks above `9.0`. An unreadable directory yields no matches for that branch.
 
 For Codex Desktop on Windows, use the versioned installation directory in the pattern:
 
@@ -54,7 +54,7 @@ For Codex Desktop on Windows, use the versioned installation directory in the pa
 }
 ```
 
-A configured path never falls back to `PATH`. If it resolves to no file, `probe` explains why the instance is unavailable, `dispatch --dry-run` adds a warning, and live dispatch pauses at `INFRA_BLOCKED` without consuming a repair attempt. Omit `executable` to look up `codex`, `claude`, or `dsh` by name on `PATH`. `custom-cmd` requires an explicit executable.
+A configured path never falls back to `PATH`. If a name is not on `PATH` or a path resolves to no file, `probe` explains why the instance is unavailable, `dispatch --dry-run` adds a warning, and live dispatch pauses at `INFRA_BLOCKED` without consuming a repair attempt. Omit `executable` to look up `codex`, `claude`, or `dsh` by name on `PATH`. `custom-cmd` requires an explicit executable.
 
 For `custom-cmd`, `{{model}}` expands to the configured `model` in `args`, `read_only_args`, and `resume_args`. If `model` is omitted, it expands to an empty string. The same `model` value identifies the executor model in the implementation record.
 

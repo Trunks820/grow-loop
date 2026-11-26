@@ -115,11 +115,17 @@ export function resolveExecutable(executable, cwd = process.cwd()) {
   return { path: candidates[0] ?? null, pattern: executable, candidates };
 }
 
+function hasCommandExtension(file) {
+  return WINDOWS_COMMAND_EXTENSIONS.includes(path.extname(file).toLowerCase());
+}
+
 function findPathExecutable(command, cwd, searchDirs) {
   const windows = process.platform === 'win32';
   const dirs = searchDirs ?? (process.env.PATH ?? (windows ? '' : '/usr/bin:/bin')).split(path.delimiter);
-  const extensions = windows ? WINDOWS_COMMAND_EXTENSIONS : [''];
-  for (const dir of dirs) {
+  const extensions = windows && !hasCommandExtension(command) ? WINDOWS_COMMAND_EXTENSIONS : [''];
+  for (const entry of dirs) {
+    // cmd.exe accepts PATH entries wrapped in quotes.
+    const dir = windows ? entry.replace(/^"(.*)"$/, '$1') : entry;
     for (const ext of extensions) {
       const candidate = path.resolve(cwd, dir, command + ext);
       if (!isFile(candidate)) continue;
@@ -136,22 +142,36 @@ function findPathExecutable(command, cwd, searchDirs) {
   return null;
 }
 
-export function resolveExecutorCommand(executable, fallback, cwd = process.cwd()) {
-  let cmd = null;
-  if (executable === undefined && fallback) {
-    cmd = findPathExecutable(fallback, cwd);
-  } else if (typeof executable === 'string' && executable.length > 0) {
-    const resolved = resolveExecutable(executable, cwd).path;
-    if (resolved) {
-      const absolute = path.resolve(cwd, resolved);
-      if (isFile(absolute)) cmd = absolute;
-    }
-  }
+function isCommandName(executable) {
+  return !executable.includes('*') && path.basename(executable) === executable;
+}
 
+function resolveConfiguredPath(executable, cwd) {
+  // A Windows path without * or a command extension tries .exe/.com/.cmd/.bat first, then the file as written.
+  // Globs match as written so version ranking stays the same.
+  const extensions = process.platform === 'win32' && !executable.includes('*') && !hasCommandExtension(executable)
+    ? [...WINDOWS_COMMAND_EXTENSIONS, '']
+    : [''];
+  for (const ext of extensions) {
+    const resolved = resolveExecutable(executable + ext, cwd).path;
+    const absolute = resolved && path.resolve(cwd, resolved);
+    if (absolute && isFile(absolute)) return absolute;
+  }
+  return null;
+}
+
+export function resolveExecutorCommand(executable, fallback, cwd = process.cwd()) {
+  // A bare name is looked up on PATH like a shell command. A path never falls back to PATH.
   const configured = executable === undefined ? fallback : executable;
+  const valid = typeof configured === 'string' && configured.length > 0;
+  const commandName = valid && isCommandName(configured);
+  const cmd = !valid ? null
+    : commandName ? findPathExecutable(configured, cwd) : resolveConfiguredPath(configured, cwd);
+
   const displayPath = configured === '' ? '""' : configured ?? '（未配置）';
+  const reason = commandName ? 'PATH 里没有这个命令' : '没有匹配的文件';
   const error = cmd ? null
-    : `找不到执行程序：配置的是 ${displayPath}，没有匹配的文件。请检查安装或改 config.json 的 executable`;
+    : `找不到执行程序：配置的是 ${displayPath}，${reason}。请检查安装或改 config.json 的 executable`;
   return { cmd, configured, error };
 }
 
